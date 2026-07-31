@@ -12,6 +12,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      publish_apt_repo:
+        description: Run the apt-repo job even without a tag (re-publish the current version for real, without touching PyPI)
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -131,7 +136,7 @@ jobs:
   # separately -- this job only ever updates it, never creates it) and GitHub
   # Pages to be enabled for the repo pointed at that branch.
   apt-repo:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_apt_repo
     needs: build
     runs-on: ubuntu-latest
     permissions:
