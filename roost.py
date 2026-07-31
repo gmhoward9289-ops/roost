@@ -51,7 +51,7 @@ import sys
 import time
 from pathlib import Path
 
-__version__ = "0.2"
+__version__ = "0.3"
 
 HOME = Path.home()
 SESSIONS_DIR = HOME / ".claude" / "sessions"
