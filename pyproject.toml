@@ -3,7 +3,10 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "roost"
+# PyPI holds the bare name "roost" in reserve (a prior project's name, retained
+# after deletion), so the distribution is roost-top. The command, the module,
+# the repo, the formula and the .deb are all still plain roost.
+name = "roost-top"
 dynamic = ["version"]
 description = "top for Claude Code -- live sessions, models, context, and the subagents they spawn"
 readme = "README.md"

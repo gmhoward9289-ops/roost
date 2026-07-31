@@ -54,7 +54,15 @@ sudo apt install ./roost_0.2_all.deb
 There is no PPA and no apt repository; the `.deb` is a release artifact, and
 `apt install ./file.deb` resolves `python3` exactly as a repo install would.
 
-With pipx, straight from the repo — no package index involved:
+With pipx:
+
+```bash
+pipx install roost-top
+```
+
+PyPI holds the bare name `roost` in reserve — a prior project's name, retained
+after deletion — so the *package* is `roost-top`; the command it installs is
+plain `roost`. Installing straight from the repo skips the index entirely:
 
 ```bash
 pipx install git+https://github.com/gmhoward9289-ops/roost
@@ -71,15 +79,10 @@ Windows: save it as `roost.py` and run it — `.PY` is in `PATHEXT`, so `roost.p
 works from anywhere on `PATH`. There is no Windows package; the single file is
 the install.
 
-**roost is not on PyPI**, deliberately. It is one dependency-free script, and the
-four routes above cover every platform it runs on without another account, token
-or release channel to keep in sync. `pipx install git+...` gives you the pipx
-workflow regardless.
-
 The man page (`man roost`) ships with the Homebrew and `.deb` installs. A pipx
 install puts it under the venv's own `share/man`, which is not on the default
 `MANPATH`; read it in place with
-`man "$(pipx environment --value PIPX_LOCAL_VENVS)/roost/share/man/man1/roost.1"`.
+`man "$(pipx environment --value PIPX_LOCAL_VENVS)/roost-top/share/man/man1/roost.1"`.
 
 ## Use
 
