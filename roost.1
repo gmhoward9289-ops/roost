@@ -1,0 +1,151 @@
+.TH ROOST 1 "2026-07-31" "roost 0.2" "User Commands"
+.SH NAME
+roost \- top for Claude Code: live sessions, context use, and their subagents
+.SH SYNOPSIS
+.B roost
+.RI [ options ]
+.SH DESCRIPTION
+.B roost
+shows every live Claude Code session on the machine, the model each is running,
+how much of its context window it has consumed, how long it has been idle, and
+the subagents it has spawned. It refreshes in place, like
+.BR top (1).
+.PP
+It reads three local sources and writes nothing. There is no network traffic
+beyond a localhost probe of the inference ports.
+.RS
+.IP \(bu 2
+.I ~/.claude/sessions/<pid>.json
+\(em live sessions: pid, sessionId, launch directory, name.
+.IP \(bu 2
+.I ~/.claude/projects/*/<sid>.jsonl
+\(em model in use and token usage.
+.IP \(bu 2
+127.0.0.1 ports \(em ollama, litellm, openwebui.
+.RE
+.PP
+Sessions are grouped by what it costs to ignore them rather than by size.
+.B NEAR LIMIT
+is about to stop working,
+.B PARKED + COSTLY
+bills its whole context on the next turn, and
+.B QUIET
+collapses to a single line until a cursor is raised.
+.SH OPTIONS
+.TP
+.BR \-w ", " \-\-watch " " [\fISECS\fR]
+Refresh interval in seconds. Live is the default; this sets the pace.
+.TP
+.BR \-1 ", " \-\-once
+Print a single frame and exit.
+.TP
+.B \-\-json
+Emit session and infra records as JSON, then exit. Intended for piping.
+.TP
+.B \-\-advise
+Start with the ADVICE panel open. Toggle it live with
+.BR a .
+.TP
+.B \-\-no\-agents
+Start with the SUBAGENTS panel closed. Toggle it live with
+.BR s .
+.TP
+.B \-\-no\-color
+Disable colour. Colour is also suppressed when
+.B NO_COLOR
+is set in the environment or when output is not a terminal.
+.TP
+.B \-\-version
+Print the version and exit.
+.SH INTERACTIVE KEYS
+.TP
+.B space
+Repaint immediately instead of waiting out the interval.
+.TP
+.BR a ", " s
+Toggle the ADVICE and SUBAGENTS panels.
+.TP
+.BR j ", " k ", " Down ", " Up
+Raise the cursor and move it. Raising the cursor expands the
+.B QUIET
+group, since idle sessions are usually the ones worth acting on.
+.TP
+.B x
+Stop the selected session. Prompts for confirmation; only
+.B y
+proceeds, and every other key cancels.
+.TP
+.B y
+Copy the selected session's sessionId to the clipboard, for
+.BR "claude \-\-resume" .
+Uses
+.BR clip (1)
+on Windows,
+.BR pbcopy (1)
+on macOS and
+.BR xclip (1)
+elsewhere; a missing helper is reported rather than silently ignored.
+.TP
+.B Esc
+Drop the cursor and re-collapse the QUIET group.
+.TP
+.B q
+Quit. During a confirmation prompt,
+.B q
+cancels the prompt instead, so that a reflexive quit is never read as consent.
+.SH STOPPING A SESSION
+.B x
+ends a process; it does not compact, save, or otherwise negotiate with the
+session. There is no local control channel into a running Claude Code session,
+so nothing finer is available from outside it.
+.PP
+On Unix the session is sent
+.B SIGTERM
+and exits on its own terms. On Windows there is no cross-process equivalent, so
+.B TerminateProcess
+is used: the session stops immediately with no chance to flush. Transcripts are
+written a turn at a time, so at most a turn already in flight is lost.
+.PP
+roost refuses to stop its own process or its parent. Run from inside the session
+it is pointed at, the cursor can land on the row whose process owns the
+terminal, and stopping it would take roost with it.
+.SH EXIT STATUS
+.B roost
+exits 0 unless it could not parse its arguments.
+.SH ENVIRONMENT
+.TP
+.B NO_COLOR
+If set to any value, colour output is disabled. See
+.UR https://no-color.org
+.UE .
+.SH CAVEATS
+roost reads an undocumented on-disk format that can change without warning.
+Treat breakage as expected rather than exceptional.
+.PP
+The context window is inferred, not recorded: nothing on disk states which window
+a session opened with, so roost picks the smallest standard tier the observed
+usage fits inside. A session on the 1M window can read 480k cache tokens in a
+single call, and scoring that against 200k yields a nonsense reading.
+.PP
+Context itself is an estimate \(em the last assistant turn's input, cache-read
+and cache-creation tokens summed over that window.
+.PP
+The ADVICE panel's thresholds are tuned to one person's usage.
+.SH FILES
+.TP
+.I ~/.claude/sessions/
+One JSON file per live session, named for its pid.
+.TP
+.I ~/.claude/projects/
+Session transcripts, and subagent transcripts one directory deeper.
+.SH SEE ALSO
+.BR top (1),
+.BR claude (1)
+.SH BUGS
+Report at
+.UR https://github.com/gmhoward9289-ops/roost/issues
+.UE .
+.SH AUTHOR
+George M. Howard <dev@swamplink.net>
+.SH COPYRIGHT
+MIT licensed.

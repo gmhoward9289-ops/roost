@@ -258,6 +258,122 @@ class TestSubagentDiscovery(unittest.TestCase):
         self.assertEqual(rows[0]["state"], "orphan")
 
 
+class TestCursor(unittest.TestCase):
+    """The cursor addresses a row that x will stop. Anything that lets the screen
+    and the index disagree is a wrong-session kill, so the invariants are here."""
+
+    def setUp(self):
+        self._color = roost.COLOR
+        roost.COLOR = False
+
+    def tearDown(self):
+        roost.COLOR = self._color
+
+    def test_quiet_is_unreachable_without_a_cursor(self):
+        rows = [worker(name="q%d" % i, idle_secs=9000, ctx_tokens=1000) for i in range(4)]
+        shown, quiet = roost.arrange(rows)
+        self.assertEqual(shown, [])
+        self.assertEqual(len(quiet), 4)
+
+    def test_cursor_expands_quiet_so_stale_sessions_can_be_reached(self):
+        """The sweep exists for idle sessions; collapsing them hides the targets."""
+        rows = [worker(name="q%d" % i, idle_secs=9000, ctx_tokens=1000) for i in range(4)]
+        shown, quiet = roost.arrange(rows, expand_quiet=True)
+        self.assertEqual(len(shown), 4)
+        self.assertEqual(quiet, [])
+
+    def test_one_marker_and_it_is_on_the_selected_row(self):
+        rows = [worker(name="a", ctx_pct=85.0), worker(name="b", idle_secs=5)]
+        shown, _ = roost.arrange(rows, expand_quiet=True)
+        for sel in range(len(shown)):
+            out = roost.render(rows, sel)
+            marked = [ln for ln in out if ln.startswith("> ")]
+            self.assertEqual(len(marked), 1)
+            self.assertIn(shown[sel][1]["name"], marked[0])
+
+    def test_marker_is_present_without_colour(self):
+        """Reverse video is unavailable over plain pipes; the marker is the
+        only thing left saying which row x acts on."""
+        out = roost.render([worker(name="solo", idle_secs=5)], 0)
+        self.assertTrue(any(ln.startswith("> ") for ln in out))
+
+    def test_selection_does_not_shift_columns(self):
+        rows = [worker(name="a", ctx_pct=85.0), worker(name="b", model="claude-fable-5")]
+        plain = roost.render(rows, 0)
+        roost.COLOR = True
+        coloured = roost.render(rows, 0)
+        self.assertEqual(len(plain), len(coloured))
+        for p, col in zip(plain, coloured):
+            self.assertEqual(roost.visible_len(col), len(p))
+
+    def test_highlight_rearms_after_every_reset(self):
+        """A per-cell RESET clears reverse video too, so a naive wrap highlights
+        only as far as the first coloured cell."""
+        roost.COLOR = True
+        line = roost.c("aa", roost.RED) + " " + roost.c("bb", roost.GREEN)
+        out = roost.highlight(line)
+        self.assertEqual(out.count(roost.REVERSE), line.count(roost.RESET) + 1)
+        self.assertEqual(roost.visible_len(out), roost.visible_len(line))
+
+    def test_highlight_is_a_noop_without_colour(self):
+        self.assertEqual(roost.highlight("plain"), "plain")
+
+
+class TestFrameClamping(unittest.TestCase):
+    """Sessions exit between frames. A cursor left pointing past the end would
+    silently address nothing -- or, worse, whatever slid into that index."""
+
+    # frame() is the only function that touches all three collectors at once, so
+    # every stub has to be handed back -- an earlier version leaked its empty
+    # collect_subagents into the subagent tests and failed three of them.
+    PATCHED = ("collect_workers", "collect_infra", "collect_subagents")
+
+    def setUp(self):
+        self._saved = {n: getattr(roost, n) for n in self.PATCHED}
+        roost.collect_infra = lambda: []
+        roost.collect_subagents = lambda sids: []
+
+    def tearDown(self):
+        for name, fn in self._saved.items():
+            setattr(roost, name, fn)
+
+    def test_sel_past_the_end_clamps_to_the_last_row(self):
+        roost.collect_workers = lambda: [worker(name="a", pid=1, idle_secs=5),
+                                         worker(name="b", pid=2, idle_secs=5)]
+        _, rows, sel = roost.frame(sel=99)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(sel, 1)
+
+    def test_sel_drops_when_every_session_is_gone(self):
+        roost.collect_workers = lambda: []
+        _, rows, sel = roost.frame(sel=3)
+        self.assertEqual(rows, [])
+        self.assertIsNone(sel)
+
+    def test_rows_match_what_was_rendered(self):
+        """frame() hands back the list the key handler indexes; if it disagreed
+        with the table by even one row, x would stop the wrong session."""
+        roost.collect_workers = lambda: [
+            worker(name="near", pid=1, ctx_pct=85.0),
+            worker(name="quiet", pid=2, idle_secs=9000, ctx_tokens=1000),
+        ]
+        lines, rows, sel = roost.frame(sel=0)
+        table = [ln for ln in lines if ln.startswith(("  ", "> ")) and "WORKER" not in ln]
+        self.assertEqual(len(rows), 2)  # quiet expanded under the cursor
+        for r in rows:
+            self.assertTrue(any(r["name"] in ln for ln in table), r["name"])
+
+
+class TestTerminateGuard(unittest.TestCase):
+    def test_refuses_to_stop_its_own_process(self):
+        self.assertIn("own process tree", roost.terminate(os.getpid()))
+
+    def test_refuses_to_stop_its_parent(self):
+        """roost launched from inside a session puts that session's pid on screen;
+        x on that row would take roost's own terminal with it."""
+        self.assertIn("own process tree", roost.terminate(os.getppid()))
+
+
 class TestInfraLine(unittest.TestCase):
     def setUp(self):
         roost.COLOR = False

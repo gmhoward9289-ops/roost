@@ -39,12 +39,39 @@ turn, and everything quiet collapses to a single line.
 ## Install
 
 ```bash
+pipx install roost
+```
+
+Homebrew:
+
+```bash
+brew install gmhoward9289-ops/tap/roost
+```
+
+Debian and Ubuntu — grab `roost_<version>_all.deb` from the
+[latest release](https://github.com/gmhoward9289-ops/roost/releases/latest):
+
+```bash
+sudo apt install ./roost_0.2_all.deb
+```
+
+There is no PPA and no apt repository; the `.deb` is a release artifact, and
+`apt install ./file.deb` resolves `python3` exactly as a repo install would.
+
+Or just take the file — it is one script with no dependencies:
+
+```bash
 curl -o roost https://raw.githubusercontent.com/gmhoward9289-ops/roost/main/roost.py
 chmod +x roost && ./roost
 ```
 
 Windows: save as `roost.py` and run it — `.PY` is in `PATHEXT`, so `roost.py`
 works from anywhere on `PATH`.
+
+The man page (`man roost`) ships with the Homebrew and `.deb` installs. A `pipx`
+install puts it under the venv's own `share/man`, which is not on the default
+`MANPATH`; `man "$(pipx environment --value PIPX_LOCAL_VENVS)/roost/share/man/man1/roost.1"`
+reads it in place.
 
 ## Use
 
@@ -56,6 +83,34 @@ roost --json       joined records, for piping
 ```
 
 While running: `space` refresh now · `a` advice panel · `s` subagents panel · `q` quit
+
+## Acting on a session
+
+`j`/`k` (or the arrow keys) raise a cursor. Raising it expands the `QUIET`
+group, because a session idle for hours is exactly what a sweep is looking for
+and it is unreachable while collapsed.
+
+| key | does |
+| --- | --- |
+| `j` `k` `↓` `↑` | move the cursor |
+| `x` | stop the selected session — confirms first, and only `y` proceeds |
+| `y` | copy its sessionId, for `claude --resume <id>` |
+| `esc` | drop the cursor, re-collapse `QUIET` |
+
+`x` ends a process. It does not compact, save, or otherwise negotiate with the
+session — **there is no local control channel into a running Claude Code
+session**, so nothing gentler is available from outside it. On Unix that is a
+`SIGTERM` and the session exits on its own terms; on Windows there is no
+cross-process equivalent, so it is a `TerminateProcess` hard kill. Transcripts
+are written a turn at a time, so at most an in-flight turn is lost.
+
+Both keys act on the row object that was on screen when you pressed them, never
+on an index re-resolved afterwards. Rows reorder between frames as sessions go
+quiet, and an index that outlived its frame would eventually stop the wrong one.
+
+roost refuses to stop its own process or its parent — run it from inside the
+session it is pointed at and the cursor can land on the row that owns your
+terminal.
 
 ## Why subagents are the interesting part
 

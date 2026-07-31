@@ -1,0 +1,68 @@
+name: release
+
+# Builds the three distributables for a tag and attaches them to the release.
+# Nothing here publishes to PyPI: that needs a token on the account, so the
+# wheel is uploaded to the release and `twine upload` stays a deliberate manual
+# step. The .deb is the apt story -- there is no PPA, so it is installed with
+# `sudo apt install ./roost_<version>_all.deb`.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Build the .deb
+        run: packaging/build-deb.sh
+
+      # The version lives in roost.py alone. A tag that disagrees with it would
+      # publish artifacts whose filenames contradict the release they hang off.
+      - name: Check the tag matches __version__
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          code_version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' roost.py)
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$code_version" != "$tag_version" ]; then
+            echo "tag $tag_version != __version__ $code_version" >&2
+            exit 1
+          fi
+
+      - name: Verify the built package actually runs
+        run: |
+          python -m venv /tmp/v
+          /tmp/v/bin/pip install --quiet dist/*.whl
+          /tmp/v/bin/roost --version
+          /tmp/v/bin/roost -1 --no-color
+          test -f /tmp/v/share/man/man1/roost.1
+
+      - name: Verify the .deb installs and the man page is readable
+        run: |
+          sudo apt-get install -y ./dist/roost_*_all.deb
+          roost --version
+          man -w roost
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber

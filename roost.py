@@ -15,6 +15,12 @@ already in Claude Code's own state.
 In live mode: space repaints now, q quits, Ctrl-C quits. The refresh interval is
 the REFRESH_SECONDS constant below -- edit it to change the default everywhere.
 
+j/k (or the arrow keys) raise a cursor, which is the only way to act on a row:
+x stops the selected session, y copies its sessionId for `claude --resume`.
+Both act on the row object that was on screen when the key was pressed, never on
+an index re-resolved afterwards -- rows reorder between frames as sessions go
+quiet, and an index that outlived its frame would eventually hit the wrong one.
+
 Three sources, all local and all read-only:
 
   ~/.claude/sessions/<pid>.json    live workers: pid, sessionId, launch cwd, name
@@ -38,12 +44,14 @@ import glob
 import json
 import os
 import shutil
+import signal
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
 
-__version__ = "0.01"
+__version__ = "0.2"
 
 HOME = Path.home()
 SESSIONS_DIR = HOME / ".claude" / "sessions"
@@ -99,6 +107,7 @@ SERVICES = (
 RESET = "\033[0m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
+REVERSE = "\033[7m"
 RED = "\033[31m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
@@ -114,6 +123,18 @@ def c(text, *codes):
     if not COLOR or not codes:
         return text
     return "".join(codes) + text + RESET
+
+
+def highlight(line):
+    """Reverse-video a whole line that already contains colour.
+
+    Every per-cell colour ends in RESET, which clears reverse video along with
+    the colour -- so a naive wrap highlights only up to the first coloured cell.
+    Re-arming after each RESET keeps the bar unbroken across the row.
+    """
+    if not COLOR:
+        return line
+    return REVERSE + line.replace(RESET, RESET + REVERSE) + RESET
 
 
 def ascii_safe(s):
@@ -188,6 +209,51 @@ def alive(pid):
     except PermissionError:
         return True
     return True
+
+
+def terminate(pid):
+    """Stop a session process. Returns an error string, or None on success.
+
+    Windows has no cross-process SIGTERM, so this is TerminateProcess: immediate,
+    with no chance for the session to shut down cleanly. Transcripts are written
+    a turn at a time, so the most that can be lost is a turn already in flight --
+    but it is a kill, not a request, and the man page says so. POSIX gets a real
+    SIGTERM and the session exits on its own terms.
+    """
+    if pid in (os.getpid(), os.getppid()):
+        # roost run from inside the session it is pointed at: the cursor lands on
+        # the row whose process owns this terminal, and x would take roost with it.
+        return "refusing to stop roost's own process tree"
+    if os.name == "nt":
+        import ctypes
+
+        PROCESS_TERMINATE = 0x0001
+        h = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE, False, int(pid))
+        if not h:
+            return "cannot open pid %d (already gone, or not yours)" % pid
+        ok = ctypes.windll.kernel32.TerminateProcess(h, 1)
+        ctypes.windll.kernel32.CloseHandle(h)
+        return None if ok else "TerminateProcess failed on pid %d" % pid
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as e:
+        return "%s (pid %d)" % (e.strerror or e, pid)
+    return None
+
+
+# xclip is the one that may genuinely be absent; a failed copy is reported, not
+# swallowed, because the whole point is pasting the id into a resume command.
+CLIP_CMD = {"win32": ["clip"], "darwin": ["pbcopy"]}.get(
+    sys.platform, ["xclip", "-selection", "clipboard"])
+
+
+def to_clipboard(text):
+    try:
+        p = subprocess.Popen(CLIP_CMD, stdin=subprocess.PIPE)
+        p.communicate(text.encode("utf-8"))
+        return p.returncode == 0
+    except OSError:
+        return False
 
 
 def port_open(port, timeout=0.35):
@@ -598,7 +664,29 @@ def bucket(w):
 BUCKET_COLORS = {0: RED, 1: YELLOW, 2: GREEN, 3: DIM, 4: DIM}
 
 
-def render(workers):
+def arrange(workers, expand_quiet=False):
+    """Split workers into table rows and the collapsed QUIET tail.
+
+    Pulled out of render() so the cursor and the screen agree by construction.
+    Two orderings computed separately would eventually disagree, and the failure
+    mode of that disagreement is stopping the wrong session.
+
+    QUIET expands under the cursor because that group is precisely what the
+    sweep is for: a session idle for hours is invisible in the collapsed line,
+    and unreachable if the cursor cannot enter it.
+    """
+    tagged = [(bucket(w), w) for w in workers]
+    shown = [(b, w) for (b, w) in tagged if b[0] != 4 or expand_quiet]
+    quiet = [] if expand_quiet else [w for (b, w) in tagged if b[0] == 4]
+    # Within a group, order by what a turn costs. Percentage buries the
+    # expensive sessions: 484k tokens on the 1M window reads as a mild 48%,
+    # while 140k on a 200k window looks alarming at 70% and costs a third as much.
+    shown.sort(key=lambda t: (t[0][0], -(t[1]["ctx_tokens"] or 0)))
+    return shown, quiet
+
+
+def render(workers, sel=None):
+    """Table for `workers`. `sel` is an index into arrange()'s shown rows."""
     lines = []
     if not workers:
         lines.append("no live Claude Code sessions")
@@ -613,13 +701,7 @@ def render(workers):
         ("IDLE", lambda r: dur(r["idle_secs"])),
     ]
 
-    tagged = [(bucket(w), w) for w in workers]
-    shown = [(b, w) for (b, w) in tagged if b[0] != 4]
-    quiet = [w for (b, w) in tagged if b[0] == 4]
-    # Within a group, order by what a turn costs. Percentage buries the
-    # expensive sessions: 484k tokens on the 1M window reads as a mild 48%,
-    # while 140k on a 200k window looks alarming at 70% and costs a third as much.
-    shown.sort(key=lambda t: (t[0][0], -(t[1]["ctx_tokens"] or 0)))
+    shown, quiet = arrange(workers, expand_quiet=sel is not None)
 
     # Widths span every row that will be printed, so groups stay aligned with
     # each other rather than each group forming its own ragged table.
@@ -632,17 +714,22 @@ def render(workers):
         lines.append(c("  " + "  ".join(head[i].ljust(wid[i]) for i in range(len(cols)))
                        + "  TASK", BOLD))
     last = None
-    for (b, w), row in zip(shown, body):
+    for i, ((b, w), row) in enumerate(zip(shown, body)):
         if b[1] != last:
             last = b[1]
             lines.append(c(b[1], BOLD, BUCKET_COLORS.get(b[0], DIM)))
-        cells = [style_cell(cols[i][0], row[i].ljust(wid[i]), w) for i in range(len(cols))]
+        cells = [style_cell(cols[j][0], row[j].ljust(wid[j]), w) for j in range(len(cols))]
         # Last gate before the terminal. Sanitised at collection too, but this
         # is the boundary that matters: every task string reaches the screen here.
         task = ascii_safe(w.get("task") or "")
         if w.get("task_src") == "prompt" and task:
             task = c(task, DIM)  # not yet named -- this is the raw last prompt
-        lines.append("  " + "  ".join(cells) + "  " + task)
+        # The marker is printed whether or not colour is on: over SSH, in a pipe,
+        # or on a terminal with no reverse video it is the only thing that says
+        # which row x would act on.
+        mark = "> " if i == sel else "  "
+        line = mark + "  ".join(cells) + "  " + task
+        lines.append(highlight(line) if i == sel else line)
 
     if quiet:
         names = " . ".join(x["name"] for x in quiet[:12])
@@ -748,18 +835,29 @@ def render_subagents(agents):
     return lines
 
 
-def frame(with_advice=False, with_agents=True):
+def frame(with_advice=False, with_agents=True, sel=None):
+    """Returns (lines, rows, sel).
+
+    `rows` is what the cursor indexes, handed back so the key handler acts on the
+    frame the user was actually looking at. `sel` comes back clamped: sessions
+    exit between frames, and a cursor left pointing past the end would silently
+    address nothing.
+    """
     workers = collect_workers()
+    shown, _ = arrange(workers, expand_quiet=sel is not None)
+    rows = [w for _, w in shown]
+    if sel is not None:
+        sel = min(sel, len(rows) - 1) if rows else None
     # Infra leads because it is a constant: one quiet line you skim past, which
     # is exactly the weight it deserves until something turns red.
-    lines = render_infra(collect_infra()) + render(workers)
+    lines = render_infra(collect_infra()) + render(workers, sel)
     if with_agents:
         live_sids = set(w["session_id"] for w in workers if w.get("session_id"))
         lines.extend(render_subagents(collect_subagents(live_sids)))
     if with_advice:
         lines.append("")
         lines.extend(advise(workers))
-    return lines
+    return lines, rows, sel
 
 
 def enable_vt():
@@ -835,7 +933,12 @@ class KeyReader(object):
         return False
 
     def get(self, timeout):
-        """One key within `timeout` seconds, else None."""
+        """One key within `timeout` seconds, else None.
+
+        Returns a single character, or one of the names "UP", "DOWN", "ESC" --
+        arrows are multi-byte on both platforms and the caller should not have to
+        know either encoding.
+        """
         if not self.enabled:
             time.sleep(timeout)
             return None
@@ -848,17 +951,25 @@ class KeyReader(object):
                     ch = msvcrt.getwch()
                     # Arrows and function keys arrive as a two-char sequence.
                     if ch in ("\x00", "\xe0"):
-                        msvcrt.getwch()
-                        return None
-                    return ch
+                        return {"H": "UP", "P": "DOWN"}.get(msvcrt.getwch())
+                    return "ESC" if ch == "\x1b" else ch
                 time.sleep(0.02)
             return None
         import select
 
         r, _, _ = select.select([sys.stdin], [], [], timeout)
-        if r:
-            return sys.stdin.read(1)
-        return None
+        if not r:
+            return None
+        ch = sys.stdin.read(1)
+        if ch != "\x1b":
+            return ch
+        # A bare Esc and the start of an arrow sequence are the same byte. The
+        # rest of a real CSI arrives in the same burst, so nothing further within
+        # a beat means the user pressed Esc.
+        r, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if not r or sys.stdin.read(1) != "[":
+            return "ESC"
+        return {"A": "UP", "B": "DOWN"}.get(sys.stdin.read(1))
 
 
 def term_size():
@@ -903,8 +1014,11 @@ def main():
                     help="start with the ADVICE panel open (toggle live with 'a')")
     ap.add_argument("--no-agents", action="store_true",
                     help="start with the SUBAGENTS panel closed (toggle live with 's')")
-    ap.epilog = ("keys while running:  space = refresh now   a = advice panel   "
-                 "s = subagents panel   q = quit")
+    ap.epilog = (
+        "keys while running:  space = refresh now   a = advice panel   "
+        "s = subagents panel   q = quit\n"
+        "with a cursor (j/k or arrows):  x = stop the session (confirms)   "
+        "y = copy its sessionId   esc = deselect")
     args = ap.parse_args()
 
     if args.json:
@@ -926,7 +1040,7 @@ def main():
     # Live is the default, as with top/htop -- `-h` is argparse's help and exits,
     # so keys have nothing to act on there. A single frame is opt-in.
     if args.once:
-        print("\n".join(frame(args.advise, not args.no_agents)))
+        print("\n".join(frame(args.advise, not args.no_agents)[0]))
         return
     interval = args.watch if args.watch else REFRESH_SECONDS
 
@@ -936,22 +1050,39 @@ def main():
     # Panels are toggled live rather than fixed at launch: on a short terminal all
     # three at once overflow the window, and what you want to see changes.
     show = {"advice": args.advise, "agents": not args.no_agents}
+    sel = None      # cursor row index, or None when there is no cursor
+    pending = None  # the worker row awaiting a y/n answer
+    note = None     # result of the last action, cleared by the next keypress
     try:
         with KeyReader() as keys:
             while True:
-                if keys.enabled:
-                    hint = "space refresh | %s advice | %s agents | q quit" % (
+                if not keys.enabled:
+                    hint = "Ctrl-C to stop"
+                elif sel is None:
+                    hint = "j/k select | space refresh | %s advice | %s agents | q quit" % (
                         c("a", BOLD, GREEN) if show["advice"] else "a",
                         c("s", BOLD, GREEN) if show["agents"] else "s",
                     )
                 else:
-                    hint = "Ctrl-C to stop"
+                    hint = "j/k move | x stop | y yank id | esc deselect | q quit"
                 header = [
                     c("roost", BOLD) + "  " + c(socket.gethostname(), CYAN)
                     + "  " + time.strftime("%H:%M:%S") + "   " + c(hint, DIM),
                     "",
                 ]
-                paint(header + frame(show["advice"], show["agents"]), vt)
+                lines, rows, sel = frame(show["advice"], show["agents"], sel)
+                # A session can exit while its confirmation is on screen. Matching
+                # on pid rather than on the row dict is what makes that detectable:
+                # every frame rebuilds the dicts, so identity and equality both
+                # fail on rows that are in fact the same session.
+                if pending and not any(r["pid"] == pending["pid"] for r in rows):
+                    pending, note = None, c("that session exited on its own", DIM)
+                if pending:
+                    lines += ["", c("stop %s (pid %d)?  y / n" % (
+                        pending["name"], pending["pid"]), BOLD, RED)]
+                elif note:
+                    lines += ["", note]
+                paint(header + lines, vt)
 
                 # Sleep in slices so a keypress lands within ~0.2s rather than at
                 # the end of the tick.
@@ -963,16 +1094,53 @@ def main():
                     key = keys.get(min(0.2, remaining))
                     if key is None:
                         continue
+                    note = None
+
+                    # The confirmation swallows every key: only an explicit y
+                    # stops a session, and q here cancels rather than quitting so
+                    # that a reflexive quit cannot be read as consent.
+                    if pending is not None:
+                        if key in ("y", "Y"):
+                            err = terminate(pending["pid"])
+                            note = c("stopped %s (pid %d)" % (
+                                pending["name"], pending["pid"]), GREEN) if err is None \
+                                else c(err, BOLD, RED)
+                        else:
+                            note = c("cancelled", DIM)
+                        pending = None
+                        break
+
+                    if key in ("q", "Q", "\x03"):
+                        return
                     if key == " ":
                         break  # repaint now
+                    if key == "ESC":
+                        sel = None
+                        break
+                    if key in ("j", "J", "DOWN"):
+                        # Unbounded on purpose -- frame() clamps against the row
+                        # count it actually rendered, which is the only correct one.
+                        sel = 0 if sel is None else sel + 1
+                        break
+                    if key in ("k", "K", "UP"):
+                        sel = 0 if sel is None else max(0, sel - 1)
+                        break
                     if key in ("a", "A"):
                         show["advice"] = not show["advice"]
                         break  # repaint immediately, do not wait out the tick
                     if key in ("s", "S"):
                         show["agents"] = not show["agents"]
                         break
-                    if key in ("q", "Q", "\x03"):
-                        return
+                    if sel is not None and rows and key in ("x", "X"):
+                        # Captured from the frame on screen, not re-resolved later.
+                        pending = rows[sel]
+                        break
+                    if sel is not None and rows and key in ("y", "Y"):
+                        w = rows[sel]
+                        note = c("copied %s -- claude --resume <paste>" % w["name"], GREEN) \
+                            if to_clipboard(w["session_id"]) \
+                            else c("no clipboard helper (%s not found)" % CLIP_CMD[0], YELLOW)
+                        break
     except KeyboardInterrupt:
         pass
     finally:

@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "roost"
+dynamic = ["version"]
+description = "top for Claude Code -- live sessions, models, context, and the subagents they spawn"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "George M. Howard", email = "dev@swamplink.net" }]
+keywords = ["claude", "claude-code", "tui", "top", "monitoring", "context"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Monitoring",
+]
+# No dependencies, and there will not be any: roost has to run on whatever
+# Python is already on the box, including a bare system 3.9 on macOS.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/gmhoward9289-ops/roost"
+Issues = "https://github.com/gmhoward9289-ops/roost/issues"
+
+[project.scripts]
+roost = "roost:main"
+
+# One source of truth for the version: __version__ in roost.py, which is also
+# what `roost --version` prints and what the man page header carries.
+[tool.hatch.version]
+path = "roost.py"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["roost.py"]
+
+# Installs to <prefix>/share/man/man1. pipx and venv installs put that outside
+# the default MANPATH, so `man roost` works after a system or Homebrew install
+# but may need MANPATH help inside a venv -- see README.
+[tool.hatch.build.targets.wheel.shared-data]
+"roost.1" = "share/man/man1/roost.1"
+
+[tool.hatch.build.targets.sdist]
+include = ["roost.py", "roost.1", "README.md", "LICENSE", "tests/", "packaging/"]
