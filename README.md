@@ -37,7 +37,7 @@ turn, and everything quiet collapses to a single line.
 ## Install
 
 ```bash
-curl -o roost https://raw.githubusercontent.com/OWNER/roost/main/roost.py
+curl -o roost https://raw.githubusercontent.com/gmhoward9289-ops/roost/main/roost.py
 chmod +x roost && ./roost
 ```
 
