@@ -1,9 +1,13 @@
 name: release
 
-# Builds the three distributables for a tag and attaches them to the release.
-# Nothing here publishes to PyPI: that needs a token on the account, so the
-# wheel is uploaded to the release and `twine upload` stays a deliberate manual
-# step. The .deb is the apt story -- there is no PPA, so it is installed with
+# Builds the distributables for a tag and attaches them to the release.
+#
+# Nothing here publishes to PyPI, and that is deliberate: roost is one
+# dependency-free script, and Homebrew + .deb + `pipx install git+...` + curl
+# already cover every platform without another account or token to keep in
+# sync. A trusted-publishing job used to live here and was removed.
+#
+# The .deb is the apt story -- there is no PPA, so it installs with
 # `sudo apt install ./roost_<version>_all.deb`.
 on:
   push:
@@ -42,18 +46,19 @@ jobs:
             exit 1
           fi
 
-      # PEP 440 strips the leading zero, so __version__ "0.02" builds a wheel
-      # named roost-0.2 while the tag, the .deb and the man page all say 0.02.
-      # That is a chosen tradeoff, not an accident -- surfaced here rather than
-      # discovered on the PyPI page after an upload that cannot be undone.
-      - name: Report the PyPI-normalised version
+      # PEP 440 would rewrite a version like "0.02" to "0.2", so the wheel
+      # filename could disagree with the tag, the .deb and the man page. 0.2 is
+      # already canonical and normalises to itself, but this fails loudly if the
+      # version is ever changed to something PEP 440 rewrites.
+      - name: Check the wheel filename matches the version
         run: |
           code_version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' roost.py)
-          pypi_version=$(basename "$(ls dist/*.whl)" | cut -d- -f2)
-          echo "__version__ / tag / deb / man : $code_version"
-          echo "wheel, sdist and PyPI         : $pypi_version"
-          if [ "$code_version" != "$pypi_version" ]; then
-            echo "::warning::PyPI will publish this as $pypi_version, not $code_version"
+          wheel_version=$(basename "$(ls dist/*.whl)" | cut -d- -f2)
+          echo "version / tag / deb / man : $code_version"
+          echo "wheel and sdist           : $wheel_version"
+          if [ "$code_version" != "$wheel_version" ]; then
+            echo "::error::PEP 440 rewrote $code_version to $wheel_version; pick a canonical version" >&2
+            exit 1
           fi
 
       - name: Verify the built package actually runs
@@ -86,25 +91,3 @@ jobs:
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
             || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
           gh release upload "$GITHUB_REF_NAME" dist/* --clobber
-
-  # Publishes the tagged build to PyPI via trusted publishing (OIDC): PyPI
-  # trusts this repo's release.yml through the "pypi" environment, so no API
-  # token exists anywhere -- not in secrets, not on a laptop. The first run
-  # needs the pending publisher registered on the PyPI account; until then
-  # this job fails on its own and can be re-run after registration. The
-  # release artifacts above land either way.
-  pypi:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
-    runs-on: ubuntu-latest
-    environment: pypi
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist
-      - name: Drop the .deb -- PyPI takes wheels and sdists only
-        run: rm -f dist/*.deb
-      - uses: pypa/gh-action-pypi-publish@release/v1

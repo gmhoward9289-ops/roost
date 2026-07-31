@@ -38,11 +38,7 @@ turn, and everything quiet collapses to a single line.
 
 ## Install
 
-```bash
-pipx install roost
-```
-
-Homebrew:
+Homebrew (macOS and Linux):
 
 ```bash
 brew install gmhoward9289-ops/tap/roost
@@ -58,20 +54,32 @@ sudo apt install ./roost_0.2_all.deb
 There is no PPA and no apt repository; the `.deb` is a release artifact, and
 `apt install ./file.deb` resolves `python3` exactly as a repo install would.
 
-Or just take the file — it is one script with no dependencies:
+With pipx, straight from the repo — no package index involved:
+
+```bash
+pipx install git+https://github.com/gmhoward9289-ops/roost
+```
+
+Or just take the file. It is one script, stdlib only, no dependencies:
 
 ```bash
 curl -o roost https://raw.githubusercontent.com/gmhoward9289-ops/roost/main/roost.py
 chmod +x roost && ./roost
 ```
 
-Windows: save as `roost.py` and run it — `.PY` is in `PATHEXT`, so `roost.py`
-works from anywhere on `PATH`.
+Windows: save it as `roost.py` and run it — `.PY` is in `PATHEXT`, so `roost.py`
+works from anywhere on `PATH`. There is no Windows package; the single file is
+the install.
 
-The man page (`man roost`) ships with the Homebrew and `.deb` installs. A `pipx`
+**roost is not on PyPI**, deliberately. It is one dependency-free script, and the
+four routes above cover every platform it runs on without another account, token
+or release channel to keep in sync. `pipx install git+...` gives you the pipx
+workflow regardless.
+
+The man page (`man roost`) ships with the Homebrew and `.deb` installs. A pipx
 install puts it under the venv's own `share/man`, which is not on the default
-`MANPATH`; `man "$(pipx environment --value PIPX_LOCAL_VENVS)/roost/share/man/man1/roost.1"`
-reads it in place.
+`MANPATH`; read it in place with
+`man "$(pipx environment --value PIPX_LOCAL_VENVS)/roost/share/man/man1/roost.1"`.
 
 ## Use
 
