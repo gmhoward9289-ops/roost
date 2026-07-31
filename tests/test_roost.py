@@ -433,14 +433,55 @@ class TestPaintOverflow(unittest.TestCase):
         shown = len(out) - 1  # every row but the notice
         self.assertIn("%d more line(s)" % (40 - shown), out[-1])
 
-    def test_a_frame_that_fits_is_left_alone(self):
+    def test_a_frame_that_fits_keeps_every_line(self):
         out = self._paint(5)
-        self.assertEqual(out, ["line %d" % i for i in range(5)])
+        self.assertEqual(len(out), 5)
+        self.assertEqual(out[:-1], ["line %d" % i for i in range(4)])
+        # The last line carries the version stamp, so it is compared by prefix.
+        self.assertTrue(out[-1].startswith("line 4"))
         self.assertNotIn("more line(s)", "\n".join(out))
 
     def test_never_paints_more_rows_than_the_terminal_has(self):
         for n in (1, 10, 11, 12, 13, 200):
             self.assertLessEqual(len(self._paint(n)), 11)
+
+    def test_version_is_stamped_bottom_right(self):
+        out = self._paint(3)
+        self.assertTrue(out[-1].endswith("v" + roost.__version__))
+
+    def test_version_survives_an_overflowing_frame(self):
+        """It rides the overflow notice rather than the line the notice replaced,
+        so the thing that reports clipping cannot itself clip the version away."""
+        out = self._paint(40)
+        self.assertIn("more line(s) below", out[-1])
+        self.assertTrue(out[-1].endswith("v" + roost.__version__))
+
+    def test_version_is_dropped_rather_than_wrapped(self):
+        """A wrapped line scrolls the display, which is indistinguishable from a
+        clear that never happened."""
+        buf = io.StringIO()
+        stdout = sys.stdout
+        sys.stdout = buf
+        try:
+            roost.paint(["x" * 200], vt=False)
+        finally:
+            sys.stdout = stdout
+        line = buf.getvalue().splitlines()[-1]
+        self.assertLessEqual(len(line), 99)
+        self.assertNotIn("v" + roost.__version__, line)
+
+    def test_padding_counts_columns_not_bytes(self):
+        """len() on a coloured line counts escape bytes as columns and shoves the
+        stamp past the right edge by one column per colour code."""
+        roost.COLOR = True
+        buf = io.StringIO()
+        stdout = sys.stdout
+        sys.stdout = buf
+        try:
+            roost.paint([roost.c("a", roost.RED) + roost.c("b", roost.GREEN)], vt=False)
+        finally:
+            sys.stdout = stdout
+        self.assertEqual(roost.visible_len(buf.getvalue().splitlines()[-1]), 99)
 
 
 class TestActionLog(unittest.TestCase):

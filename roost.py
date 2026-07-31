@@ -51,7 +51,7 @@ import sys
 import time
 from pathlib import Path
 
-__version__ = "0.2"
+__version__ = "0.02"
 
 HOME = Path.home()
 SESSIONS_DIR = HOME / ".claude" / "sessions"
@@ -1053,6 +1053,19 @@ def paint(lines, vt):
         body = body[: rows - 2] + [clip_ansi(
             c("... %d more line(s) below -- taller window, or s/a to close a panel"
               % hidden, DIM), cols - 1)]
+
+    # Version, bottom-right. Stamped onto whatever the last visible line turns
+    # out to be -- including the overflow notice above -- so it cannot itself be
+    # the thing that gets clipped off. INFRA is not a footer to hang it on: it
+    # leads the frame. Padded by visible_len, since escape bytes are not columns
+    # and len() would push it off the right edge by the number of colour codes
+    # in the line. Dropped rather than wrapped when there is no room: a wrapped
+    # line scrolls the display, which looks identical to a clear that never ran.
+    if body:
+        stamp = c("v" + __version__, DIM)
+        room = cols - 1 - visible_len(body[-1]) - visible_len(stamp)
+        if room >= 2:
+            body[-1] += " " * room + stamp
     if vt:
         # Home, overwrite each line erasing its old tail, then wipe any rows left
         # over from a taller previous frame. Flicker-free, unlike a full clear.

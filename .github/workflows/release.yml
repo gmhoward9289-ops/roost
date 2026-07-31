@@ -42,6 +42,20 @@ jobs:
             exit 1
           fi
 
+      # PEP 440 strips the leading zero, so __version__ "0.02" builds a wheel
+      # named roost-0.2 while the tag, the .deb and the man page all say 0.02.
+      # That is a chosen tradeoff, not an accident -- surfaced here rather than
+      # discovered on the PyPI page after an upload that cannot be undone.
+      - name: Report the PyPI-normalised version
+        run: |
+          code_version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' roost.py)
+          pypi_version=$(basename "$(ls dist/*.whl)" | cut -d- -f2)
+          echo "__version__ / tag / deb / man : $code_version"
+          echo "wheel, sdist and PyPI         : $pypi_version"
+          if [ "$code_version" != "$pypi_version" ]; then
+            echo "::warning::PyPI will publish this as $pypi_version, not $code_version"
+          fi
+
       - name: Verify the built package actually runs
         run: |
           python -m venv /tmp/v
@@ -65,4 +79,10 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+        # Pushing a tag does not create a GitHub Release, so uploading straight
+        # to one fails on a plain `git push --tags`. Create it if it is not there
+        # and upload either way, so the tag is the only step a release needs.
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
