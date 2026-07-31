@@ -1,0 +1,4 @@
+# A CR in the shebang makes the script unrunnable on Linux/macOS with a
+# baffling "env: python3\r: No such file or directory". Force LF everywhere.
+* text=auto eol=lf
+*.py text eol=lf
