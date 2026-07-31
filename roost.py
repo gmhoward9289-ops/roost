@@ -602,6 +602,7 @@ EXPENSIVE_TOKENS = 150000   # per-turn cost above which a fresh session is cheap
 PARKED_IDLE_HOURS = 2       # untouched this long and still fat == parked
 STALE_IDLE_HOURS = 6        # untouched this long and small == just clutter
 NEAR_LIMIT_PCT = 80
+ADVICE_TASK_WIDTH = 52  # task text in ADVICE; the detail lives on the next line
 TYPICAL_BASELINE = 50000    # measured: what a fresh session starts at here
 # -----------------------------------------------------------------------------
 
@@ -616,25 +617,31 @@ def advise(workers):
         idle_h = (r["idle_secs"] or 0) / 3600.0
         pct = r["ctx_pct"] or 0
         tag = "%s (pid %d)" % (r["name"], r["pid"])
+        # The pid alone does not tell you what you would be closing. The task is
+        # what makes the call obvious -- "audit the build scripts" is easy to
+        # abandon, "migrate the database" is not.
+        task = ascii_safe(r.get("task") or "")
+        if len(task) > ADVICE_TASK_WIDTH:
+            task = task[:ADVICE_TASK_WIDTH - 3] + "..."
         saving = tok - TYPICAL_BASELINE
 
         if tok >= EXPENSIVE_TOKENS and idle_h >= PARKED_IDLE_HOURS:
-            out.append((saving, c("PARKED+COSTLY", BOLD, RED), tag,
+            out.append((saving, c("PARKED+COSTLY", BOLD, RED), tag, task,
                         "idle %.1fh holding %s tokens. Resuming costs that much on the "
                         "FIRST turn. Start a fresh session instead (~%s) and save ~%s per turn."
                         % (idle_h, "{:,}".format(tok), "{:,}".format(TYPICAL_BASELINE),
                            "{:,}".format(saving))))
         elif pct >= NEAR_LIMIT_PCT:
-            out.append((saving, c("NEAR LIMIT", BOLD, YELLOW), tag,
+            out.append((saving, c("NEAR LIMIT", BOLD, YELLOW), tag, task,
                         "at %.0f%% of its window. Wrap up or /compact before it "
                         "auto-compacts mid-task." % pct))
         elif tok >= EXPENSIVE_TOKENS:
-            out.append((saving, c("EXPENSIVE", YELLOW), tag,
+            out.append((saving, c("EXPENSIVE", YELLOW), tag, task,
                         "every turn now reprocesses %s tokens. Fine to finish the "
                         "current task in; do not start an unrelated one here."
                         % "{:,}".format(tok)))
         elif idle_h >= STALE_IDLE_HOURS:
-            out.append((0, c("STALE", DIM), tag,
+            out.append((0, c("STALE", DIM), tag, task,
                         "idle %.1fh at %.0f%%. Costs nothing while it sits, but it hides "
                         "the sessions that matter -- close it." % (idle_h, pct)))
 
@@ -642,8 +649,11 @@ def advise(workers):
     if not out:
         lines.append("  nothing to act on -- no parked, oversized, or stale sessions")
         return lines
-    for _, label, tag, text in sorted(out, key=lambda x: -x[0]):
-        lines.append("  %s  %s" % (label, c(tag, BOLD)))
+    for _, label, tag, task, text in sorted(out, key=lambda x: -x[0]):
+        head = "  %s  %s" % (label, c(tag, BOLD))
+        if task:
+            head += "  " + c(task, DIM)
+        lines.append(head)
         lines.append("      %s" % text)
 
     total = sum(r["ctx_tokens"] or 0 for r in workers)
