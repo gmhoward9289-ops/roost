@@ -8,13 +8,13 @@
 # (stars/forks/watchers) that this project has not met.
 #
 # After tagging a release, refresh the checksum with:
-#   curl -sL https://github.com/gmhoward9289-ops/roost/archive/refs/tags/v0.3.tar.gz | shasum -a 256
+#   curl -sL https://github.com/gmhoward9289-ops/roost/archive/refs/tags/v0.4.tar.gz | shasum -a 256
 class Roost < Formula
   include Language::Python::Shebang
 
   desc "top for Claude Code: live sessions, context use, and their subagents"
   homepage "https://github.com/gmhoward9289-ops/roost"
-  url "https://github.com/gmhoward9289-ops/roost/archive/refs/tags/v0.3.tar.gz"
+  url "https://github.com/gmhoward9289-ops/roost/archive/refs/tags/v0.4.tar.gz"
   sha256 "01b8cd2245c49daf939d12d5564d334217ceacb47effcb2a57c7ef4255068113"
   license "MIT"
 
