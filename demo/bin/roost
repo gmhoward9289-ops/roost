@@ -1,0 +1,4 @@
+#!/bin/sh
+# Shim so the recording shows `roost` being typed, while running the repo's
+# own roost.py -- whatever branch is checked out is what gets recorded.
+exec python3 "$(cd "$(dirname "$0")/../.." && pwd)/roost.py" "$@"

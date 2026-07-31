@@ -7,6 +7,8 @@ it has burned — and, unlike anything else, **the subagents it spawned**.
 
 One file, no dependencies, Python 3.9+. Runs on macOS, Linux and Windows.
 
+![roost watching a fleet: buckets, subagents, the advice panel, and a cancelled stop](demo/roost-demo.gif)
+
 ```
   WORKER    MODEL    CTX  IDLE    TASK
 NEAR LIMIT
