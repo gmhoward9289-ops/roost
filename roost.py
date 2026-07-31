@@ -71,7 +71,15 @@ AGENT_RECENT_SECS = 3600
 
 # A subagent counts as working if its transcript was written this recently.
 AGENT_ACTIVE_SECS = 30
+
+# Every session roost stops gets one JSON line here. Same shape and the same cap
+# as the hook logs next to it, so the same one-liners read all of them.
+LOG_PATH = HOME / ".claude" / "logs" / "roost.jsonl"
+LOG_MAX_LINES = 5000
 # -----------------------------------------------------------------------------
+
+# Set in main(); --no-log turns it off.
+LOGGING = True
 
 # agentId -> {description, status, model}, harvested from the parent transcript.
 # Descriptions never change, so this is filled once and never invalidated.
@@ -209,6 +217,54 @@ def alive(pid):
     except PermissionError:
         return True
     return True
+
+
+def trim_log():
+    """Hold the log at LOG_MAX_LINES, checked by size so the common write is one
+    append and no read. Records run a few hundred bytes; the slack is deliberate."""
+    try:
+        if LOG_PATH.stat().st_size < LOG_MAX_LINES * 400:
+            return
+        kept = LOG_PATH.read_text(encoding="utf-8").splitlines()[-LOG_MAX_LINES:]
+        LOG_PATH.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def log_action(action, worker, ok=True, detail=""):
+    """Append one record per action roost takes.
+
+    Actions only -- frames are not logged, and neither is task text. The task is
+    free-form prose out of a transcript and would turn an audit trail into a
+    copy of what was being worked on; name and sessionId identify the session
+    without carrying its contents. The numbers alongside are what make the log
+    answer a real question later: how much context a sweep actually reclaimed.
+
+    Never raises. A log that cannot be written is not a reason to lose the UI.
+    """
+    if not LOGGING:
+        return
+    rec = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "action": action,
+        "ok": ok,
+        "host": socket.gethostname(),
+        "name": worker.get("name"),
+        "pid": worker.get("pid"),
+        "session_id": worker.get("session_id"),
+        "model": worker.get("model"),
+        "ctx_tokens": worker.get("ctx_tokens"),
+        "idle_secs": int(worker["idle_secs"]) if worker.get("idle_secs") else None,
+    }
+    if detail:
+        rec["detail"] = detail
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(str(LOG_PATH), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except OSError:
+        return
+    trim_log()
 
 
 def terminate(pid):
@@ -988,7 +1044,15 @@ def paint(lines, vt):
     to a clear that never happened.
     """
     cols, rows = term_size()
-    body = [clip_ansi(ln, cols - 1) for ln in lines][: rows - 1]
+    body = [clip_ansi(ln, cols - 1) for ln in lines]
+    # Say so when the frame does not fit. Silent truncation is how a confirmation
+    # prompt and an ADVICE panel both went missing without appearing to fail --
+    # the screen looked complete, so nothing suggested there was more below it.
+    if len(body) > rows - 1:
+        hidden = len(body) - (rows - 2)
+        body = body[: rows - 2] + [clip_ansi(
+            c("... %d more line(s) below -- taller window, or s/a to close a panel"
+              % hidden, DIM), cols - 1)]
     if vt:
         # Home, overwrite each line erasing its old tail, then wipe any rows left
         # over from a taller previous frame. Flicker-free, unlike a full clear.
@@ -1014,12 +1078,17 @@ def main():
                     help="start with the ADVICE panel open (toggle live with 'a')")
     ap.add_argument("--no-agents", action="store_true",
                     help="start with the SUBAGENTS panel closed (toggle live with 's')")
+    ap.add_argument("--no-log", action="store_true",
+                    help="do not record stopped sessions to %s" % LOG_PATH)
     ap.epilog = (
         "keys while running:  space = refresh now   a = advice panel   "
         "s = subagents panel   q = quit\n"
         "with a cursor (j/k or arrows):  x = stop the session (confirms)   "
         "y = copy its sessionId   esc = deselect")
     args = ap.parse_args()
+
+    global LOGGING
+    LOGGING = not args.no_log
 
     if args.json:
         print(json.dumps({"workers": collect_workers(), "infra": collect_infra()}, indent=2))
@@ -1049,7 +1118,11 @@ def main():
 
     # Panels are toggled live rather than fixed at launch: on a short terminal all
     # three at once overflow the window, and what you want to see changes.
-    show = {"advice": args.advise, "agents": not args.no_agents}
+    # One panel at a time. They used to be independent toggles, which meant
+    # opening ADVICE while SUBAGENTS was up pushed it past the bottom of the
+    # terminal -- you had to close the other one first to see the one you asked
+    # for. Flipping is what "show me the advice" actually means.
+    view = "advice" if args.advise else (None if args.no_agents else "agents")
     sel = None      # cursor row index, or None when there is no cursor
     pending = None  # the worker row awaiting a y/n answer
     note = None     # result of the last action, cleared by the next keypress
@@ -1060,28 +1133,42 @@ def main():
                     hint = "Ctrl-C to stop"
                 elif sel is None:
                     hint = "j/k select | space refresh | %s advice | %s agents | q quit" % (
-                        c("a", BOLD, GREEN) if show["advice"] else "a",
-                        c("s", BOLD, GREEN) if show["agents"] else "s",
+                        c("a", BOLD, GREEN) if view == "advice" else "a",
+                        c("s", BOLD, GREEN) if view == "agents" else "s",
                     )
                 else:
                     hint = "j/k move | x stop | y yank id | esc deselect | q quit"
-                header = [
-                    c("roost", BOLD) + "  " + c(socket.gethostname(), CYAN)
-                    + "  " + time.strftime("%H:%M:%S") + "   " + c(hint, DIM),
-                    "",
-                ]
-                lines, rows, sel = frame(show["advice"], show["agents"], sel)
+                lines, rows, sel = frame(view == "advice", view == "agents", sel)
                 # A session can exit while its confirmation is on screen. Matching
                 # on pid rather than on the row dict is what makes that detectable:
                 # every frame rebuilds the dicts, so identity and equality both
                 # fail on rows that are in fact the same session.
                 if pending and not any(r["pid"] == pending["pid"] for r in rows):
                     pending, note = None, c("that session exited on its own", DIM)
+
+                # The status line lives in the header, above the table, and the
+                # blank placeholder keeps it there so nothing shifts when it
+                # fills. It used to be appended under the table, where paint()
+                # clipped it away: 24 sessions and their subagents make a frame
+                # taller than the terminal, so the confirmation was invisible
+                # precisely when there was most to act on, and the next keypress
+                # cancelled a prompt that had never been seen.
                 if pending:
-                    lines += ["", c("stop %s (pid %d)?  y / n" % (
-                        pending["name"], pending["pid"]), BOLD, RED)]
-                elif note:
-                    lines += ["", note]
+                    status = c("stop %s (pid %d)?   y = yes, any other key = no" % (
+                        pending["name"], pending["pid"]), BOLD, RED)
+                else:
+                    status = note or ""
+                title = (c("roost", BOLD) + "  " + c(socket.gethostname(), CYAN)
+                         + "  " + time.strftime("%H:%M:%S") + "   " + c(hint, DIM))
+                if keys.enabled:
+                    # Only in interactive mode, because that is the half that can
+                    # end a process. Reading the dashboard has never been the
+                    # risky part. Pinned top-right so it sits above the table
+                    # rather than anywhere the frame can clip it away.
+                    tag = c(" EXPERIMENTAL ", BOLD, REVERSE, YELLOW)
+                    pad = term_size()[0] - 1 - visible_len(title) - visible_len(tag)
+                    title += " " * max(1, pad) + tag
+                header = [title, status, ""]
                 paint(header + lines, vt)
 
                 # Sleep in slices so a keypress lands within ~0.2s rather than at
@@ -1102,6 +1189,7 @@ def main():
                     if pending is not None:
                         if key in ("y", "Y"):
                             err = terminate(pending["pid"])
+                            log_action("stop", pending, ok=err is None, detail=err or "")
                             note = c("stopped %s (pid %d)" % (
                                 pending["name"], pending["pid"]), GREEN) if err is None \
                                 else c(err, BOLD, RED)
@@ -1126,20 +1214,25 @@ def main():
                         sel = 0 if sel is None else max(0, sel - 1)
                         break
                     if key in ("a", "A"):
-                        show["advice"] = not show["advice"]
+                        view = None if view == "advice" else "advice"
                         break  # repaint immediately, do not wait out the tick
                     if key in ("s", "S"):
-                        show["agents"] = not show["agents"]
+                        view = None if view == "agents" else "agents"
                         break
-                    if sel is not None and rows and key in ("x", "X"):
-                        # Captured from the frame on screen, not re-resolved later.
-                        pending = rows[sel]
-                        break
-                    if sel is not None and rows and key in ("y", "Y"):
-                        w = rows[sel]
-                        note = c("copied %s -- claude --resume <paste>" % w["name"], GREEN) \
-                            if to_clipboard(w["session_id"]) \
-                            else c("no clipboard helper (%s not found)" % CLIP_CMD[0], YELLOW)
+                    if key in ("x", "X", "y", "Y"):
+                        # Both need a row. Saying so beats doing nothing: a key
+                        # that silently no-ops is indistinguishable from a broken
+                        # one, and this pair is the reason the cursor exists.
+                        if sel is None or not rows:
+                            note = c("select a row first -- j/k or the arrow keys", YELLOW)
+                        elif key in ("x", "X"):
+                            # Captured from the frame on screen, not re-resolved later.
+                            pending = rows[sel]
+                        else:
+                            w = rows[sel]
+                            note = c("copied %s -- claude --resume <paste>" % w["name"], GREEN) \
+                                if to_clipboard(w["session_id"]) \
+                                else c("no clipboard helper (%s not found)" % CLIP_CMD[0], YELLOW)
                         break
     except KeyboardInterrupt:
         pass

@@ -11,8 +11,11 @@ how much of its context window it has consumed, how long it has been idle, and
 the subagents it has spawned. It refreshes in place, like
 .BR top (1).
 .PP
-It reads three local sources and writes nothing. There is no network traffic
-beyond a localhost probe of the inference ports.
+It reads three local sources. The only file it writes is its own action log,
+described under
+.B LOGGING
+below. There is no network traffic beyond a localhost probe of the inference
+ports.
 .RS
 .IP \(bu 2
 .I ~/.claude/sessions/<pid>.json
@@ -55,6 +58,11 @@ Disable colour. Colour is also suppressed when
 .B NO_COLOR
 is set in the environment or when output is not a terminal.
 .TP
+.B \-\-no\-log
+Do not record stopped sessions. See
+.B LOGGING
+below.
+.TP
 .B \-\-version
 Print the version and exit.
 .SH INTERACTIVE KEYS
@@ -63,7 +71,10 @@ Print the version and exit.
 Repaint immediately instead of waiting out the interval.
 .TP
 .BR a ", " s
-Toggle the ADVICE and SUBAGENTS panels.
+Show the ADVICE or SUBAGENTS panel; pressing the key again closes it. Only one
+panel is open at a time, so asking for one closes the other. Opening both used
+to push the second past the bottom of the terminal, which looked like the key
+had done nothing.
 .TP
 .BR j ", " k ", " Down ", " Up
 Raise the cursor and move it. Raising the cursor expands the
@@ -109,6 +120,32 @@ written a turn at a time, so at most a turn already in flight is lost.
 roost refuses to stop its own process or its parent. Run from inside the session
 it is pointed at, the cursor can land on the row whose process owns the
 terminal, and stopping it would take roost with it.
+.SH LOGGING
+Every session stopped with
+.B x
+appends one JSON object to
+.IR ~/.claude/logs/roost.jsonl :
+timestamp, host, session name, pid, sessionId, model, context tokens held, idle
+seconds, and whether the stop succeeded. The file is held at 5000 lines.
+.PP
+The session's task text is deliberately not recorded. It is free-form prose out
+of a transcript, and an audit trail of what was stopped should not become a copy
+of what was being worked on.
+.PP
+Because the record carries the context each session was holding, the log answers
+afterwards what a sweep actually reclaimed:
+.PP
+.RS
+.EX
+python3 \-c 'import json,sys; print(sum(json.loads(l)["ctx_tokens"] or 0
+  for l in open(sys.argv[1]) if json.loads(l)["ok"]))' ~/.claude/logs/roost.jsonl
+.EE
+.RE
+.PP
+Pass
+.B \-\-no\-log
+to record nothing. A log that cannot be written is ignored rather than raised:
+losing the log is survivable, losing the display is not.
 .SH EXIT STATUS
 .B roost
 exits 0 unless it could not parse its arguments.
@@ -138,6 +175,9 @@ One JSON file per live session, named for its pid.
 .TP
 .I ~/.claude/projects/
 Session transcripts, and subagent transcripts one directory deeper.
+.TP
+.I ~/.claude/logs/roost.jsonl
+One JSON record per session stopped. The only file roost writes.
 .SH SEE ALSO
 .BR top (1),
 .BR claude (1)

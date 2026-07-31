@@ -86,6 +86,10 @@ While running: `space` refresh now · `a` advice panel · `s` subagents panel ·
 
 ## Acting on a session
 
+> **Experimental.** Interactive mode carries an `EXPERIMENTAL` marker in the
+> top-right corner, and it means it — `x` ends a real process. Reading the
+> dashboard has never been the risky half.
+
 `j`/`k` (or the arrow keys) raise a cursor. Raising it expands the `QUIET`
 group, because a session idle for hours is exactly what a sweep is looking for
 and it is unreachable while collapsed.
@@ -111,6 +115,34 @@ quiet, and an index that outlived its frame would eventually stop the wrong one.
 roost refuses to stop its own process or its parent — run it from inside the
 session it is pointed at and the cursor can land on the row that owns your
 terminal.
+
+Only one panel is open at a time: `a` and `s` flip between ADVICE and SUBAGENTS
+rather than stacking. With two dozen sessions on screen a stacked second panel
+lands below the bottom of the terminal, which is indistinguishable from the key
+not working. For the same reason the frame now says `... N more line(s) below`
+instead of quietly truncating.
+
+## What it logs
+
+Every session stopped with `x` appends one JSON line to
+`~/.claude/logs/roost.jsonl` — same shape and the same 5000-line cap as the hook
+logs beside it:
+
+```json
+{"ts":"2026-07-31T00:22:57-0400","action":"stop","ok":true,"host":"COOPER",
+ "name":"models-ca","pid":4321,"session_id":"abc-123","model":"claude-opus-5",
+ "ctx_tokens":484030,"idle_secs":92500}
+```
+
+The session's **task text is deliberately not recorded.** It is free-form prose
+out of a transcript, and an audit trail of what was stopped should not become a
+copy of what was being worked on.
+
+Because each record carries the context that session was holding, the log
+answers afterwards what a sweep actually reclaimed rather than just how many
+rows you closed. `--no-log` records nothing. A log that cannot be written is
+ignored rather than raised — losing the log is survivable, losing the display
+is not.
 
 ## Why subagents are the interesting part
 

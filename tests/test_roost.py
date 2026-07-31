@@ -9,6 +9,7 @@ codes leaking through width clipping, and a mtime cache that returned stale rows
 """
 
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -372,6 +373,105 @@ class TestTerminateGuard(unittest.TestCase):
         """roost launched from inside a session puts that session's pid on screen;
         x on that row would take roost's own terminal with it."""
         self.assertIn("own process tree", roost.terminate(os.getppid()))
+
+
+class TestPaintOverflow(unittest.TestCase):
+    """Silent truncation is how a confirmation prompt and the ADVICE panel both
+    went missing without appearing to fail: 24 sessions plus subagents make a
+    frame taller than the terminal, and the screen still looked complete."""
+
+    def setUp(self):
+        self._color, self._term = roost.COLOR, roost.term_size
+        roost.COLOR = False
+        roost.term_size = lambda: (100, 12)
+
+    def tearDown(self):
+        roost.COLOR, roost.term_size = self._color, self._term
+
+    def _paint(self, n):
+        buf = io.StringIO()
+        stdout = sys.stdout
+        sys.stdout = buf
+        try:
+            roost.paint(["line %d" % i for i in range(n)], vt=False)
+        finally:
+            sys.stdout = stdout
+        return buf.getvalue().splitlines()
+
+    def test_overflow_is_announced_not_swallowed(self):
+        out = self._paint(40)
+        self.assertIn("more line(s) below", out[-1])
+
+    def test_the_count_accounts_for_the_notice_itself(self):
+        """The notice occupies a row, so the line it displaces must be counted."""
+        out = self._paint(40)
+        shown = len(out) - 1  # every row but the notice
+        self.assertIn("%d more line(s)" % (40 - shown), out[-1])
+
+    def test_a_frame_that_fits_is_left_alone(self):
+        out = self._paint(5)
+        self.assertEqual(out, ["line %d" % i for i in range(5)])
+        self.assertNotIn("more line(s)", "\n".join(out))
+
+    def test_never_paints_more_rows_than_the_terminal_has(self):
+        for n in (1, 10, 11, 12, 13, 200):
+            self.assertLessEqual(len(self._paint(n)), 11)
+
+
+class TestActionLog(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._path, self._on = roost.LOG_PATH, roost.LOGGING
+        # A nested directory on purpose: on a fresh machine ~/.claude/logs does
+        # not exist yet, and the first stop must not be the thing that discovers it.
+        roost.LOG_PATH = Path(self.tmp) / "logs" / "roost.jsonl"
+        roost.LOGGING = True
+
+    def tearDown(self):
+        roost.LOG_PATH, roost.LOGGING = self._path, self._on
+
+    def test_writes_one_json_record_per_action(self):
+        roost.log_action("stop", worker(name="a", pid=7))
+        roost.log_action("stop", worker(name="b", pid=8), ok=False, detail="denied")
+        records = [json.loads(l) for l in roost.LOG_PATH.read_text().splitlines()]
+        self.assertEqual([r["pid"] for r in records], [7, 8])
+        self.assertEqual([r["ok"] for r in records], [True, False])
+        self.assertEqual(records[1]["detail"], "denied")
+
+    def test_task_text_is_never_logged(self):
+        """The task is free-form transcript prose. An audit trail of what was
+        stopped must not become a copy of what was being worked on."""
+        roost.log_action("stop", worker(task="private notes about a client"))
+        body = roost.LOG_PATH.read_text()
+        self.assertNotIn("private notes", body)
+        self.assertNotIn("task", json.loads(body.splitlines()[0]))
+
+    def test_records_carry_what_makes_a_sweep_answerable_later(self):
+        roost.log_action("stop", worker(ctx_tokens=484030, idle_secs=92500.7))
+        rec = json.loads(roost.LOG_PATH.read_text().splitlines()[0])
+        self.assertEqual(rec["ctx_tokens"], 484030)
+        self.assertEqual(rec["idle_secs"], 92500)
+        for field in ("ts", "host", "name", "session_id", "model"):
+            self.assertIn(field, rec)
+
+    def test_no_log_writes_nothing(self):
+        roost.LOGGING = False
+        roost.log_action("stop", worker())
+        self.assertFalse(roost.LOG_PATH.exists())
+
+    def test_an_unwritable_log_does_not_take_down_the_ui(self):
+        """Losing the log is survivable; losing the frame is not."""
+        roost.LOG_PATH = Path(self.tmp) / "logs"  # a directory, so open() fails
+        roost.LOG_PATH.mkdir(parents=True, exist_ok=True)
+        roost.log_action("stop", worker())  # must not raise
+
+    def test_trim_holds_the_file_at_the_cap(self):
+        roost.LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fat = json.dumps({"pad": "x" * 500})
+        roost.LOG_PATH.write_text("\n".join([fat] * (roost.LOG_MAX_LINES + 400)) + "\n")
+        roost.trim_log()
+        kept = len(roost.LOG_PATH.read_text().splitlines())
+        self.assertEqual(kept, roost.LOG_MAX_LINES)
 
 
 class TestInfraLine(unittest.TestCase):
