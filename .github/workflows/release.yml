@@ -4,8 +4,10 @@ name: release
 # publishes the wheel and sdist to PyPI as roost-top -- the bare name is held
 # in reserve there, and the pypi job below says how the publishing works.
 #
-# The .deb is the apt story -- there is no PPA, so it installs with
-# `sudo apt install ./roost_<version>_all.deb`.
+# The .deb is also pushed into a real apt repo by the apt-repo job below, so
+# `sudo apt install ./roost_<version>_all.deb` (no repo, no updates) and
+# `sudo apt install roost` (via the hosted repo, with updates) both work --
+# see that job for how the repo itself gets built and signed.
 on:
   push:
     tags: ["v*"]
@@ -110,3 +112,103 @@ jobs:
       - name: Drop the .deb -- PyPI takes wheels and sdists only
         run: rm -f dist/*.deb
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # Publishes the .deb into a real, signed apt repo hosted on this repo's
+  # GitHub Pages (gh-pages branch), so users get `sudo apt install roost` and
+  # `apt upgrade` instead of a one-shot manual .deb download. One arch (all),
+  # one suite (stable), one component (main) -- roost has no variants that
+  # would need more.
+  #
+  # Signing key: a dedicated, sign-only key (not George's personal key),
+  # imported here from the ROOST_APT_GPG_PRIVATE_KEY secret. Its public half
+  # is the master copy at packaging/apt/pubkey.asc, published unchanged as
+  # roost-archive-keyring.asc at the repo root so `curl | gpg --dearmor` gets
+  # exactly what signed the Release file. Rotating it means: generate a new
+  # key, replace the secret, replace packaging/apt/pubkey.asc, tell existing
+  # users to re-import.
+  #
+  # Requires the gh-pages branch to already exist (bootstrapped once,
+  # separately -- this job only ever updates it, never creates it) and GitHub
+  # Pages to be enabled for the repo pointed at that branch.
+  apt-repo:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the tag (for packaging/apt/pubkey.asc)
+        uses: actions/checkout@v4
+        with:
+          path: src
+
+      - name: Check out gh-pages
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Install apt repo tooling
+        run: sudo apt-get update && sudo apt-get install -y apt-utils gnupg
+
+      - name: Import the signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.ROOST_APT_GPG_PRIVATE_KEY }}
+        run: |
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -m 700 "$GNUPGHOME"
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          fpr=$(echo "$GPG_PRIVATE_KEY" | gpg --batch --import-options show-only --import --with-colons 2>/dev/null | awk -F: '/^fpr:/{print $10; exit}')
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "KEYFPR=$fpr" >> "$GITHUB_ENV"
+
+      - name: Add the new .deb to the pool
+        run: |
+          deb=$(ls dist/*_all.deb)
+          install -D -m 0644 "$deb" "gh-pages/pool/main/r/roost/$(basename "$deb")"
+
+      - name: Publish the signing key alongside the repo
+        run: cp src/packaging/apt/pubkey.asc gh-pages/roost-archive-keyring.asc
+
+      - name: Rebuild the package index
+        working-directory: gh-pages
+        run: |
+          mkdir -p dists/stable/main/binary-all
+          apt-ftparchive packages pool > dists/stable/main/binary-all/Packages
+          gzip -9fk dists/stable/main/binary-all/Packages
+          apt-ftparchive \
+            -o APT::FTPArchive::Release::Origin=roost \
+            -o APT::FTPArchive::Release::Label=roost \
+            -o APT::FTPArchive::Release::Suite=stable \
+            -o APT::FTPArchive::Release::Codename=stable \
+            -o APT::FTPArchive::Release::Architectures=all \
+            -o APT::FTPArchive::Release::Components=main \
+            -o APT::FTPArchive::Release::Description="top for Claude Code" \
+            release dists/stable > dists/stable/Release
+
+      - name: Sign the release
+        working-directory: gh-pages
+        run: |
+          gpg --batch --yes --default-key "$KEYFPR" --clearsign -o dists/stable/InRelease dists/stable/Release
+          gpg --batch --yes --default-key "$KEYFPR" -abs -o dists/stable/Release.gpg dists/stable/Release
+
+      - name: Verify the signature the way apt will
+        run: gpg --verify gh-pages/dists/stable/InRelease
+
+      - name: Commit and push
+        working-directory: gh-pages
+        run: |
+          git config user.name "roost-release-bot"
+          git config user.email "dev@swamplink.com"
+          git add -A
+          git commit -m "Publish $GITHUB_REF_NAME" || echo "nothing changed"
+          git push origin gh-pages
+
+      - name: Discard the imported private key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/gnupg"

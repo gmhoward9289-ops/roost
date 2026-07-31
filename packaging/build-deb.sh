@@ -4,9 +4,10 @@
 # Deliberately a plain dpkg-deb tree rather than a debian/ source package: roost
 # is one architecture-independent script with no build step and no dependencies
 # beyond python3 itself, so debhelper would add ceremony and no correctness.
-# The result is meant to be attached to a GitHub release and installed with
-#   sudo apt install ./roost_<version>_all.deb
-# which resolves python3 the same way an apt repo would. There is no PPA.
+# The .github/workflows/release.yml apt-repo job publishes this same .deb into
+# a real signed apt repo; it is also attached to the GitHub release as-is for
+# `sudo apt install ./roost_<version>_all.deb`, which resolves python3 the same
+# way the repo install does.
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
