@@ -53,6 +53,14 @@ Start with the ADVICE panel open. Toggle it live with
 Start with the SUBAGENTS panel closed. Toggle it live with
 .BR s .
 .TP
+.B \-\-interactive
+Start with interactive mode armed \(em the cursor,
+.BR x / y ,
+and the
+.B EXPERIMENTAL
+marker. Off by default. Toggle it live with
+.BR i .
+.TP
 .B \-\-no\-color
 Disable colour. Colour is also suppressed when
 .B NO_COLOR
@@ -76,18 +84,32 @@ panel is open at a time, so asking for one closes the other. Opening both used
 to push the second past the bottom of the terminal, which looked like the key
 had done nothing.
 .TP
+.B i
+Arm or disarm interactive mode. Off by default; arming it is what turns on
+the cursor,
+.BR x / y ,
+and the
+.B EXPERIMENTAL
+marker, all together. Disarming drops the cursor and stops
+.BR j / k / x / y
+from responding until armed again.
+.TP
 .BR j ", " k ", " Down ", " Up
-Raise the cursor and move it. Raising the cursor expands the
+Raise the cursor and move it. Requires interactive mode armed (see
+.BR i
+above). Raising the cursor expands the
 .B QUIET
 group, since idle sessions are usually the ones worth acting on.
 .TP
 .B x
-Stop the selected session. Prompts for confirmation; only
+Stop the selected session. Requires interactive mode armed. Prompts for
+confirmation; only
 .B y
 proceeds, and every other key cancels.
 .TP
 .B y
-Copy the selected session's sessionId to the clipboard, for
+Requires interactive mode armed. Copy the selected session's sessionId to the
+clipboard, for
 .BR "claude \-\-resume" .
 Uses
 .BR clip (1)

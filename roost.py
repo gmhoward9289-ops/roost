@@ -15,11 +15,15 @@ already in Claude Code's own state.
 In live mode: space repaints now, q quits, Ctrl-C quits. The refresh interval is
 the REFRESH_SECONDS constant below -- edit it to change the default everywhere.
 
-j/k (or the arrow keys) raise a cursor, which is the only way to act on a row:
-x stops the selected session, y copies its sessionId for `claude --resume`.
-Both act on the row object that was on screen when the key was pressed, never on
-an index re-resolved afterwards -- rows reorder between frames as sessions go
-quiet, and an index that outlived its frame would eventually hit the wrong one.
+i arms interactive mode, off by default. Arming it is what turns on the cursor
+and the EXPERIMENTAL tag together -- one key for the whole risky half, so a
+stray keypress on a dashboard left running cannot end a session by accident.
+Once armed, j/k (or the arrow keys) raise a cursor, which is the only way to
+act on a row: x stops the selected session, y copies its sessionId for
+`claude --resume`. Both act on the row object that was on screen when the key
+was pressed, never on an index re-resolved afterwards -- rows reorder between
+frames as sessions go quiet, and an index that outlived its frame would
+eventually hit the wrong one.
 
 Three sources, all local and all read-only:
 
@@ -1091,13 +1095,16 @@ def main():
                     help="start with the ADVICE panel open (toggle live with 'a')")
     ap.add_argument("--no-agents", action="store_true",
                     help="start with the SUBAGENTS panel closed (toggle live with 's')")
+    ap.add_argument("--interactive", action="store_true",
+                    help="start with interactive mode armed -- cursor, x/y, and the "
+                         "EXPERIMENTAL tag (default off; toggle live with 'i')")
     ap.add_argument("--no-log", action="store_true",
                     help="do not record stopped sessions to %s" % LOG_PATH)
     ap.epilog = (
         "keys while running:  space = refresh now   a = advice panel   "
-        "s = subagents panel   q = quit\n"
-        "with a cursor (j/k or arrows):  x = stop the session (confirms)   "
-        "y = copy its sessionId   esc = deselect")
+        "s = subagents panel   i = arm interactive mode   q = quit\n"
+        "interactive mode (armed with i):  j/k or arrows move a cursor   "
+        "x = stop the session (confirms)   y = copy its sessionId   esc = deselect")
     args = ap.parse_args()
 
     global LOGGING
@@ -1136,6 +1143,9 @@ def main():
     # terminal -- you had to close the other one first to see the one you asked
     # for. Flipping is what "show me the advice" actually means.
     view = "advice" if args.advise else (None if args.no_agents else "agents")
+    # Off by default: this is the gate on the half that can end a process, and
+    # arming it is one deliberate keypress rather than "having a terminal."
+    interactive = bool(args.interactive)
     sel = None      # cursor row index, or None when there is no cursor
     pending = None  # the worker row awaiting a y/n answer
     note = None     # result of the last action, cleared by the next keypress
@@ -1144,13 +1154,18 @@ def main():
             while True:
                 if not keys.enabled:
                     hint = "Ctrl-C to stop"
-                elif sel is None:
-                    hint = "j/k select | space refresh | %s advice | %s agents | q quit" % (
-                        c("a", BOLD, GREEN) if view == "advice" else "a",
-                        c("s", BOLD, GREEN) if view == "agents" else "s",
-                    )
                 else:
-                    hint = "j/k move | x stop | y yank id | esc deselect | q quit"
+                    i_tag = c("i", BOLD, GREEN) if interactive else "i"
+                    a_tag = c("a", BOLD, GREEN) if view == "advice" else "a"
+                    s_tag = c("s", BOLD, GREEN) if view == "agents" else "s"
+                    if not interactive:
+                        hint = "space refresh | %s interactive | %s advice | %s agents | q quit" % (
+                            i_tag, a_tag, s_tag)
+                    elif sel is None:
+                        hint = "j/k select | space refresh | %s interactive | %s advice | %s agents | q quit" % (
+                            i_tag, a_tag, s_tag)
+                    else:
+                        hint = "j/k move | x stop | y yank id | esc deselect | %s interactive | q quit" % i_tag
                 lines, rows, sel = frame(view == "advice", view == "agents", sel)
                 # A session can exit while its confirmation is on screen. Matching
                 # on pid rather than on the row dict is what makes that detectable:
@@ -1173,11 +1188,12 @@ def main():
                     status = note or ""
                 title = (c("roost", BOLD) + "  " + c(socket.gethostname(), CYAN)
                          + "  " + time.strftime("%H:%M:%S") + "   " + c(hint, DIM))
-                if keys.enabled:
-                    # Only in interactive mode, because that is the half that can
-                    # end a process. Reading the dashboard has never been the
-                    # risky part. Pinned top-right so it sits above the table
-                    # rather than anywhere the frame can clip it away.
+                if keys.enabled and interactive:
+                    # Only while interactive mode is armed, because that is the
+                    # half that can end a process. Reading the dashboard has
+                    # never been the risky part. Pinned top-right so it sits
+                    # above the table rather than anywhere the frame can clip
+                    # it away.
                     tag = c(" EXPERIMENTAL ", BOLD, REVERSE, YELLOW)
                     pad = term_size()[0] - 1 - visible_len(title) - visible_len(tag)
                     title += " " * max(1, pad) + tag
@@ -1218,25 +1234,49 @@ def main():
                     if key == "ESC":
                         sel = None
                         break
-                    if key in ("j", "J", "DOWN"):
-                        # Unbounded on purpose -- frame() clamps against the row
-                        # count it actually rendered, which is the only correct one.
-                        sel = 0 if sel is None else sel + 1
-                        break
-                    if key in ("k", "K", "UP"):
-                        sel = 0 if sel is None else max(0, sel - 1)
-                        break
                     if key in ("a", "A"):
                         view = None if view == "advice" else "advice"
                         break  # repaint immediately, do not wait out the tick
                     if key in ("s", "S"):
                         view = None if view == "agents" else "agents"
                         break
+                    if key in ("i", "I"):
+                        # The one key that arms the whole risky half at once --
+                        # cursor, x/y, and the EXPERIMENTAL tag all come alive
+                        # together, so there is exactly one thing to remember
+                        # before a keypress can end a process.
+                        interactive = not interactive
+                        if interactive:
+                            note = c("interactive armed -- j/k select, x stop, y yank", BOLD, YELLOW)
+                        else:
+                            # Drop the cursor rather than leave it parked: a
+                            # stale sel would resurface on re-arming, pointing
+                            # at whatever row happens to occupy that index by
+                            # then, not the one it was left on.
+                            sel = None
+                            note = c("interactive off -- view only", DIM)
+                        break
+                    if key in ("j", "J", "DOWN"):
+                        if not interactive:
+                            note = c("press i to arm interactive mode first", YELLOW)
+                        else:
+                            # Unbounded on purpose -- frame() clamps against the row
+                            # count it actually rendered, which is the only correct one.
+                            sel = 0 if sel is None else sel + 1
+                        break
+                    if key in ("k", "K", "UP"):
+                        if not interactive:
+                            note = c("press i to arm interactive mode first", YELLOW)
+                        else:
+                            sel = 0 if sel is None else max(0, sel - 1)
+                        break
                     if key in ("x", "X", "y", "Y"):
-                        # Both need a row. Saying so beats doing nothing: a key
-                        # that silently no-ops is indistinguishable from a broken
-                        # one, and this pair is the reason the cursor exists.
-                        if sel is None or not rows:
+                        # All three need interactive armed, and x/y also need a
+                        # row. Saying so beats doing nothing: a key that silently
+                        # no-ops is indistinguishable from a broken one.
+                        if not interactive:
+                            note = c("press i to arm interactive mode first", YELLOW)
+                        elif sel is None or not rows:
                             note = c("select a row first -- j/k or the arrow keys", YELLOW)
                         elif key in ("x", "X"):
                             # Captured from the frame on screen, not re-resolved later.

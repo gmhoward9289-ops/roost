@@ -104,24 +104,31 @@ roost -1           one frame, then exit
 roost --json       joined records, for piping
 ```
 
-While running: `space` refresh now · `a` advice panel · `s` subagents panel · `q` quit
+While running: `space` refresh now · `a` advice panel · `s` subagents panel · `i` arm interactive · `q` quit
 
 ## Acting on a session
 
-> **Experimental.** Interactive mode carries an `EXPERIMENTAL` marker in the
-> top-right corner, and it means it — `x` ends a real process. Reading the
-> dashboard has never been the risky half.
+> **Experimental, and off by default.** `i` arms interactive mode — the
+> cursor, `x`, `y`, and the `EXPERIMENTAL` marker in the top-right corner all
+> come alive together, and it means it: `x` ends a real process. Reading the
+> dashboard has never been the risky half; `i` is the one key that draws the
+> line. Press it again to disarm — the cursor drops and `x`/`y`/`j`/`k` stop
+> responding until you press it once more.
 
-`j`/`k` (or the arrow keys) raise a cursor. Raising it expands the `QUIET`
-group, because a session idle for hours is exactly what a sweep is looking for
-and it is unreachable while collapsed.
+Once armed, `j`/`k` (or the arrow keys) raise a cursor. Raising it expands the
+`QUIET` group, because a session idle for hours is exactly what a sweep is
+looking for and it is unreachable while collapsed.
 
 | key | does |
 | --- | --- |
-| `j` `k` `↓` `↑` | move the cursor |
+| `i` | arm or disarm interactive mode |
+| `j` `k` `↓` `↑` | move the cursor (interactive mode only) |
 | `x` | stop the selected session — confirms first, and only `y` proceeds |
 | `y` | copy its sessionId, for `claude --resume <id>` |
 | `esc` | drop the cursor, re-collapse `QUIET` |
+
+Start already armed with `roost --interactive` if you know you'll be acting on
+a session right away.
 
 `x` ends a process. It does not compact, save, or otherwise negotiate with the
 session — **there is no local control channel into a running Claude Code
