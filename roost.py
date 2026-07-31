@@ -564,7 +564,7 @@ def collect_workers():
             # fallback for sessions too young to have been named yet.
             # Sanitised at the source: this is transcript text, and it lands in
             # a TUI that steers the cursor with escape sequences. An unescaped
-            #  in a title could clear the screen or repaint the table.
+            # a raw ESC in a title could clear the screen or repaint the table.
             "task": ascii_safe(info["title"] or info["prompt"] or ""),
             "task_src": "title" if info["title"] else ("prompt" if info["prompt"] else "-"),
             "idle_secs": idle,
