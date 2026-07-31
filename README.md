@@ -1,5 +1,7 @@
 # roost
 
+[![ci](https://github.com/gmhoward9289-ops/roost/actions/workflows/ci.yml/badge.svg)](https://github.com/gmhoward9289-ops/roost/actions/workflows/ci.yml)
+
 `top` for Claude Code. Every live session, the model it is on, how much context
 it has burned — and, unlike anything else, **the subagents it spawned**.
 
