@@ -52,16 +52,11 @@ Debian and Ubuntu — grab `roost_<version>_all.deb` from the
 [latest release](https://github.com/gmhoward9289-ops/roost/releases/latest):
 
 ```bash
-sudo apt install ./roost_0.02_all.deb
+sudo apt install ./roost_0.2_all.deb
 ```
 
 There is no PPA and no apt repository; the `.deb` is a release artifact, and
 `apt install ./file.deb` resolves `python3` exactly as a repo install would.
-
-> **Version note.** The tag, the `.deb`, the man page and the in-app footer all
-> read `0.02`. PyPI does not permit a leading zero in a release segment — PEP 440
-> normalizes it away — so `pip` and `pipx` show and install the very same build
-> as `0.2`. One artifact, one channel spelling it differently.
 
 Or just take the file — it is one script with no dependencies:
 
@@ -194,7 +189,9 @@ ships, `WINDOW_TIERS` is the one line to edit.
 - The window inference above is a heuristic.
 - The `ADVICE` panel's thresholds are tuned to one person's usage. Read
   `EXPENSIVE_TOKENS` and friends before trusting the advice.
-- Tested on macOS and Windows. Linux should work — same paths — but is untested.
+- Daily-driven on macOS and Windows. CI runs the suite and a smoke frame on
+  Linux, and it detects live sessions there — but nobody lives on it yet.
+  Field reports welcome.
 
 ## License
 
