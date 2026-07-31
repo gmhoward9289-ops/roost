@@ -57,7 +57,7 @@ Or, without adding a repo — grab `roost_<version>_all.deb` from the
 [latest release](https://github.com/gmhoward9289-ops/roost/releases/latest):
 
 ```bash
-sudo apt install ./roost_0.2_all.deb
+sudo apt install ./roost_0.3_all.deb
 ```
 
 Both resolve `python3` exactly as a normal repo install would. The repo is
