@@ -106,6 +106,6 @@ ships, `WINDOW_TIERS` is the one line to edit.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Contact: dev@swamplink.net
+MIT — see [LICENSE](LICENSE). Contact: dev@swamplink.com
 
 Built in a Digital Swamp. From my swamp to yours.
