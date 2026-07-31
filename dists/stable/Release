@@ -1,0 +1,24 @@
+Architectures: all
+Codename: stable
+Components: main
+Date: Fri, 31 Jul 2026 17:03:14 +0000
+Description: top for Claude Code
+Label: roost
+Origin: roost
+Suite: stable
+MD5Sum:
+ e7b68914edf7465bfe01ce4b532e67f8              165 Release
+ c03f86b6aa00e95b6ad50cfa9a086baf              946 main/binary-all/Packages
+ 5ca4e537574b6b3c7af4331b5bd64102              663 main/binary-all/Packages.gz
+SHA1:
+ 9cd4309f1080eb201dfe861873e876ecc37b2cbb              165 Release
+ 83742453cfdc53fcf8cea351837d46455c0883f4              946 main/binary-all/Packages
+ 550557d7ed1e4ad77b2b5370dd7b6a963e16f8a7              663 main/binary-all/Packages.gz
+SHA256:
+ 6e6f06b43d943bc3f3109cce6d54152d7e9aff46e4545a08e3f20e95f0f01200              165 Release
+ dca290724000a01832cf2a3d5a3ab97fab0250f9423a40c310498cd3c24423d6              946 main/binary-all/Packages
+ 54fa88085f10cbe6562add82163e3158bb5807bbfee71bfe363e64466892b3a8              663 main/binary-all/Packages.gz
+SHA512:
+ 611087b8eea256765ab2cf1bd981ccdaf07b9e34deac01234ac2d5975059bbcc4cbe51ef7886fe501e526cd16ddce9dbce278609df5badc56fdab4f6a3a1ae22              165 Release
+ 2a48fd4d74b20d79161ac6251cb57f6d503d5c7e641a953a24b8affabea663f44d166c16226333c5f048dc9ff6cab7ad1d3e12aaf7576428866e848ed4a7c887              946 main/binary-all/Packages
+ 6c6fc0a5607b141df44d2b6696509ace02789bbbe2c9afb825b351430e3650f39d5021e55d9d490982d024e2975ed7c10c69a0a710e2e5290ea8bd3751f2084c              663 main/binary-all/Packages.gz
