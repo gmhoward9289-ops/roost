@@ -15,7 +15,7 @@ class Roost < Formula
   desc "top for Claude Code: live sessions, context use, and their subagents"
   homepage "https://github.com/gmhoward9289-ops/roost"
   url "https://github.com/gmhoward9289-ops/roost/archive/refs/tags/v0.4.tar.gz"
-  sha256 "01b8cd2245c49daf939d12d5564d334217ceacb47effcb2a57c7ef4255068113"
+  sha256 "87f1c68bc6d1b3c383ebec53e8e4a8d9ad197fd54b1a29abe70e2942dd625dda"
   license "MIT"
 
   depends_on "python@3.13"
