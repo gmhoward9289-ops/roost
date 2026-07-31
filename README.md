@@ -44,15 +44,26 @@ Homebrew (macOS and Linux):
 brew install gmhoward9289-ops/tap/roost
 ```
 
-Debian and Ubuntu — grab `roost_<version>_all.deb` from the
+Debian and Ubuntu, from the repo — this also gets you `apt upgrade`:
+
+```bash
+curl -fsSL https://gmhoward9289-ops.github.io/roost/roost-archive-keyring.asc | sudo gpg --dearmor -o /usr/share/keyrings/roost-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/roost-archive-keyring.gpg] https://gmhoward9289-ops.github.io/roost stable main" | sudo tee /etc/apt/sources.list.d/roost.list
+sudo apt update
+sudo apt install roost
+```
+
+Or, without adding a repo — grab `roost_<version>_all.deb` from the
 [latest release](https://github.com/gmhoward9289-ops/roost/releases/latest):
 
 ```bash
 sudo apt install ./roost_0.2_all.deb
 ```
 
-There is no PPA and no apt repository; the `.deb` is a release artifact, and
-`apt install ./file.deb` resolves `python3` exactly as a repo install would.
+Both resolve `python3` exactly as a normal repo install would. The repo is
+signed with a dedicated key (not tied to any personal identity); its public
+half is `packaging/apt/pubkey.asc` in this repo, published unchanged as
+`roost-archive-keyring.asc` above.
 
 With pipx:
 
