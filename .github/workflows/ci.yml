@@ -32,6 +32,44 @@ jobs:
           python roost.py --version
           python roost.py -1 --no-color
 
+  # roost.py is the single source of the version, but the man page and the
+  # Homebrew formula embed it as literal text and both drifted on the v0.3 bump.
+  # A stale formula is the dangerous one: Homebrew derives `version` from the
+  # tarball URL, so its own version assertion checks the stale number against a
+  # stale tarball and passes, and `brew install` ships the old release with
+  # nothing anywhere reporting a problem. Checked here, on the bump PR, rather
+  # than at release time when the tag is already cut.
+  packaging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Version consistency across artifacts
+        run: packaging/check-version-consistency.sh
+      # build-deb.sh derives the version from roost.py, so this is really a
+      # check that the derivation still works and the man page it gzips in is
+      # the one we just validated. It prints the artifact path on success.
+      - name: The .deb builds and carries the same version
+        run: |
+          set -euo pipefail
+          packaging/build-deb.sh
+          version=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' roost.py)
+          test -f "dist/roost_${version}_all.deb"
+          # The man page ships inside the .deb; confirm the version reached it
+          # rather than trusting that the file on disk was the one packaged.
+          # (Extract rather than stream a named tar member -- dpkg emits the
+          # './' prefix and matching it exactly is needlessly brittle.)
+          rm -rf /tmp/debx && mkdir -p /tmp/debx
+          dpkg-deb -x "dist/roost_${version}_all.deb" /tmp/debx
+          got=$(gunzip -c /tmp/debx/usr/share/man/man1/roost.1.gz | head -1)
+          case "$got" in
+            *"\"roost ${version}\""*) ;;
+            *) echo "::error::man page in the .deb says: $got (want roost ${version})"; exit 1 ;;
+          esac
+          echo "dist/roost_${version}_all.deb carries man page roost ${version}"
+
   security:
     runs-on: ubuntu-latest
     container:

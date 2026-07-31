@@ -50,8 +50,17 @@ jobs:
             exit 1
           fi
 
+      # The man page and the Homebrew formula embed the version as literal text
+      # rather than deriving it. Both drifted on v0.3, and neither failure is
+      # loud: `man roost` simply disagrees with `roost --version`, and a stale
+      # formula passes its own version assertion because Homebrew reads
+      # `version` from the same stale URL it fetches. ci.yml runs this on every
+      # PR; repeating it here makes a tag build refuse to publish a mismatch.
+      - name: Check the man page and Homebrew formula match __version__
+        run: packaging/check-version-consistency.sh
+
       # PEP 440 would rewrite a version like "0.02" to "0.2", so the wheel
-      # filename could disagree with the tag, the .deb and the man page. 0.2 is
+      # filename could disagree with the tag, the .deb and the man page. 0.3 is
       # already canonical and normalises to itself, but this fails loudly if the
       # version is ever changed to something PEP 440 rewrites.
       - name: Check the wheel filename matches the version
