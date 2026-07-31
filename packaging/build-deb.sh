@@ -34,7 +34,7 @@ Section: utils
 Priority: optional
 Architecture: all
 Depends: python3 (>= 3.9)
-Maintainer: George M. Howard <dev@swamplink.net>
+Maintainer: George M. Howard <dev@swamplink.com>
 Homepage: https://github.com/gmhoward9289-ops/roost
 Description: top for Claude Code
  Shows every live Claude Code session on the machine, the model each is

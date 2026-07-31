@@ -9,7 +9,7 @@ description = "top for Claude Code -- live sessions, models, context, and the su
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-authors = [{ name = "George M. Howard", email = "dev@swamplink.net" }]
+authors = [{ name = "George M. Howard", email = "dev@swamplink.com" }]
 keywords = ["claude", "claude-code", "tui", "top", "monitoring", "context"]
 classifiers = [
     "Development Status :: 3 - Alpha",
