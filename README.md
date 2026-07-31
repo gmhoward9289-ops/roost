@@ -224,6 +224,15 @@ ships, `WINDOW_TIERS` is the one line to edit.
   Linux, and it detects live sessions there — but nobody lives on it yet.
   Field reports welcome.
 
+## Help wanted
+
+roost is one person's tool with a public issue tracker. The
+[`help wanted` issues](https://github.com/gmhoward9289-ops/roost/labels/help%20wanted)
+are real asks, not decoration: Linux field reports, a canary test for the
+undocumented on-disk format, adapters for other agent CLIs (gated on demand —
+comment if you would use one), and config seams for the window tiers and the
+ADVICE thresholds.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Contact: dev@swamplink.com
