@@ -12,6 +12,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -373,6 +374,30 @@ class TestTerminateGuard(unittest.TestCase):
         """roost launched from inside a session puts that session's pid on screen;
         x on that row would take roost's own terminal with it."""
         self.assertIn("own process tree", roost.terminate(os.getppid()))
+
+    def test_actually_stops_a_real_child_process(self):
+        """The only test that runs the platform kill itself.
+
+        Windows is the load-bearing leg here: there is no cross-process SIGTERM,
+        so that branch is OpenProcess + TerminateProcess through ctypes and no
+        Linux or macOS run will ever execute it. The guard tests above return
+        before reaching any of that.
+        """
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            self.assertIsNone(roost.terminate(child.pid))
+            # Exit status, not roost.alive(): Popen holds an open handle to the
+            # child, and Windows keeps a process object queryable for as long as
+            # any handle exists -- so OpenProcess still succeeds here even though
+            # the process is dead. It does not affect roost, whose rows are
+            # sessions it never spawned and holds no handle to.
+            child.wait(timeout=15)
+            self.assertIsNotNone(child.poll())
+        finally:
+            if child.poll() is None:  # terminate() failed; do not leak the process
+                child.kill()
+                child.wait(timeout=10)
 
 
 class TestPaintOverflow(unittest.TestCase):
