@@ -1,0 +1,53 @@
+name: release-please
+
+# The front half of releasing. release.yml is the back half: it fires on a
+# `v*` tag and does all the actual publishing (GitHub Release, PyPI, npm, apt,
+# Homebrew tap). Nothing here duplicates that work.
+#
+# What this adds is the step that used to be manual and error-prone: bumping
+# the version everywhere and cutting the tag. On every push to main,
+# release-please maintains a single open "release PR" that bumps the version in
+# every artifact that carries it and prepends the generated section to
+# CHANGELOG.md. Merging that PR is the release decision; release-please then
+# pushes the tag, and release.yml takes it from there.
+#
+# This is why PR titles have to be conventional commits -- squash-merge uses
+# the PR title as the commit subject (enforced in repo settings), and that
+# subject is the only thing release-please reads to decide the version bump and
+# write the changelog entry. pr-title-lint.yml is what keeps that true.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          # ONE-TIME SETUP: create a fine-grained PAT with Contents and Pull
+          # requests read/write on this repo and store it as the
+          # RELEASE_PLEASE_TOKEN secret.
+          #
+          # This is not optional cosmetics. GitHub deliberately refuses to
+          # trigger workflows from events created with the default
+          # GITHUB_TOKEN, to stop workflows recursively triggering themselves.
+          # The tag release-please pushes is such an event, so with
+          # GITHUB_TOKEN the tag lands and release.yml simply never runs -- no
+          # error, no release, just silence. A PAT is a different actor, so the
+          # push event is real and release.yml fires.
+          #
+          # The fallback keeps this workflow functional before the secret
+          # exists: the release PR is still opened and maintained correctly,
+          # and only the publish step is missing. If the tag ever lands without
+          # a release, that is the symptom -- recover by running release.yml
+          # manually via workflow_dispatch, or by deleting and re-pushing the
+          # tag with a credential that is not GITHUB_TOKEN.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
