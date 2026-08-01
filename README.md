@@ -81,6 +81,19 @@ plain `roost`. Installing straight from the repo skips the index entirely:
 pipx install git+https://github.com/gmhoward9289-ops/roost
 ```
 
+With npm — the one channel that gives Windows a real `roost` command:
+
+```bash
+npm install -g roost-top
+```
+
+Or run it without installing: `npx roost-top`. The npm package is a wrapper, not
+a port: it ships the same `roost.py` and finds a Python to run it with (`py -3`
+first on Windows, `python3` elsewhere, 3.9 or newer either way). Python still has
+to be on `PATH` — npm delivers the script and puts `roost` on `PATH`, it does not
+bring an interpreter. As on PyPI, the bare name `roost` was already taken, so the
+package is `roost-top` and the command is plain `roost`.
+
 Or just take the file. It is one script, stdlib only, no dependencies:
 
 ```bash
@@ -89,8 +102,8 @@ chmod +x roost && ./roost
 ```
 
 Windows: save it as `roost.py` and run it — `.PY` is in `PATHEXT`, so `roost.py`
-works from anywhere on `PATH`. There is no Windows package; the single file is
-the install.
+works from anywhere on `PATH`. Beyond npm above there is no Windows package; the
+single file is the install.
 
 The man page (`man roost`) ships with the Homebrew and `.deb` installs. A pipx
 install puts it under the venv's own `share/man`, which is not on the default

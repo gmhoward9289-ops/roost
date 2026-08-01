@@ -68,6 +68,20 @@ else
   printf '  ok    %-22s dynamic (from roost.py)\n' "pyproject.toml"
 fi
 
+# --- npm package: a literal version, and the one artifact that cannot match ----
+# npm rejects a two-component version, so package.json carries 0.4.0 where
+# roost.py says 0.4. Compare against the padded form rather than exempting it --
+# padding is a known transform, and "exempt" would mean 0.4.0 could sit there
+# forever after roost.py moved to 0.5.
+case $VERSION in
+  *.*.*) NPM_WANT=$VERSION ;;
+  *.*)   NPM_WANT=$VERSION.0 ;;
+  *)     NPM_WANT=$VERSION.0.0 ;;
+esac
+npm_version=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+              package.json | head -1)
+report "package.json version" "$npm_version" "$NPM_WANT"
+
 # --- --version output ---------------------------------------------------------
 cli_version=$(python3 roost.py --version 2>&1 | sed -n 's/^roost \(.*\)$/\1/p')
 report "roost --version" "$cli_version" "$VERSION"
@@ -78,6 +92,7 @@ if [ "$fail" -ne 0 ]; then
 Version drift. Every artifact above must say $VERSION.
 
   roost.1            .TH ROOST 1 "<date>" "roost $VERSION" "User Commands"
+  package.json       "version": "$NPM_WANT"   (npm needs three components)
   packaging/roost.rb url ...archive/refs/tags/v$VERSION.tar.gz
                      and refresh sha256:
                        curl -sL https://github.com/gmhoward9289-ops/roost/archive/refs/tags/v$VERSION.tar.gz | shasum -a 256
