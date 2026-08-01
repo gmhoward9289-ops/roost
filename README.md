@@ -119,7 +119,7 @@ roost -1           one frame, then exit
 roost --json       joined records, for piping
 ```
 
-While running: `space` refresh now · `a` advice panel · `s` subagents panel · `m` local models panel · `i` arm interactive · `q` quit
+While running: `space` refresh now · `a` advice panel · `s` subagents panel · `m` local models panel · `h` or `?` what am I looking at · `i` arm interactive · `q` quit
 
 ## Acting on a session
 
@@ -160,11 +160,18 @@ roost refuses to stop its own process or its parent — run it from inside the
 session it is pointed at and the cursor can land on the row that owns your
 terminal.
 
-Only one panel is open at a time: `a`, `s`, and `m` flip between ADVICE,
-SUBAGENTS, and LOCAL MODELS rather than stacking. With two dozen sessions on
-screen a stacked second panel lands below the bottom of the terminal, which is
-indistinguishable from the key not working. For the same reason the frame now
-says `... N more line(s) below` instead of quietly truncating.
+Only one panel is open at a time: `a`, `s`, `m`, and `h` flip between ADVICE,
+SUBAGENTS, LOCAL MODELS, and HELP rather than stacking. With two dozen sessions
+on screen a stacked second panel lands below the bottom of the terminal, which
+is indistinguishable from the key not working. For the same reason the frame
+now says `... N more line(s) below` instead of quietly truncating.
+
+## Help
+
+`h` or `?` opens a HELP panel — not a keybinding reference (the footer hint
+already lists the keys), but a one-line-each rundown of what each screen on
+the display means: INFRA, WORKERS, SUBAGENTS, ADVICE, LOCAL MODELS. roost is
+small enough that this is the whole manual.
 
 ## Local models
 

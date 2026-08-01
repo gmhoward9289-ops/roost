@@ -645,6 +645,37 @@ class TestRenderModels(unittest.TestCase):
         self.assertIn("2 installed, 1 resident", out)
 
 
+class TestRenderHelp(unittest.TestCase):
+    """Help is an overview of what's on screen, not a keybinding reference --
+    the footer hint already lists the keys."""
+
+    PATCHED = ("collect_workers", "collect_infra", "collect_subagents")
+
+    def setUp(self):
+        roost.COLOR = False
+        self._saved = {n: getattr(roost, n) for n in self.PATCHED}
+        roost.collect_workers = lambda: []
+        roost.collect_infra = lambda: []
+        roost.collect_subagents = lambda sids: []
+
+    def tearDown(self):
+        for name, fn in self._saved.items():
+            setattr(roost, name, fn)
+
+    def test_names_every_toggleable_panel(self):
+        out = "\n".join(roost.render_help())
+        self.assertIn("HELP", out)
+        for name, key, _ in roost.HELP_SCREENS:
+            self.assertIn(name, out)
+            if key:
+                self.assertIn("(%s)" % key, out)
+
+    def test_is_reachable_through_frame(self):
+        """The 'h' toggle wires through frame() the same way a/s/m do."""
+        lines, _, _ = roost.frame(with_help=True)
+        self.assertIn(roost.c("HELP", roost.BOLD), lines)
+
+
 
 class TestAdviceNamesTheTask(unittest.TestCase):
     """A pid says which process to kill; the task says whether you want to."""

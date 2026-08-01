@@ -987,7 +987,42 @@ def render_models(models):
     return lines
 
 
-def frame(with_advice=False, with_agents=True, with_models=False, sel=None):
+# name, key, what it shows. Not a keybinding reference -- the footer hint
+# already has the keys -- just what each screen on the display means. roost
+# is small enough that this list is the whole manual.
+HELP_SCREENS = (
+    ("INFRA", None,
+     "ollama / litellm / openwebui: up or down, plus what's resident in Ollama's VRAM right now."),
+    ("WORKERS", None,
+     "every live Claude Code session: model, context window used, idle time, current task. "
+     "QUIET collapses idle sessions to one line; raise the cursor to expand it."),
+    ("SUBAGENTS", "s",
+     "work a session farmed out. Invisible in any pid-based view, since a subagent shares its "
+     "parent's process rather than running as one of its own."),
+    ("ADVICE", "a",
+     "concrete actions, ranked by how many tokens each would save -- which sessions are "
+     "expensive to resume, near their context limit, or just idle clutter."),
+    ("LOCAL MODELS", "m",
+     "everything Ollama has installed, not just what's resident in VRAM -- disk size, "
+     "residency, and time until an idle model unloads."),
+)
+
+
+def render_help():
+    """What each screen means, not how to drive it -- the footer hint already
+    lists the keys, and roost has few enough screens that this fits on one page."""
+    lines = ["", c("HELP", BOLD)]
+    for name, key, text in HELP_SCREENS:
+        label = "%s (%s)" % (name, key) if key else name
+        lines.append("  " + c(label, BOLD))
+        lines.append("      " + c(text, DIM))
+    lines.append("")
+    lines.append("  " + c("interactive mode (i) arms the cursor: j/k select, x stop, "
+                          "y copy sessionId, esc deselect.", DIM))
+    return lines
+
+
+def frame(with_advice=False, with_agents=True, with_models=False, with_help=False, sel=None):
     """Returns (lines, rows, sel).
 
     `rows` is what the cursor indexes, handed back so the key handler acts on the
@@ -1008,6 +1043,8 @@ def frame(with_advice=False, with_agents=True, with_models=False, sel=None):
         lines.extend(render_subagents(collect_subagents(live_sids)))
     if with_models:
         lines.extend(render_models(collect_local_models()))
+    if with_help:
+        lines.extend(render_help())
     if with_advice:
         lines.append("")
         lines.extend(advise(workers))
@@ -1149,7 +1186,7 @@ def paint(lines, vt):
     if len(body) > rows - 1:
         hidden = len(body) - (rows - 2)
         body = body[: rows - 2] + [clip_ansi(
-            c("... %d more line(s) below -- taller window, or s/a/m to close a panel"
+            c("... %d more line(s) below -- taller window, or s/a/m/h to close a panel"
               % hidden, DIM), cols - 1)]
 
     # Version, bottom-right. Stamped onto whatever the last visible line turns
@@ -1198,7 +1235,8 @@ def main():
                     help="do not record stopped sessions to %s" % LOG_PATH)
     ap.epilog = (
         "keys while running:  space = refresh now   a = advice panel   "
-        "s = subagents panel   m = local models panel   i = arm interactive mode   q = quit\n"
+        "s = subagents panel   m = local models panel   h or ? = what am I looking at   "
+        "i = arm interactive mode   q = quit\n"
         "interactive mode (armed with i):  j/k or arrows move a cursor   "
         "x = stop the session (confirms)   y = copy its sessionId   esc = deselect")
     args = ap.parse_args()
@@ -1244,7 +1282,8 @@ def main():
     # Live is the default, as with top/htop -- `-h` is argparse's help and exits,
     # so keys have nothing to act on there. A single frame is opt-in.
     if args.once:
-        print("\n".join(frame(view == "advice", view == "agents", view == "models")[0]))
+        print("\n".join(frame(view == "advice", view == "agents", view == "models",
+                               view == "help")[0]))
         return
     interval = args.watch if args.watch else REFRESH_SECONDS
 
@@ -1267,15 +1306,17 @@ def main():
                     a_tag = c("a", BOLD, GREEN) if view == "advice" else "a"
                     s_tag = c("s", BOLD, GREEN) if view == "agents" else "s"
                     m_tag = c("m", BOLD, GREEN) if view == "models" else "m"
+                    h_tag = c("h", BOLD, GREEN) if view == "help" else "h"
                     if not interactive:
-                        hint = "space refresh | %s interactive | %s advice | %s agents | %s models | q quit" % (
-                            i_tag, a_tag, s_tag, m_tag)
+                        hint = "space refresh | %s interactive | %s advice | %s agents | %s models | %s help | q quit" % (
+                            i_tag, a_tag, s_tag, m_tag, h_tag)
                     elif sel is None:
-                        hint = "j/k select | space refresh | %s interactive | %s advice | %s agents | %s models | q quit" % (
-                            i_tag, a_tag, s_tag, m_tag)
+                        hint = "j/k select | space refresh | %s interactive | %s advice | %s agents | %s models | %s help | q quit" % (
+                            i_tag, a_tag, s_tag, m_tag, h_tag)
                     else:
                         hint = "j/k move | x stop | y yank id | esc deselect | %s interactive | q quit" % i_tag
-                lines, rows, sel = frame(view == "advice", view == "agents", view == "models", sel)
+                lines, rows, sel = frame(view == "advice", view == "agents", view == "models",
+                                          view == "help", sel)
                 # A session can exit while its confirmation is on screen. Matching
                 # on pid rather than on the row dict is what makes that detectable:
                 # every frame rebuilds the dicts, so identity and equality both
@@ -1351,6 +1392,9 @@ def main():
                         break
                     if key in ("m", "M"):
                         view = None if view == "models" else "models"
+                        break
+                    if key in ("h", "H", "?"):
+                        view = None if view == "help" else "help"
                         break
                     if key in ("i", "I"):
                         # The one key that arms the whole risky half at once --
