@@ -553,6 +553,97 @@ class TestInfraLine(unittest.TestCase):
     def test_no_sessions_still_renders(self):
         self.assertIn("no live Claude Code sessions", "\n".join(roost.render([])))
 
+    def test_no_model_resident_is_shown_not_swallowed(self):
+        """Installed-but-unloaded used to collapse the whole detail away, leaving
+        a bare 'ollama:11434 up' that reads as roost not knowing Ollama exists."""
+        out = "\n".join(roost.render_infra(
+            [{"name": "ollama", "port": 11434, "up": True, "detail": "no model resident"}]))
+        self.assertIn("no model resident", out)
+
+
+class TestLocalModels(unittest.TestCase):
+    """The INFRA line only ever reflects /api/ps -- a model that is installed but
+    idle drops out of it entirely. collect_local_models() is the fuller picture,
+    merging /api/tags (everything installed) with /api/ps (what is resident)."""
+
+    def setUp(self):
+        roost.COLOR = False
+        self._port_open, self._http_json = roost.port_open, roost.http_json
+
+    def tearDown(self):
+        roost.port_open, roost.http_json = self._port_open, self._http_json
+
+    def test_empty_when_ollama_is_down(self):
+        roost.port_open = lambda port, timeout=0.35: False
+        roost.http_json = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should not fetch"))
+        self.assertEqual(roost.collect_local_models(), [])
+
+    def test_merges_installed_with_resident(self):
+        roost.port_open = lambda port, timeout=0.35: True
+
+        def fake_http_json(port, path, timeout=1.5):
+            if path == "/api/tags":
+                return {"models": [
+                    {"name": "qwen-coder-16k:latest", "size": 5_500_000_000},
+                    {"name": "gemma4-32k:latest", "size": 9_610_000_000},
+                ]}
+            if path == "/api/ps":
+                return {"models": [
+                    {"name": "qwen-coder-16k:latest", "size_vram": 5_500_000_000,
+                     "expires_at": "2099-01-01T00:00:00-07:00"},
+                ]}
+            return None
+
+        roost.http_json = fake_http_json
+        models = {m["name"]: m for m in roost.collect_local_models()}
+        self.assertTrue(models["qwen-coder-16k:latest"]["resident"])
+        self.assertAlmostEqual(models["qwen-coder-16k:latest"]["vram_gb"], 5.5)
+        self.assertIsNotNone(models["qwen-coder-16k:latest"]["expires_secs"])
+        self.assertFalse(models["gemma4-32k:latest"]["resident"])
+        self.assertIsNone(models["gemma4-32k:latest"]["vram_gb"])
+        self.assertIsNone(models["gemma4-32k:latest"]["expires_secs"])
+
+    def test_an_unparseable_expiry_drops_the_timer_not_the_model(self):
+        roost.port_open = lambda port, timeout=0.35: True
+
+        def fake_http_json(port, path, timeout=1.5):
+            if path == "/api/tags":
+                return {"models": [{"name": "m", "size": 1_000_000_000}]}
+            if path == "/api/ps":
+                return {"models": [{"name": "m", "size_vram": 1_000_000_000,
+                                     "expires_at": "not-a-timestamp"}]}
+            return None
+
+        roost.http_json = fake_http_json
+        models = roost.collect_local_models()
+        self.assertEqual(len(models), 1)
+        self.assertTrue(models[0]["resident"])
+        self.assertIsNone(models[0]["expires_secs"])
+
+
+class TestRenderModels(unittest.TestCase):
+    def setUp(self):
+        roost.COLOR = False
+
+    def test_no_models_says_so(self):
+        out = "\n".join(roost.render_models([]))
+        self.assertIn("LOCAL MODELS", out)
+        self.assertIn("none installed", out)
+
+    def test_lists_disk_state_and_vram(self):
+        out = "\n".join(roost.render_models([
+            {"name": "qwen-coder-16k:latest", "disk_gb": 5.5, "resident": True,
+             "vram_gb": 5.5, "expires_secs": 240},
+            {"name": "gemma4-32k:latest", "disk_gb": 9.6, "resident": False,
+             "vram_gb": None, "expires_secs": None},
+        ]))
+        self.assertIn("qwen-coder-16k:latest", out)
+        self.assertIn("gemma4-32k:latest", out)
+        self.assertIn("resident", out)
+        self.assertIn("unloaded", out)
+        self.assertIn("5.5 GB", out)
+        self.assertIn("2 installed, 1 resident", out)
+
 
 
 class TestAdviceNamesTheTask(unittest.TestCase):

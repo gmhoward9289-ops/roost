@@ -53,6 +53,10 @@ Start with the ADVICE panel open. Toggle it live with
 Start with the SUBAGENTS panel closed. Toggle it live with
 .BR s .
 .TP
+.B \-\-models
+Start with the LOCAL MODELS panel open. Toggle it live with
+.BR m .
+.TP
 .B \-\-interactive
 Start with interactive mode armed \(em the cursor,
 .BR x / y ,
@@ -78,11 +82,11 @@ Print the version and exit.
 .B space
 Repaint immediately instead of waiting out the interval.
 .TP
-.BR a ", " s
-Show the ADVICE or SUBAGENTS panel; pressing the key again closes it. Only one
-panel is open at a time, so asking for one closes the other. Opening both used
-to push the second past the bottom of the terminal, which looked like the key
-had done nothing.
+.BR a ", " s ", " m
+Show the ADVICE, SUBAGENTS, or LOCAL MODELS panel; pressing the key again
+closes it. Only one panel is open at a time, so asking for one closes the
+others. Opening more than one used to push the rest past the bottom of the
+terminal, which looked like the key had done nothing.
 .TP
 .B i
 Arm or disarm interactive mode. Off by default; arming it is what turns on

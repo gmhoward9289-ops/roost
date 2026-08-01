@@ -53,6 +53,7 @@ import socket
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 __version__ = "0.4"
@@ -598,6 +599,50 @@ def collect_infra():
     return out
 
 
+def _iso_to_epoch(ts):
+    """Ollama's expires_at is RFC3339 with an offset, e.g.
+    '2026-08-01T15:04:05.123456-07:00'. Any format surprise just drops the
+    unload timer -- it is not worth losing the whole panel over."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts).timestamp()
+    except Exception:
+        return None
+
+
+def collect_local_models():
+    """Installed and resident Ollama models, merged from /api/tags and /api/ps.
+
+    /api/ps alone -- what the INFRA line uses -- only sees what is currently in
+    VRAM, so a model that is installed but idle is invisible there. This is the
+    fuller picture: everything `ollama list` knows about, with residency and a
+    VRAM figure layered on top for whichever of those happen to be loaded.
+    """
+    if not port_open(11434):
+        return []
+    tags = http_json(11434, "/api/tags") or {}
+    ps = http_json(11434, "/api/ps") or {}
+    resident = {m.get("name"): m for m in (ps.get("models") or [])}
+    out = []
+    for m in tags.get("models") or []:
+        name = m.get("name", "?")
+        r = resident.get(name)
+        expires_secs = None
+        if r and r.get("expires_at"):
+            epoch = _iso_to_epoch(r["expires_at"])
+            if epoch is not None:
+                expires_secs = max(0, epoch - time.time())
+        out.append({
+            "name": name,
+            "disk_gb": (m.get("size") or 0) / 1e9,
+            "resident": r is not None,
+            "vram_gb": ((r.get("size_vram") or r.get("size") or 0) / 1e9) if r else None,
+            "expires_secs": expires_secs,
+        })
+    return out
+
+
 # ---- advisory thresholds ----------------------------------------------------
 # A turn costs whatever the context currently holds, so a fat session is
 # expensive on every future turn, not once. These are the lines where that stops
@@ -823,7 +868,7 @@ def render_infra(infra):
     for s in infra:
         mark = c("up", GREEN) if s["up"] else c("DOWN", BOLD, RED)
         extra = ""
-        if s["up"] and s["detail"] and s["detail"] != "no model resident":
+        if s["up"] and s["detail"]:
             extra = " " + c(s["detail"], CYAN)
         parts.append("%s:%d %s%s" % (c(s["name"], BOLD), s["port"], mark, extra))
     return [c("INFRA  ", BOLD) + "   ".join(parts), ""]
@@ -905,7 +950,44 @@ def render_subagents(agents):
     return lines
 
 
-def frame(with_advice=False, with_agents=True, sel=None):
+def render_models(models):
+    """The INFRA line only ever shows what is resident in VRAM right now -- a
+    model that is installed but idle drops out of it entirely. This is the
+    full inventory: everything `ollama list` knows about, with residency and
+    VRAM called out for whichever happen to be loaded."""
+    lines = ["", c("LOCAL MODELS", BOLD)]
+    if not models:
+        lines.append(c("  none installed (or ollama not running)", DIM))
+        return lines
+
+    cols = [
+        ("MODEL", lambda m: m["name"]),
+        ("DISK", lambda m: "%.1f GB" % m["disk_gb"]),
+        ("STATE", lambda m: "resident" if m["resident"] else "unloaded"),
+        ("VRAM", lambda m: "-" if m["vram_gb"] is None else "%.1f GB" % m["vram_gb"]),
+        ("UNLOADS IN", lambda m: "-" if m["expires_secs"] is None else dur(m["expires_secs"])),
+    ]
+    table = [[h for h, _ in cols]] + [[f(m) for _, f in cols] for m in models]
+    w = [max(len(row[i]) for row in table) for i in range(len(cols))]
+    lines.append("  " + c("  ".join(table[0][i].ljust(w[i]) for i in range(len(cols))), BOLD))
+    for row, m in zip(table[1:], models):
+        cells = []
+        for i, (header, _) in enumerate(cols):
+            txt = row[i].ljust(w[i])
+            if header == "MODEL":
+                cells.append(c(txt, BOLD))
+            elif header == "STATE":
+                cells.append(c(txt, BOLD, GREEN) if m["resident"] else c(txt, DIM))
+            else:
+                cells.append(c(txt, DIM))
+        lines.append("  " + "  ".join(cells))
+
+    resident = sum(1 for m in models if m["resident"])
+    lines.append("  " + c("%d installed, %d resident" % (len(models), resident), DIM))
+    return lines
+
+
+def frame(with_advice=False, with_agents=True, with_models=False, sel=None):
     """Returns (lines, rows, sel).
 
     `rows` is what the cursor indexes, handed back so the key handler acts on the
@@ -924,6 +1006,8 @@ def frame(with_advice=False, with_agents=True, sel=None):
     if with_agents:
         live_sids = set(w["session_id"] for w in workers if w.get("session_id"))
         lines.extend(render_subagents(collect_subagents(live_sids)))
+    if with_models:
+        lines.extend(render_models(collect_local_models()))
     if with_advice:
         lines.append("")
         lines.extend(advise(workers))
@@ -1065,7 +1149,7 @@ def paint(lines, vt):
     if len(body) > rows - 1:
         hidden = len(body) - (rows - 2)
         body = body[: rows - 2] + [clip_ansi(
-            c("... %d more line(s) below -- taller window, or s/a to close a panel"
+            c("... %d more line(s) below -- taller window, or s/a/m to close a panel"
               % hidden, DIM), cols - 1)]
 
     # Version, bottom-right. Stamped onto whatever the last visible line turns
@@ -1105,6 +1189,8 @@ def main():
                     help="start with the ADVICE panel open (toggle live with 'a')")
     ap.add_argument("--no-agents", action="store_true",
                     help="start with the SUBAGENTS panel closed (toggle live with 's')")
+    ap.add_argument("--models", action="store_true",
+                    help="start with the LOCAL MODELS panel open (toggle live with 'm')")
     ap.add_argument("--interactive", action="store_true",
                     help="start with interactive mode armed -- cursor, x/y, and the "
                          "EXPERIMENTAL tag (default off; toggle live with 'i')")
@@ -1112,7 +1198,7 @@ def main():
                     help="do not record stopped sessions to %s" % LOG_PATH)
     ap.epilog = (
         "keys while running:  space = refresh now   a = advice panel   "
-        "s = subagents panel   i = arm interactive mode   q = quit\n"
+        "s = subagents panel   m = local models panel   i = arm interactive mode   q = quit\n"
         "interactive mode (armed with i):  j/k or arrows move a cursor   "
         "x = stop the session (confirms)   y = copy its sessionId   esc = deselect")
     args = ap.parse_args()
@@ -1121,7 +1207,11 @@ def main():
     LOGGING = not args.no_log
 
     if args.json:
-        print(json.dumps({"workers": collect_workers(), "infra": collect_infra()}, indent=2))
+        print(json.dumps({
+            "workers": collect_workers(),
+            "infra": collect_infra(),
+            "local_models": collect_local_models(),
+        }, indent=2))
         return
 
     vt = enable_vt()
@@ -1136,23 +1226,31 @@ def main():
         and sys.stdout.isatty()
     )
 
+    # Panels are toggled live rather than fixed at launch: on a short terminal all
+    # of them at once overflow the window, and what you want to see changes.
+    # One panel at a time. They used to be independent toggles, which meant
+    # opening ADVICE while SUBAGENTS was up pushed it past the bottom of the
+    # terminal -- you had to close the other one first to see the one you asked
+    # for. Flipping is what "show me the advice" actually means.
+    if args.advise:
+        view = "advice"
+    elif args.models:
+        view = "models"
+    elif args.no_agents:
+        view = None
+    else:
+        view = "agents"
+
     # Live is the default, as with top/htop -- `-h` is argparse's help and exits,
     # so keys have nothing to act on there. A single frame is opt-in.
     if args.once:
-        print("\n".join(frame(args.advise, not args.no_agents)[0]))
+        print("\n".join(frame(view == "advice", view == "agents", view == "models")[0]))
         return
     interval = args.watch if args.watch else REFRESH_SECONDS
 
     if vt:
         sys.stdout.write("\033[2J\033[?25l")  # one clear up front, then hide the cursor
 
-    # Panels are toggled live rather than fixed at launch: on a short terminal all
-    # three at once overflow the window, and what you want to see changes.
-    # One panel at a time. They used to be independent toggles, which meant
-    # opening ADVICE while SUBAGENTS was up pushed it past the bottom of the
-    # terminal -- you had to close the other one first to see the one you asked
-    # for. Flipping is what "show me the advice" actually means.
-    view = "advice" if args.advise else (None if args.no_agents else "agents")
     # Off by default: this is the gate on the half that can end a process, and
     # arming it is one deliberate keypress rather than "having a terminal."
     interactive = bool(args.interactive)
@@ -1168,15 +1266,16 @@ def main():
                     i_tag = c("i", BOLD, GREEN) if interactive else "i"
                     a_tag = c("a", BOLD, GREEN) if view == "advice" else "a"
                     s_tag = c("s", BOLD, GREEN) if view == "agents" else "s"
+                    m_tag = c("m", BOLD, GREEN) if view == "models" else "m"
                     if not interactive:
-                        hint = "space refresh | %s interactive | %s advice | %s agents | q quit" % (
-                            i_tag, a_tag, s_tag)
+                        hint = "space refresh | %s interactive | %s advice | %s agents | %s models | q quit" % (
+                            i_tag, a_tag, s_tag, m_tag)
                     elif sel is None:
-                        hint = "j/k select | space refresh | %s interactive | %s advice | %s agents | q quit" % (
-                            i_tag, a_tag, s_tag)
+                        hint = "j/k select | space refresh | %s interactive | %s advice | %s agents | %s models | q quit" % (
+                            i_tag, a_tag, s_tag, m_tag)
                     else:
                         hint = "j/k move | x stop | y yank id | esc deselect | %s interactive | q quit" % i_tag
-                lines, rows, sel = frame(view == "advice", view == "agents", sel)
+                lines, rows, sel = frame(view == "advice", view == "agents", view == "models", sel)
                 # A session can exit while its confirmation is on screen. Matching
                 # on pid rather than on the row dict is what makes that detectable:
                 # every frame rebuilds the dicts, so identity and equality both
@@ -1249,6 +1348,9 @@ def main():
                         break  # repaint immediately, do not wait out the tick
                     if key in ("s", "S"):
                         view = None if view == "agents" else "agents"
+                        break
+                    if key in ("m", "M"):
+                        view = None if view == "models" else "models"
                         break
                     if key in ("i", "I"):
                         # The one key that arms the whole risky half at once --
