@@ -1,0 +1,53 @@
+name: pr-title-lint
+
+# Squash is the only merge method this repo allows, and repo settings make the
+# squash commit subject the PR title verbatim. That makes the PR title the
+# permanent commit message on main -- and the single input release-please reads
+# to decide whether the next release is a minor or a patch, and what the
+# changelog says. A title like "fix stuff" is therefore not a style problem; it
+# silently produces a wrong version and an unreadable changelog.
+#
+# Individual commits inside a PR are deliberately not linted. They get squashed
+# away, so policing them buys nothing and costs every contributor a rebase.
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      # pull_request_target runs with a write-capable token in the base repo's
+      # context, which is what lets this report on PRs from forks. It is safe
+      # here only because this job never checks out or executes the PR's code
+      # -- it reads the title and nothing else.
+      - uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Kept to the types release-please is configured to understand, so a
+          # title that passes here always maps to a changelog section rather
+          # than vanishing into the "other" bucket.
+          types: |
+            feat
+            fix
+            perf
+            refactor
+            docs
+            test
+            ci
+            build
+            chore
+            revert
+          # A scope is optional -- roost is a single ~1k-line program with no
+          # meaningful subsystem boundaries to name.
+          requireScope: false
+          # Subjects are sentences here, not fragments, so leading capitals are
+          # fine; only the empty subject is worth rejecting.
+          subjectPattern: ^.{3,}$
+          subjectPatternError: |
+            The subject after "{type}: " is too short. Say what the change does,
+            not that it changes something.
