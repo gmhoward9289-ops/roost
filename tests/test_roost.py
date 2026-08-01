@@ -341,6 +341,70 @@ class TestTranscriptScan(unittest.TestCase):
         self.assertIsNone(got["model"])
 
 
+class TestContextHistory(unittest.TestCase):
+    """History comes out of the transcript, not a buffer kept across frames."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "s.jsonl")
+        roost._SCAN_CACHE.clear()
+
+    def write(self, totals, per_turn=1):
+        """One assistant record per entry; per_turn repeats each total."""
+        with open(self.path, "w") as fh:
+            for t in totals:
+                for _ in range(per_turn):
+                    fh.write(json.dumps({
+                        "type": "assistant",
+                        "message": {"model": "claude-opus-5", "usage": {
+                            "input_tokens": t, "cache_read_input_tokens": 0,
+                            "cache_creation_input_tokens": 0}},
+                    }) + "\n")
+
+    def test_history_is_oldest_first(self):
+        self.write([10, 20, 30])
+        self.assertEqual(roost.scan_transcript(self.path)["ctx_history"],
+                         [10, 20, 30])
+
+    def test_ctx_tokens_is_still_the_newest_turn(self):
+        """The headline number must not become the oldest retained sample."""
+        self.write([10, 20, 30])
+        self.assertEqual(roost.scan_transcript(self.path)["ctx_tokens"], 30)
+
+    def test_history_is_capped(self):
+        self.write(list(range(1, 40)))
+        got = roost.scan_transcript(self.path)["ctx_history"]
+        self.assertEqual(len(got), roost.HISTORY_TURNS)
+        self.assertEqual(got[-1], 39, "cap dropped the newest, not the oldest")
+
+    def test_repeated_totals_within_a_turn_count_once(self):
+        """A tool-using turn writes several records at the same total. Without
+        de-duping, one busy turn fills the window and TREND reads +0."""
+        self.write([10, 20, 30], per_turn=5)
+        self.assertEqual(roost.scan_transcript(self.path)["ctx_history"],
+                         [10, 20, 30])
+
+    def test_missing_file_gives_an_empty_history(self):
+        got = roost.scan_transcript(os.path.join(self.tmp, "nope.jsonl"))
+        self.assertEqual(got["ctx_history"], [])
+
+
+class TestGrowth(unittest.TestCase):
+    def test_reports_the_span_not_the_last_step(self):
+        self.assertEqual(roost.growth([100000, 101000, 116000]), "+16k")
+
+    def test_flat_history(self):
+        self.assertEqual(roost.growth([5000, 5000]), "=")
+
+    def test_compaction_shows_as_a_drop(self):
+        """/compact is the one thing that lowers context; it must not read +."""
+        self.assertEqual(roost.growth([180000, 20000]), "-160k")
+
+    def test_too_short_to_have_a_trend(self):
+        for h in ([], [42], None):
+            self.assertEqual(roost.growth(h), "-")
+
+
 class TestSubagentDiscovery(unittest.TestCase):
     """Subagents have no pid; they live one directory deeper than sessions."""
 

@@ -10,19 +10,19 @@ One file, no dependencies, Python 3.9+. Runs on macOS, Linux and Windows.
 ![roost watching a fleet: buckets, subagents, the advice panel, and a cancelled stop](demo/roost-demo.gif)
 
 ```
-  WORKER    MODEL    CTX  TOKENS  FLOW             IDLE    TASK
+  WORKER   MODEL    CTX  TOKENS  TREND  FLOW             IDLE   TASK
 NEAR LIMIT
-  demo-a1   opus-5   85%  170k       ..:-=+#+=-..  12s     refactor the parser
+  demo-a1  opus-5   85%  170k    +4k       ..:-=+#+=-..  12s    refactor the parser
 PARKED + COSTLY
-  demo-b2   opus-5   61%  122k    ..............   4h10m   audit the build scripts
+  demo-b2  opus-5   61%  122k    +2k    ..............   4h10m  audit the build scripts
 WORKING NOW
-  demo-c3   fable-5  22%  44k          ...:=+*#+   3s      add integration tests
+  demo-c3  fable-5  22%  44k     +22k       ...:=+*#+    3s     add integration tests
 STARTING
-  demo-d4   -        -    -
+  demo-d4  -        -    -       -                       -
 
 QUIET (4)  demo-e5 . demo-f6 . demo-g7 . demo-h8
 
-8 worker(s)  |  fable-5, opus-5
+8 worker(s)  |  1.2M held  |  61k last 8 turns  |  1 near limit  |  fable-5, opus-5
 
 SUBAGENTS
   STATE    AGENT          MODEL     CTX       IDLE   TASK
@@ -37,6 +37,18 @@ INFRA  ollama:11434 up qwen2.5-coder:14b (9.2 GB)   litellm:4000 up   openwebui:
 Sessions are grouped by what it costs to ignore them, not by size: `NEAR LIMIT`
 is about to stop working, `PARKED + COSTLY` bills its whole context on the next
 turn, and everything quiet collapses to a single line.
+
+`TREND` is context added over the session's last few turns. It is an amount and
+not a sparkline because context inside a session only ever rises — it drops
+solely on `/compact` — so a shape would draw the same ramp on every row. `CTX`
+says how full a session is; `TREND` says how fast it is filling, which is how
+`demo-c3` above shows as the one to watch at 22%. It is read back out of the
+transcript rather than accumulated while roost runs, so it is there on the first
+frame and under `--once`. That is also what separates it from `FLOW` alongside
+it: `FLOW` sparks throughput sampled since roost started and begins empty,
+`TREND` is an amount already in the file when roost opens it.
+
+The last line totals the fleet. Context held is what a sweep would reclaim.
 
 ## Install
 
