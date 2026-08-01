@@ -34,7 +34,8 @@ jobs:
           manifest-file: .release-please-manifest.json
           # ONE-TIME SETUP: create a fine-grained PAT with Contents and Pull
           # requests read/write on this repo and store it as the
-          # RELEASE_PLEASE_TOKEN secret.
+          # ROOST_RELEASE_PLEASE secret, matching the ROOST_ prefix the apt
+          # signing key already uses.
           #
           # This is not optional cosmetics. GitHub deliberately refuses to
           # trigger workflows from events created with the default
@@ -50,4 +51,4 @@ jobs:
           # a release, that is the symptom -- recover by running release.yml
           # manually via workflow_dispatch, or by deleting and re-pushing the
           # tag with a credential that is not GITHUB_TOKEN.
-          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.ROOST_RELEASE_PLEASE || secrets.GITHUB_TOKEN }}
