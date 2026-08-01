@@ -127,6 +127,37 @@ jobs:
         run: rm -f dist/*.deb
       - uses: pypa/gh-action-pypi-publish@release/v1
 
+  # Publishes the tagged build to npm as roost-top via trusted publishing
+  # (OIDC), the same no-token pattern as the pypi job above: npmjs.com trusts
+  # this exact repo + workflow file through a registered Trusted Publisher, so
+  # `npm publish` requests a short-lived credential instead of reading a
+  # stored secret. Needs npm CLI >= 11.5.1, which actions/setup-node's bundled
+  # npm can lag behind -- upgraded explicitly rather than assumed.
+  #
+  # One-time setup this job depends on and cannot do for itself: on
+  # https://www.npmjs.com/package/roost-top/access, add a Trusted Publisher ->
+  # GitHub Actions, pointing at gmhoward9289-ops/roost, workflow file
+  # release.yml, environment "npm" (create that GitHub Environment here too,
+  # unprotected is fine -- it exists to give the pairing a name, mirroring how
+  # the pypi job above uses one). Until that's registered, this job fails
+  # alone; PyPI and apt still publish.
+  npm:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - run: npm install -g npm@latest
+      - run: npm publish
+
   # Publishes the .deb into a real, signed apt repo hosted on this repo's
   # GitHub Pages (gh-pages branch), so users get `sudo apt install roost` and
   # `apt upgrade` instead of a one-shot manual .deb download. One arch (all),
@@ -226,3 +257,55 @@ jobs:
       - name: Discard the imported private key
         if: always()
         run: rm -rf "$RUNNER_TEMP/gnupg"
+
+  # Publishes packaging/roost.rb (this repo's master copy) into the tap repo
+  # (gmhoward9289-ops/homebrew-tap) as Formula/roost.rb, with a freshly
+  # computed sha256 for this tag's release tarball. The checksum used to be a
+  # manual "refresh it after tagging" step -- see the comment this replaced at
+  # the top of packaging/roost.rb -- and a manual step is exactly how the v0.2
+  # tarball shipped from a formula that still read 0.2 and passed its own
+  # version assertion anyway (see check-version-consistency.sh).
+  #
+  # One-time setup this job depends on and cannot do for itself: a
+  # TAP_PUSH_TOKEN secret on this repo -- a fine-grained PAT scoped to
+  # gmhoward9289-ops/homebrew-tap with Contents: Read and write. The default
+  # GITHUB_TOKEN only carries permission inside this repo, not a second one.
+  homebrew-tap:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this repo (for packaging/roost.rb)
+        uses: actions/checkout@v7
+        with:
+          path: src
+
+      - name: Check out the tap
+        uses: actions/checkout@v7
+        with:
+          repository: gmhoward9289-ops/homebrew-tap
+          ref: master
+          path: tap
+          token: ${{ secrets.TAP_PUSH_TOKEN }}
+
+      - name: Compute the release tarball checksum
+        run: |
+          url="https://github.com/${{ github.repository }}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          sha256=$(curl -sL "$url" | sha256sum | cut -d' ' -f1)
+          echo "URL=$url" >> "$GITHUB_ENV"
+          echo "SHA256=$sha256" >> "$GITHUB_ENV"
+
+      - name: Write the formula with this release's url and checksum
+        run: |
+          sed -e "s#^  url \".*\"#  url \"$URL\"#" \
+              -e "s#^  sha256 \".*\"#  sha256 \"$SHA256\"#" \
+              src/packaging/roost.rb > tap/Formula/roost.rb
+
+      - name: Commit and push
+        working-directory: tap
+        run: |
+          git config user.name "roost-release-bot"
+          git config user.email "dev@swamplink.com"
+          git add Formula/roost.rb
+          git diff --cached --quiet && echo "nothing changed" || git commit -m "roost $GITHUB_REF_NAME"
+          git push origin master
