@@ -554,5 +554,51 @@ class TestInfraLine(unittest.TestCase):
         self.assertIn("no live Claude Code sessions", "\n".join(roost.render([])))
 
 
+
+class TestAdviceNamesTheTask(unittest.TestCase):
+    """A pid says which process to kill; the task says whether you want to."""
+
+    def _advice_for(self, **kw):
+        roost.COLOR = False
+        return "\n".join(roost.advise([worker(**kw)]))
+
+    def test_task_appears_beside_the_pid(self):
+        out = self._advice_for(ctx_tokens=400000, ctx_pct=40.0,
+                               idle_secs=5 * 3600, task="audit the build scripts")
+        self.assertIn("PARKED+COSTLY", out)
+        self.assertIn("demo-a1 (pid 1234)", out)
+        self.assertIn("audit the build scripts", out)
+
+    def test_long_task_is_truncated_not_wrapped(self):
+        out = self._advice_for(ctx_tokens=400000, ctx_pct=40.0,
+                               idle_secs=5 * 3600, task="x" * 200)
+        head = [ln for ln in out.splitlines() if "demo-a1" in ln][0]
+        self.assertIn("...", head)
+        trailing = head.split("demo-a1 (pid 1234)")[1].strip()
+        self.assertLessEqual(len(trailing), roost.ADVICE_TASK_WIDTH)
+
+    def test_escapes_in_a_task_never_reach_the_advice_line(self):
+        # ADVICE renders transcript text just as the table does, so it needs the
+        # same guard: a title carrying a clear-screen sequence would blank the
+        # display from here too.
+        evil = "evil" + chr(27) + "[2J" + chr(27) + "[Hgone"
+        out = self._advice_for(ctx_tokens=400000, ctx_pct=40.0,
+                               idle_secs=5 * 3600, task=evil)
+        self.assertNotIn(chr(27) + "[2J", out)
+        self.assertIn("evil", out)
+
+    def test_missing_task_still_renders_cleanly(self):
+        out = self._advice_for(ctx_tokens=400000, ctx_pct=40.0,
+                               idle_secs=5 * 3600, task="")
+        head = [ln for ln in out.splitlines() if "demo-a1" in ln][0]
+        self.assertIn("demo-a1 (pid 1234)", head)
+        self.assertTrue(head.rstrip().endswith(")"))
+
+    def test_quiet_session_produces_no_advice(self):
+        roost.COLOR = False
+        out = "\n".join(roost.advise([worker(ctx_tokens=20000, ctx_pct=10.0,
+                                             idle_secs=60)]))
+        self.assertIn("nothing to act on", out)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
