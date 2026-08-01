@@ -55,7 +55,14 @@ import sys
 import time
 from pathlib import Path
 
+# release-please rewrites the line below on a release PR. The marker is on
+# its own line rather than trailing the assignment because release.yml,
+# build-deb.sh and check-version-consistency.sh all parse this line with a
+# greedy `sed -n 's/^__version__ = "\(.*\)"/\1/p'`, which would swallow a
+# trailing comment into the version string.
+# x-release-please-start-version
 __version__ = "0.4"
+# x-release-please-end
 
 HOME = Path.home()
 SESSIONS_DIR = HOME / ".claude" / "sessions"
