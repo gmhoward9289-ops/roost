@@ -50,8 +50,10 @@ import os
 import shutil
 import signal
 import socket
+import re
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from datetime import datetime
@@ -101,6 +103,27 @@ SPARK_RAMP = ".:-=+*#"
 # e.g. ROOST_WEEKLY_BUDGET=60M or 850k or a plain integer of tokens.
 USAGE_DAYS = 7
 USAGE_BUDGET_ENV = "ROOST_WEEKLY_BUDGET"
+
+# GATEWAY panel: where the batch pipeline writes its runs, and where the job
+# queue lives. The gateway itself is DB-less, so every activity endpoint 400s --
+# the filesystem is the source of truth for what it has been doing.
+BATCH_DIR_ENV = "ROOST_BATCH_DIR"
+JOBS_DIR_ENV = "JOBS_ROOT"
+# A batch run counts as actively writing if its newest output landed within
+# ~2x the slower lane's per-item time (~110s for gemma; see the batch README).
+BATCH_ACTIVE_SECS = 240
+PROXY_LOG_TAIL = 65536
+
+# REMOTE panel: ssh aliases come from the environment only, never from file
+# contents -- anything writable over the network must not choose ssh targets.
+REMOTES_ENV = "ROOST_REMOTES"
+REMOTE_CMD_ENV = "ROOST_REMOTE_CMD"
+# ssh runs a non-login shell, whose PATH misses Homebrew and per-user bin dirs
+# -- so the default widens PATH rather than assuming an install location.
+REMOTE_CMD_DEFAULT = (
+    'PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:$HOME/Claude/bin" roost --json')
+REMOTE_REFRESH_SECS = 30
+REMOTE_TIMEOUT_SECS = 15
 
 # Every session roost stops gets one JSON line here. Same shape and the same cap
 # as the hook logs next to it, so the same one-liners read all of them.
@@ -728,6 +751,332 @@ def collect_local_models():
     return out
 
 
+def _batch_root():
+    return Path(os.environ.get(BATCH_DIR_ENV,
+                               str(HOME / "litellm-server" / "batch")))
+
+
+def _jobs_root():
+    return Path(os.environ.get(JOBS_DIR_ENV, str(HOME / "jobs")))
+
+
+def _proxy_log_activity(path):
+    """Last-request age and requests/min, read off the tail of proxy.log.
+
+    Best-effort by design: the log format is LiteLLM's to change, so anything
+    that fails to parse just drops these two numbers rather than the panel.
+    Only timestamped lines mentioning a completions route count as requests.
+    """
+    lines = read_tail(str(path), PROXY_LOG_TAIL)
+    stamp = re.compile(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})")
+    now = time.time()
+    last = None
+    recent = 0
+    for line in lines:
+        if "completion" not in line and "chat" not in line:
+            continue
+        m = stamp.search(line)
+        if not m:
+            continue
+        try:
+            t = time.mktime(time.strptime(
+                m.group(1) + " " + m.group(2), "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            continue
+        last = t if last is None else max(last, t)
+        if now - t <= 60:
+            recent += 1
+    return {"last_req_secs": (now - last) if last is not None else None,
+            "req_per_min": recent if last is not None else None}
+
+
+def collect_gateway():
+    """LiteLLM liveliness plus batch-run progress, derived from files.
+
+    The gateway is DB-less, so its activity endpoints all 400 -- but the batch
+    pipeline is resumable by construction (one output file per finished item),
+    which means progress is fully derivable from the filesystem with zero
+    cooperation from the running process. _run.json, when extract.py wrote one,
+    pins the worklist and model; without it the run still shows, just with less.
+    """
+    now = time.time()
+    out = {"litellm_up": port_open(4000), "runs": [], "jobs": None,
+           "last_req_secs": None, "req_per_min": None}
+
+    root = _batch_root()
+    log = root.parent / "proxy.log"
+    if log.exists():
+        out.update(_proxy_log_activity(log))
+
+    if root.is_dir():
+        for d in sorted(root.iterdir()):
+            if not d.is_dir():
+                continue
+            try:
+                outputs = [p for p in d.glob("*.json")
+                           if not p.name.startswith("_")]
+                failures = d / "_failures.jsonl"
+                failed = 0
+                if failures.exists():
+                    failed = sum(
+                        1 for ln in failures.read_text(
+                            encoding="utf-8", errors="replace").splitlines()
+                        if ln.strip())
+                meta = {}
+                rj = d / "_run.json"
+                if rj.exists():
+                    try:
+                        meta = json.loads(rj.read_text(encoding="utf-8"))
+                    except ValueError:
+                        meta = {}
+                # A dir of loose JSON is not automatically a run: schemas/ and
+                # the like would otherwise show up as one. Without a _run.json
+                # only the results-* naming convention identifies a run.
+                if not meta and not failed and not d.name.startswith("results"):
+                    continue
+                if not outputs and not failed and not meta:
+                    continue  # empty results dir, nothing to say yet
+
+                mtimes = sorted(p.stat().st_mtime for p in outputs)
+                newest = mtimes[-1] if mtimes else None
+                # Rate from the spread of the newest outputs rather than from
+                # the start time: a resumed run's start says nothing about the
+                # pace it is writing at now.
+                rate_hr = None
+                recent = mtimes[-50:]
+                if len(recent) >= 2 and recent[-1] > recent[0]:
+                    rate_hr = (len(recent) - 1) / (recent[-1] - recent[0]) * 3600.0
+                total = meta.get("total")
+                eta_secs = None
+                if rate_hr and isinstance(total, int):
+                    remaining = total - len(outputs) - failed
+                    if remaining > 0:
+                        eta_secs = remaining / rate_hr * 3600.0
+                worklist = meta.get("worklist")
+                out["runs"].append({
+                    "name": d.name,
+                    "model": meta.get("model"),
+                    "worklist": Path(worklist).name if worklist else None,
+                    "done": len(outputs),
+                    "total": total,
+                    "failed": failed,
+                    "rate_hr": rate_hr,
+                    "eta_secs": eta_secs,
+                    "last_write_secs": (now - newest) if newest else None,
+                    "active": newest is not None
+                              and (now - newest) <= BATCH_ACTIVE_SECS,
+                })
+            except OSError:
+                continue
+        out["runs"].sort(key=lambda r: (not r["active"],
+                                        r["last_write_secs"] or 1e12))
+
+    jobs = _jobs_root()
+    if jobs.is_dir():
+        depth = {}
+        for state in ("inbox", "running", "done", "failed"):
+            sub = jobs / state
+            if state in ("done", "failed"):
+                depth[state] = sum(1 for p in sub.iterdir()
+                                   if p.is_dir()) if sub.is_dir() else 0
+            else:
+                depth[state] = len(list(sub.glob("*.json"))) if sub.is_dir() else 0
+        out["jobs"] = depth
+    return out
+
+
+def render_gateway(gw):
+    """LiteLLM plus everything it has been fed, without asking it anything --
+    a DB-less gateway keeps no history, so the batch pipeline's own output
+    files carry the progress story."""
+    lines = ["", c("GATEWAY", BOLD)]
+    mark = c("up", GREEN) if gw["litellm_up"] else c("DOWN", BOLD, RED)
+    head = "  litellm %s (127.0.0.1:4000)" % mark
+    if gw["last_req_secs"] is not None:
+        head += "   last request %s ago" % dur(gw["last_req_secs"])
+    if gw["req_per_min"] is not None:
+        head += "   %d req/min" % gw["req_per_min"]
+    lines.append(head)
+    if gw["jobs"] is not None:
+        j = gw["jobs"]
+        inbox = str(j["inbox"])
+        lines.append("  jobs queue: inbox %s  running %s  done %s  failed %s" % (
+            c(inbox, BOLD, YELLOW) if j["inbox"] else inbox,
+            c(str(j["running"]), GREEN) if j["running"] else j["running"],
+            j["done"],
+            c(str(j["failed"]), RED) if j["failed"] else j["failed"]))
+
+    if not gw["runs"]:
+        lines.append(c("  no batch runs found", DIM))
+        return lines
+
+    cols = [
+        ("BATCH RUN", lambda r: r["name"]),
+        ("MODEL", lambda r: r["model"] or "?"),
+        ("DONE/TOTAL", lambda r: "%d/%s" % (
+            r["done"], r["total"] if r["total"] is not None else "?")),
+        ("FAIL", lambda r: str(r["failed"])),
+        ("RATE", lambda r: "-" if not r["rate_hr"] else "%d/hr" % round(r["rate_hr"])),
+        ("ETA", lambda r: dur(r["eta_secs"]) if r["eta_secs"]
+            else ("done" if r["total"] is not None
+                  and r["done"] + r["failed"] >= r["total"] else "-")),
+        ("LAST", lambda r: "-" if r["last_write_secs"] is None
+            else dur(r["last_write_secs"]) + " ago"),
+    ]
+    table = [[h for h, _ in cols]] + [[f(r) for _, f in cols] for r in gw["runs"]]
+    w = [max(len(row[i]) for row in table) for i in range(len(cols))]
+    lines.append("  " + c("  ".join(
+        table[0][i].ljust(w[i]) for i in range(len(cols))), BOLD))
+    for row, r in zip(table[1:], gw["runs"]):
+        cells = [row[i].ljust(w[i]) for i in range(len(cols))]
+        # Same colouring rule as LOCAL MODELS: green while actively writing,
+        # dim once done or stale.
+        line = "  " + "  ".join(cells)
+        lines.append(c(line, GREEN) if r["active"] else c(line, DIM))
+    active = sum(1 for r in gw["runs"] if r["active"])
+    lines.append("  " + c("%d run(s), %d active" % (len(gw["runs"]), active), DIM))
+    return lines
+
+
+# host -> {"data", "t", "err", "thread"}. Fetches run on daemon threads so a
+# host behind a closed MacBook lid shows as stale rather than hanging the UI.
+_REMOTE = {}
+_REMOTE_LOCK = threading.Lock()
+
+
+def _fetch_remote(host):
+    cmd = os.environ.get(REMOTE_CMD_ENV, REMOTE_CMD_DEFAULT)
+    err, data = None, None
+    try:
+        p = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, cmd],
+            capture_output=True, text=True, timeout=REMOTE_TIMEOUT_SECS)
+        if p.returncode == 0:
+            data = json.loads(p.stdout)
+        else:
+            tail = (p.stderr or "").strip().splitlines()
+            err = tail[-1][:60] if tail else "exit %d" % p.returncode
+    except subprocess.TimeoutExpired:
+        err = "timeout after %ds" % REMOTE_TIMEOUT_SECS
+    except (OSError, ValueError) as e:
+        err = str(e)[:60]
+    with _REMOTE_LOCK:
+        st = _REMOTE.setdefault(host, {})
+        if data is not None:
+            st["data"] = data
+            st["t"] = time.time()
+            st["err"] = None
+        else:
+            st["err"] = err  # keep the last good data and its timestamp
+        st["thread"] = None
+
+
+def collect_remote():
+    hosts = [h.strip() for h in
+             os.environ.get(REMOTES_ENV, "hyrule").split(",") if h.strip()]
+    rows = []
+    now = time.time()
+    for host in hosts:
+        with _REMOTE_LOCK:
+            st = _REMOTE.setdefault(host, {})
+            age = (now - st["t"]) if st.get("t") else None
+            if st.get("thread") is None and (age is None
+                                             or age >= REMOTE_REFRESH_SECS):
+                t = threading.Thread(target=_fetch_remote, args=(host,),
+                                     daemon=True)
+                st["thread"] = t
+                t.start()
+                first_try = not st.get("t") and not st.get("err")
+            else:
+                t, first_try = None, False
+        # Only the very first attempt per host gets a blocking grace period --
+        # it is what makes --once useful. A host that already failed once (the
+        # closed-lid case) never blocks again; its row shows the error instead.
+        if t is not None and first_try:
+            t.join(REMOTE_TIMEOUT_SECS + 2)
+        with _REMOTE_LOCK:
+            st = _REMOTE[host]
+            age = (time.time() - st["t"]) if st.get("t") else None
+            rows.append({"host": host, "data": st.get("data"),
+                         "age_secs": age, "err": st.get("err"),
+                         "fetching": st.get("thread") is not None})
+    return rows
+
+
+def render_remote(remotes):
+    """One summary row per remote host, rendered from that host's own
+    `roost --json` over ssh. Data is cached: a host that stops answering keeps
+    its last good row with the age saying how old it is."""
+    lines = ["", c("REMOTE", BOLD)]
+    if not remotes:
+        lines.append(c("  set %s (comma-separated ssh aliases)" % REMOTES_ENV, DIM))
+        return lines
+
+    cols = [
+        ("HOST", lambda r: r["host"]),
+        ("WORKERS", lambda r: r["nworkers"]),
+        ("WORKING", lambda r: r["working"]),
+        ("RESIDENT MODELS", lambda r: r["resident"]),
+        ("BATCH", lambda r: r["batch"]),
+        ("JOBS", lambda r: r["jobs"]),
+        ("AGE", lambda r: r["age"]),
+    ]
+    view = []
+    for r in remotes:
+        d = r["data"]
+        if d is None:
+            view.append({"host": r["host"], "nworkers": "-", "working": "-",
+                         "resident": "-", "batch": "-", "jobs": "-",
+                         "age": "fetching..." if r["fetching"]
+                                else (r["err"] or "-"), "stale": True})
+            continue
+        workers = d.get("workers") or []
+        working = sum(1 for w in workers
+                      if w.get("idle_secs") is not None and w["idle_secs"] < 60)
+        resident = ", ".join(m["name"] for m in (d.get("local_models") or [])
+                             if m.get("resident")) or "-"
+        gw = d.get("gateway") or {}
+        runs = [x for x in (gw.get("runs") or []) if x.get("active")]
+        if runs:
+            batch = ", ".join("%s %d/%s" % (
+                x["name"], x["done"],
+                x["total"] if x.get("total") is not None else "?")
+                for x in runs)
+        else:
+            batch = "-"
+        j = gw.get("jobs")
+        jobs = ("in %d run %d fail %d" % (j["inbox"], j["running"], j["failed"])
+                if j else "-")
+        age = dur(r["age_secs"]) if r["age_secs"] is not None else "-"
+        stale = r["age_secs"] is not None and r["age_secs"] > 3 * REMOTE_REFRESH_SECS
+        if r["err"]:
+            age += " (%s)" % r["err"]
+        elif stale:
+            age += " (stale)"
+        view.append({"host": r["host"], "nworkers": str(len(workers)),
+                     "working": str(working), "resident": resident,
+                     "batch": batch, "jobs": jobs, "age": age, "stale": stale})
+
+    table = [[h for h, _ in cols]] + [[f(r) for _, f in cols] for r in view]
+    w = [max(len(row[i]) for row in table) for i in range(len(cols))]
+    lines.append("  " + c("  ".join(
+        table[0][i].ljust(w[i]) for i in range(len(cols))), BOLD))
+    for row, r in zip(table[1:], view):
+        cells = []
+        for i, (header, _) in enumerate(cols):
+            txt = row[i].ljust(w[i])
+            if header == "HOST":
+                cells.append(c(txt, BOLD))
+            elif header == "WORKING" and not r["stale"] and row[i] not in ("0", "-"):
+                cells.append(c(txt, GREEN))
+            elif r["stale"] or header == "AGE":
+                cells.append(c(txt, DIM))
+            else:
+                cells.append(txt)
+        lines.append("  " + "  ".join(cells))
+    return lines
+
+
 def parse_budget(s):
     """'60M', '850k', or a plain token count. None on unset or garbage."""
     if not s:
@@ -1284,6 +1633,16 @@ HELP_SCREENS = (
      "it as a share of your plan. Local (non claude-*) models are flagged and excluded "
      "from the budget math. First open scans a week of transcripts and can pause for a "
      "moment; after that it reads only what was appended."),
+    ("GATEWAY", "g",
+     "LiteLLM liveliness plus batch-run progress. The gateway is DB-less so it keeps no "
+     "request history -- progress is derived from the batch pipeline's own output files "
+     "(one JSON per finished item), the job queue dirs, and a best-effort read of "
+     "proxy.log. Green rows are actively writing."),
+    ("REMOTE", "r",
+     "other machines' roost, over ssh. One row per host in ROOST_REMOTES: workers, "
+     "resident models, batch progress, job queue. Fetched on a background thread and "
+     "cached, so an unreachable host shows its last good row with an age instead of "
+     "hanging the display."),
 )
 
 
@@ -1325,6 +1684,10 @@ def frame(view=None, sel=None):
         lines.extend(render_models(collect_local_models()))
     elif view == "usage":
         lines.extend(render_usage(collect_usage()))
+    elif view == "gateway":
+        lines.extend(render_gateway(collect_gateway()))
+    elif view == "remote":
+        lines.extend(render_remote(collect_remote()))
     elif view == "help":
         lines.extend(render_help())
     elif view == "advice":
@@ -1468,7 +1831,7 @@ def paint(lines, vt):
     if len(body) > rows - 1:
         hidden = len(body) - (rows - 2)
         body = body[: rows - 2] + [clip_ansi(
-            c("... %d more line(s) below -- taller window, or s/a/m/h to close a panel"
+            c("... %d more line(s) below -- taller window, or s/a/m/u/g/r/h to close a panel"
               % hidden, DIM), cols - 1)]
 
     # Version, bottom-right. Stamped onto whatever the last visible line turns
@@ -1514,6 +1877,11 @@ def main():
                     help="start with the USAGE panel open (toggle live with 'u'); "
                          "set %s (e.g. 60M) to show weekly burn against a budget"
                          % USAGE_BUDGET_ENV)
+    ap.add_argument("--gateway", action="store_true",
+                    help="start with the GATEWAY panel open (toggle live with 'g')")
+    ap.add_argument("--remote", action="store_true",
+                    help="start with the REMOTE panel open (toggle live with 'r'); "
+                         "hosts come from %s (comma-separated ssh aliases)" % REMOTES_ENV)
     ap.add_argument("--interactive", action="store_true",
                     help="start with interactive mode armed -- cursor, x/y, and the "
                          "EXPERIMENTAL tag (default off; toggle live with 'i')")
@@ -1522,6 +1890,7 @@ def main():
     ap.epilog = (
         "keys while running:  space = refresh now   a = advice panel   "
         "s = subagents panel   m = local models panel   u = usage panel   "
+        "g = gateway panel   r = remote panel   "
         "h or ? = what am I looking at   "
         "i = arm interactive mode   q = quit\n"
         "interactive mode (armed with i):  j/k or arrows move a cursor   "
@@ -1536,6 +1905,7 @@ def main():
             "workers": collect_workers(),
             "infra": collect_infra(),
             "local_models": collect_local_models(),
+            "gateway": collect_gateway(),
         }, indent=2))
         return
 
@@ -1563,6 +1933,10 @@ def main():
         view = "models"
     elif args.usage:
         view = "usage"
+    elif args.gateway:
+        view = "gateway"
+    elif args.remote:
+        view = "remote"
     elif args.no_agents:
         view = None
     else:
@@ -1608,10 +1982,14 @@ def main():
                     s_tag = c("s", BOLD, GREEN) if view == "agents" else "s"
                     m_tag = c("m", BOLD, GREEN) if view == "models" else "m"
                     u_tag = c("u", BOLD, GREEN) if view == "usage" else "u"
+                    g_tag = c("g", BOLD, GREEN) if view == "gateway" else "g"
+                    r_tag = c("r", BOLD, GREEN) if view == "remote" else "r"
                     h_tag = c("h", BOLD, GREEN) if view == "help" else "h"
                     hint = ("space refresh | %s | %s | %s advice | %s agents | "
-                            "%s models | %s usage | %s help | q quit") % (
-                        i_tag, cur_tag, a_tag, s_tag, m_tag, u_tag, h_tag)
+                            "%s models | %s usage | %s gateway | %s remote | "
+                            "%s help | q quit") % (
+                        i_tag, cur_tag, a_tag, s_tag, m_tag, u_tag, g_tag,
+                        r_tag, h_tag)
                 lines, rows, sel = frame(view, sel)
                 # A session can exit while its confirmation is on screen. Matching
                 # on pid rather than on the row dict is what makes that detectable:
@@ -1691,6 +2069,12 @@ def main():
                         break
                     if key in ("u", "U"):
                         view = None if view == "usage" else "usage"
+                        break
+                    if key in ("g", "G"):
+                        view = None if view == "gateway" else "gateway"
+                        break
+                    if key in ("r", "R"):
+                        view = None if view == "remote" else "remote"
                         break
                     if key in ("h", "H", "?"):
                         view = None if view == "help" else "help"
