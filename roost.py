@@ -901,7 +901,9 @@ def style_cell(header, text, row):
                 return c(text, code)
         return c(text, DIM)
     if header == "IDLE":
-        # An hour idle is the signal the maintenance sweep looks for.
+        # This 1-hour mark only dims the IDLE column for readability. The
+        # maintenance sweep itself acts on PARKED_IDLE_HOURS (2h) and
+        # STALE_IDLE_HOURS (6h) below, not on this threshold.
         if row["idle_secs"] is None:
             return c(text, DIM)
         if row["idle_secs"] >= 3600:

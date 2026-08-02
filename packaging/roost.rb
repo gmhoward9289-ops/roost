@@ -16,7 +16,11 @@
 # Homebrew distribution was invisible to any download tracking until this
 # changed.
 #
-# After tagging a release, refresh the checksum with:
+# The checksum below is refreshed automatically on release: the homebrew-tap
+# job in release.yml recomputes it for each tag and pushes the updated
+# formula to the tap repo, so no manual step is needed. This line is kept in
+# the same shape release-please/check-version-consistency.sh expect, as a
+# record of what that job effectively runs:
 #   curl -sL https://github.com/gmhoward9289-ops/roost/releases/download/v0.5.0/roost_top-0.5.0.tar.gz | shasum -a 256   # x-release-please-version
 class Roost < Formula
   include Language::Python::Shebang
