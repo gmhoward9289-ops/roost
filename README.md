@@ -119,7 +119,7 @@ roost -1           one frame, then exit
 roost --json       joined records, for piping
 ```
 
-While running: `space` refresh now · `a` advice panel · `s` subagents panel · `i` arm interactive · `q` quit
+While running: `space` refresh now · `a` advice panel · `s` subagents panel · `m` local models panel · `h` or `?` what am I looking at · `i` arm interactive · `q` quit
 
 ## Acting on a session
 
@@ -160,11 +160,30 @@ roost refuses to stop its own process or its parent — run it from inside the
 session it is pointed at and the cursor can land on the row that owns your
 terminal.
 
-Only one panel is open at a time: `a` and `s` flip between ADVICE and SUBAGENTS
-rather than stacking. With two dozen sessions on screen a stacked second panel
-lands below the bottom of the terminal, which is indistinguishable from the key
-not working. For the same reason the frame now says `... N more line(s) below`
-instead of quietly truncating.
+Only one panel is open at a time: `a`, `s`, `m`, and `h` flip between ADVICE,
+SUBAGENTS, LOCAL MODELS, and HELP rather than stacking. With two dozen sessions
+on screen a stacked second panel lands below the bottom of the terminal, which
+is indistinguishable from the key not working. For the same reason the frame
+now says `... N more line(s) below` instead of quietly truncating.
+
+## Help
+
+`h` or `?` opens a HELP panel — not a keybinding reference (the footer hint
+already lists the keys), but a one-line-each rundown of what each screen on
+the display means: INFRA, WORKERS, SUBAGENTS, ADVICE, LOCAL MODELS. roost is
+small enough that this is the whole manual.
+
+## Local models
+
+The INFRA line only ever shows what Ollama currently has resident in VRAM —
+`ollama:11434 up  qwen-coder-16k:latest (5.5 GB)` — because it reads
+`/api/ps`. A model that is installed but idle drops out of that line entirely,
+which reads as "roost doesn't see it" rather than "it isn't loaded right now."
+
+Press `m` for the full picture: every model `ollama list` knows about, each
+row showing disk size, residency, VRAM when loaded, and how long until Ollama
+unloads it. It reads `/api/tags` merged with `/api/ps`; if Ollama isn't
+running, the panel says so instead of showing nothing.
 
 ## What it logs
 
