@@ -855,9 +855,17 @@ _INFRA_THREAD = None
 def _infra_worker():
     global _INFRA_SNAPSHOT
     while True:
-        snap = collect_infra()
-        with _INFRA_LOCK:
-            _INFRA_SNAPSHOT = snap
+        # A raise here would kill the daemon thread silently and freeze the
+        # INFRA line at its last snapshot forever -- stale data with no tell.
+        # Keeping the old snapshot and retrying next cycle is strictly better
+        # than dying quietly; on main the same raise was at least visible.
+        try:
+            snap = collect_infra()
+        except Exception:
+            snap = None
+        if snap is not None:
+            with _INFRA_LOCK:
+                _INFRA_SNAPSHOT = snap
         time.sleep(INFRA_REFRESH_SECONDS)
 
 
