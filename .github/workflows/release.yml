@@ -329,7 +329,10 @@ jobs:
     needs: [build, windows-exe]
     runs-on: windows-latest
     steps:
-      - uses: vedantmgoyal9/winget-releaser@v2
+      # SHA-pinned, not @v2: this job holds a classic PAT with public_repo --
+      # write access to every public repo on the account -- and a mutable tag
+      # on a third-party action is a supply-chain path to that token.
+      - uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
         with:
           identifier: gmhoward9289-ops.roost
           installers-regex: '\.zip$'
