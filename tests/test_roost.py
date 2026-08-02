@@ -32,6 +32,7 @@ def worker(**kw):
         "cwd": "/tmp/demo", "project": "demo", "model": "claude-opus-5",
         "ctx_tokens": 50000, "ctx_pct": 25.0, "window": "200k",
         "idle_secs": 120.0, "age_secs": 600.0, "task": "a task", "task_src": "title",
+        "auto_compact": True,
     }
     base.update(kw)
     return base
@@ -39,24 +40,157 @@ def worker(**kw):
 
 class TestWindowInference(unittest.TestCase):
     """A 1M-window session reads 480k+ cache tokens in one call; scoring that
-    against 200k is what produced a nonsense '242%' reading."""
+    against 200k is what produced a nonsense '242%' reading. Known models now
+    resolve their real window by name instead of guessing from usage -- the bug
+    this fixed: a claude-fable-5 worker at 177k tokens used to read as '200k
+    window, 89%' when the real window is 1M and usage is ~18%."""
 
-    def test_small_usage_picks_200k(self):
-        self.assertEqual(roost.window_for(100000), (200000, "200k"))
+    def test_known_model_resolves_exactly_regardless_of_usage(self):
+        size, label = roost.window_for(177000, "claude-fable-5")
+        self.assertEqual((size, label), (1000000, "1M"))
+        self.assertNotIn("~", label)
 
-    def test_usage_over_200k_escalates_to_1m(self):
-        self.assertEqual(roost.window_for(484030), (1000000, "1M"))
+    def test_haiku_4_5_dated_snapshot_matches_by_prefix(self):
+        self.assertEqual(
+            roost.window_for(1000, "claude-haiku-4-5-20251001"), (200000, "200k"))
 
-    def test_boundary_is_inclusive(self):
-        self.assertEqual(roost.window_for(200000)[1], "200k")
+    def test_unseen_dated_snapshot_still_matches_known_family_prefix(self):
+        self.assertEqual(
+            roost.window_for(1000, "claude-haiku-4-5-99999999"), (200000, "200k"))
 
-    def test_absurd_usage_clamps_to_largest_tier(self):
-        self.assertEqual(roost.window_for(9_000_000)[1], "1M")
+    def test_legacy_dated_model_is_an_exact_match(self):
+        self.assertEqual(
+            roost.window_for(1000, "claude-opus-4-5-20251101"), (200000, "200k"))
+
+    def test_unknown_model_falls_back_to_inference_and_is_marked(self):
+        self.assertEqual(
+            roost.window_for(100000, "claude-nonexistent-9"), (200000, "~200k"))
+
+    def test_no_model_falls_back_to_inference_and_is_marked(self):
+        self.assertEqual(roost.window_for(100000), (200000, "~200k"))
+
+    def test_usage_over_200k_escalates_to_1m_when_inferring(self):
+        self.assertEqual(roost.window_for(484030), (1000000, "~1M"))
+
+    def test_boundary_is_inclusive_when_inferring(self):
+        self.assertEqual(roost.window_for(200000, "unknown-model")[1], "~200k")
+
+    def test_absurd_usage_clamps_to_largest_tier_when_inferring(self):
+        self.assertEqual(roost.window_for(9_000_000)[1], "~1M")
 
     def test_no_percentage_exceeds_100_for_known_tiers(self):
         for tokens in (1, 199_999, 200_000, 200_001, 999_999, 1_000_000):
             size, _ = roost.window_for(tokens)
             self.assertLessEqual(100.0 * tokens / size, 100.0)
+
+    def test_model_window_exact_and_prefix(self):
+        self.assertEqual(roost.model_window("claude-opus-5"), 1000000)
+        self.assertEqual(roost.model_window("claude-haiku-4-5-20251001"), 200000)
+        self.assertIsNone(roost.model_window("claude-not-a-real-model"))
+        self.assertIsNone(roost.model_window(None))
+        self.assertIsNone(roost.model_window(""))
+
+
+class TestAutoCompactResolution(unittest.TestCase):
+    """autoCompactEnabled is never written to a session lock or transcript --
+    roost has to walk the same settings.json hierarchy Claude Code itself
+    merges, or a session with it truly off looks identical to a normal one
+    that just has not hit NEAR LIMIT yet."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cwd = os.path.join(self.tmp, "project")
+        os.makedirs(os.path.join(self.cwd, ".claude"))
+        self.home = os.path.join(self.tmp, "home", ".claude")
+        os.makedirs(self.home)
+        self._home = roost.HOME
+        self._managed = roost.MANAGED_SETTINGS_PATH
+        roost.HOME = Path(self.tmp) / "home"
+        roost.MANAGED_SETTINGS_PATH = Path(self.tmp) / "no-managed-file.json"
+
+    def tearDown(self):
+        roost.HOME = self._home
+        roost.MANAGED_SETTINGS_PATH = self._managed
+
+    def test_defaults_true_with_nothing_on_disk(self):
+        self.assertTrue(roost.auto_compact_enabled(self.cwd))
+
+    def test_user_settings_can_turn_it_off(self):
+        Path(self.home, "settings.json").write_text(
+            json.dumps({"autoCompactEnabled": False}))
+        self.assertFalse(roost.auto_compact_enabled(self.cwd))
+
+    def test_project_settings_overrides_user_settings(self):
+        Path(self.home, "settings.json").write_text(
+            json.dumps({"autoCompactEnabled": False}))
+        Path(self.cwd, ".claude", "settings.json").write_text(
+            json.dumps({"autoCompactEnabled": True}))
+        self.assertTrue(roost.auto_compact_enabled(self.cwd))
+
+    def test_local_settings_overrides_project_settings(self):
+        Path(self.cwd, ".claude", "settings.json").write_text(
+            json.dumps({"autoCompactEnabled": True}))
+        Path(self.cwd, ".claude", "settings.local.json").write_text(
+            json.dumps({"autoCompactEnabled": False}))
+        self.assertFalse(roost.auto_compact_enabled(self.cwd))
+
+    def test_managed_settings_wins_over_everything(self):
+        managed = Path(self.tmp) / "managed-settings.json"
+        managed.write_text(json.dumps({"autoCompactEnabled": True}))
+        roost.MANAGED_SETTINGS_PATH = managed
+        Path(self.cwd, ".claude", "settings.local.json").write_text(
+            json.dumps({"autoCompactEnabled": False}))
+        self.assertTrue(roost.auto_compact_enabled(self.cwd))
+
+    def test_disable_auto_compact_env_key_is_equivalent(self):
+        Path(self.cwd, ".claude", "settings.json").write_text(
+            json.dumps({"env": {"DISABLE_AUTO_COMPACT": "1"}}))
+        self.assertFalse(roost.auto_compact_enabled(self.cwd))
+
+    def test_a_scope_that_sets_neither_key_falls_through(self):
+        Path(self.cwd, ".claude", "settings.local.json").write_text(json.dumps({"other": 1}))
+        Path(self.cwd, ".claude", "settings.json").write_text(
+            json.dumps({"autoCompactEnabled": False}))
+        self.assertFalse(roost.auto_compact_enabled(self.cwd))
+
+    def test_malformed_json_is_skipped_not_fatal(self):
+        Path(self.cwd, ".claude", "settings.local.json").write_text("{not json")
+        Path(self.cwd, ".claude", "settings.json").write_text(
+            json.dumps({"autoCompactEnabled": False}))
+        self.assertFalse(roost.auto_compact_enabled(self.cwd))
+
+    def test_no_cwd_defaults_true(self):
+        self.assertTrue(roost.auto_compact_enabled(""))
+        self.assertTrue(roost.auto_compact_enabled(None))
+
+
+class TestAutoCompactDisplay(unittest.TestCase):
+    def setUp(self):
+        self._color = roost.COLOR
+        roost.COLOR = False
+
+    def tearDown(self):
+        roost.COLOR = self._color
+
+    def test_tag_appears_only_when_auto_compact_is_off(self):
+        # idle_secs under a minute keeps the row in WORKING NOW rather than
+        # collapsing into the QUIET summary line, where task text (and so the
+        # tag) would not be shown at all.
+        on = worker(name="a", pid=1, idle_secs=5, auto_compact=True)
+        off = worker(name="b", pid=2, idle_secs=5, auto_compact=False)
+        self.assertNotIn("no-compact", "\n".join(roost.render([on])))
+        self.assertIn("no-compact", "\n".join(roost.render([off])))
+
+    def test_advice_warns_there_is_no_safety_net_when_auto_compact_is_off(self):
+        out = "\n".join(roost.advise([worker(
+            ctx_tokens=400000, ctx_pct=85.0, idle_secs=10, auto_compact=False)]))
+        self.assertIn("NEAR LIMIT", out)
+        self.assertIn("auto-compact off", out)
+
+    def test_advice_keeps_the_normal_wording_when_auto_compact_is_on(self):
+        out = "\n".join(roost.advise([worker(
+            ctx_tokens=400000, ctx_pct=85.0, idle_secs=10, auto_compact=True)]))
+        self.assertIn("auto-compacts mid-task", out)
 
 
 class TestDuration(unittest.TestCase):
@@ -309,9 +443,11 @@ class TestSubagentTypeAndCtx(unittest.TestCase):
         self.assertIn("Explore/def45", out)
 
     def test_ctx_column_reads_tokens_over_window(self):
+        # claude-opus-5 is a known model (MODEL_WINDOWS) -- its real window is
+        # 1M, not the old 200k usage-inferred tier.
         out = "\n".join(roost.render_subagents(
             roost.collect_subagents({self.parent_sid})))
-        self.assertIn("48k/200k", out)
+        self.assertIn("48k/1M", out)
 
     def test_running_agent_without_a_type_keeps_the_hex_id(self):
         roost._AGENT_META.clear()
