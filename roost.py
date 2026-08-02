@@ -143,12 +143,19 @@ LOG_MAX_LINES = 5000
 LOGGING = True
 
 # agentId -> {description, status, model, type}, harvested from the parent
-# transcript. Merged as records arrive; never invalidated.
+# transcript. Merged as records arrive; evicted only when the agent itself is
+# gone (prune_caches below).
 _AGENT_META = {}
 _AGENT_LABEL = {}
 
 # parent transcript path -> bytes already harvested for agent meta.
 _HARVEST_POS = {}
+
+# Keys touched since the last prune. Anything not re-touched belongs to a
+# session or agent that no longer exists; keeping it is a slow leak in a
+# dashboard left open for days.
+_SEEN_PATHS = set()
+_SEEN_AGENTS = set()
 
 # path -> (mtime, parsed result). At a 1s refresh, re-reading 256 KB from every
 # transcript each tick is megabytes of disk per second for no new information --
@@ -538,6 +545,7 @@ def scan_transcript(path):
            "title": None, "prompt": None}
     if not path:
         return out
+    _SEEN_PATHS.add(path)
     try:
         out["last_write"] = os.path.getmtime(path)
     except OSError:
@@ -602,6 +610,10 @@ def harvest_agent_meta(parent_transcript):
     """
     if not parent_transcript:
         return
+    # Keeps the byte position alive across prunes while anything still asks
+    # about this parent; without it an orphan's dead parent would be evicted
+    # and re-read from byte 0 every tick.
+    _SEEN_PATHS.add(parent_transcript)
     pos = _HARVEST_POS.get(parent_transcript, 0)
     try:
         size = os.path.getsize(parent_transcript)
@@ -631,6 +643,9 @@ def harvest_agent_meta(parent_transcript):
         aid = r.get("agentId")
         if not aid:
             continue
+        # Marked seen even when the agent has no live row: evicting it here
+        # would just force a re-harvest next tick.
+        _SEEN_AGENTS.add(aid)
         # Merge rather than first-write-wins: an async launch writes an early
         # record with no agentType, and the completed result that carries it
         # would otherwise be discarded.
@@ -690,6 +705,7 @@ def collect_subagents(live_sids):
         if not parent_live and (age is None or age > AGENT_RECENT_SECS):
             continue  # finished long ago -- history, not a live worker
 
+        _SEEN_AGENTS.add(agent_id)
         # Re-harvest while the type is still missing: a running agent's early
         # records carry no agentType; the completed result does.
         if not (_AGENT_META.get(agent_id) or {}).get("type"):
@@ -1875,7 +1891,7 @@ def frame(view=None, sel=None):
         sel = min(sel, len(rows) - 1) if rows else None
     # Infra leads because it is a constant: one quiet line you skim past, which
     # is exactly the weight it deserves until something turns red.
-    lines = render_infra(collect_infra()) + render_usage_caps(collect_usage_caps()) + render(workers, sel)
+    lines = render_infra(collect_infra()) + render(workers, sel)
     if view == "agents":
         live_sids = set(w["session_id"] for w in workers if w.get("session_id"))
         lines.extend(render_subagents(collect_subagents(live_sids)))
@@ -1892,7 +1908,30 @@ def frame(view=None, sel=None):
     elif view == "advice":
         lines.append("")
         lines.extend(advise(workers))
+    prune_caches()
     return lines, rows, sel
+
+
+def prune_caches():
+    """Evict cache entries whose session or agent vanished since the last frame.
+
+    Every live path and agent re-registers itself each tick, so anything left
+    over is history -- without this the caches grow for as long as the dashboard
+    stays open, which is days.
+    """
+    for cache in (_SCAN_CACHE, _HARVEST_POS):
+        for k in [k for k in cache if k not in _SEEN_PATHS]:
+            del cache[k]
+    for cache in (_AGENT_META, _AGENT_LABEL):
+        for k in [k for k in cache if k not in _SEEN_AGENTS]:
+            del cache[k]
+    _SEEN_PATHS.clear()
+    _SEEN_AGENTS.clear()
+
+
+# (handle, original mode) when enable_vt() changed the console, else None.
+# Conhost keeps a mutated mode after the process exits, so it must be put back.
+_VT_ORIGINAL = None
 
 
 def enable_vt():
@@ -1901,6 +1940,7 @@ def enable_vt():
     Without it the cursor-home and erase sequences are ignored, so every frame is
     appended below the last instead of overwriting it -- the screen pages away.
     """
+    global _VT_ORIGINAL
     if os.name != "nt":
         return True
     try:
@@ -1914,9 +1954,24 @@ def enable_vt():
         ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
         if mode.value & ENABLE_VIRTUAL_TERMINAL_PROCESSING:
             return True
-        return bool(k.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
+        if k.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING):
+            _VT_ORIGINAL = (handle, mode.value)
+            return True
+        return False
     except Exception:
         return False
+
+
+def restore_vt():
+    """Put the console mode back exactly as enable_vt() found it."""
+    if _VT_ORIGINAL is None:
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.SetConsoleMode(_VT_ORIGINAL[0], _VT_ORIGINAL[1])
+    except Exception:
+        pass
 
 
 class KeyReader(object):
@@ -1962,7 +2017,10 @@ class KeyReader(object):
             try:
                 import termios
 
-                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved)
+                # TCSAFLUSH, not TCSADRAIN: discard queued input (the tail of an
+                # arrow sequence, keys typed during a slow frame) instead of
+                # delivering it to the shell prompt after exit.
+                termios.tcsetattr(self._fd, termios.TCSAFLUSH, self._saved)
             except Exception:
                 pass
         return False
@@ -1992,19 +2050,27 @@ class KeyReader(object):
             return None
         import select
 
-        r, _, _ = select.select([sys.stdin], [], [], timeout)
+        # os.read on the raw fd, never sys.stdin.read: the buffered TextIO can
+        # slurp several bytes into user space, after which select() on the fd
+        # reports "not ready" while input sits in the buffer -- arrow tails then
+        # surface as stray characters, or spill to the shell after exit.
+        def read1():
+            b = os.read(self._fd, 1)
+            return b.decode("utf-8", "replace") if b else ""
+
+        r, _, _ = select.select([self._fd], [], [], timeout)
         if not r:
             return None
-        ch = sys.stdin.read(1)
+        ch = read1()
         if ch != "\x1b":
             return ch
         # A bare Esc and the start of an arrow sequence are the same byte. The
         # rest of a real CSI arrives in the same burst, so nothing further within
         # a beat means the user pressed Esc.
-        r, _, _ = select.select([sys.stdin], [], [], 0.05)
-        if not r or sys.stdin.read(1) != "[":
+        r, _, _ = select.select([self._fd], [], [], 0.05)
+        if not r or read1() != "[":
             return "ESC"
-        return {"A": "UP", "B": "DOWN"}.get(sys.stdin.read(1))
+        return {"A": "UP", "B": "DOWN"}.get(read1())
 
 
 def term_size():
@@ -2108,6 +2174,13 @@ def main():
             "gateway": collect_gateway(),
         }, indent=2))
         return
+
+    # Die by unwinding, not by default disposition: a plain kill would skip the
+    # KeyReader __exit__ and the cursor/console restore below, leaving the tty
+    # in cbreak/no-echo with the cursor hidden. SystemExit runs both.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, lambda *_: sys.exit(0))
 
     vt = enable_vt()
 
@@ -2332,6 +2405,7 @@ def main():
         if vt:
             sys.stdout.write("\033[?25h\n")  # restore the cursor on the way out
             sys.stdout.flush()
+        restore_vt()
 
 
 if __name__ == "__main__":

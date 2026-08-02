@@ -1,4 +1,4 @@
-"""Tests for roost.
+﻿"""Tests for roost.
 
 Written against stdlib unittest so `python -m unittest` works with nothing
 installed; pytest collects them unchanged in CI.
@@ -1000,6 +1000,75 @@ class TestUsageCacheEviction(unittest.TestCase):
         self.assertNotIn("gone.jsonl", roost._USAGE_CACHE)
         for byday in days.values():
             self.assertNotIn(1234, byday.values())
+
+
+class TestCachePruning(unittest.TestCase):
+    """The scan/agent caches grew for as long as the dashboard stayed open --
+    days -- because nothing ever removed sessions and agents that had exited."""
+
+    def setUp(self):
+        for d in (roost._SCAN_CACHE, roost._AGENT_META, roost._AGENT_LABEL):
+            d.clear()
+        roost._SEEN_PATHS.clear()
+        roost._SEEN_AGENTS.clear()
+
+    def test_unseen_entries_are_evicted(self):
+        roost._SCAN_CACHE["dead.jsonl"] = (1.0, {})
+        roost._AGENT_META["dead-agent"] = {"description": "x"}
+        roost._AGENT_LABEL["dead-agent"] = "x"
+        roost.prune_caches()
+        self.assertEqual(roost._SCAN_CACHE, {})
+        self.assertEqual(roost._AGENT_META, {})
+        self.assertEqual(roost._AGENT_LABEL, {})
+
+    def test_seen_entries_survive(self):
+        roost._SCAN_CACHE["live.jsonl"] = (1.0, {})
+        roost._AGENT_META["live-agent"] = {"description": "x"}
+        roost._SEEN_PATHS.add("live.jsonl")
+        roost._SEEN_AGENTS.add("live-agent")
+        roost.prune_caches()
+        self.assertIn("live.jsonl", roost._SCAN_CACHE)
+        self.assertIn("live-agent", roost._AGENT_META)
+
+    def test_seen_sets_reset_after_prune(self):
+        roost._SEEN_PATHS.add("live.jsonl")
+        roost.prune_caches()
+        self.assertEqual(roost._SEEN_PATHS, set())
+        self.assertEqual(roost._SEEN_AGENTS, set())
+
+    def test_scan_transcript_registers_its_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "s.jsonl")
+            with open(p, "w") as fh:
+                fh.write("\n")
+            roost.scan_transcript(p)
+            self.assertIn(p, roost._SEEN_PATHS)
+
+
+class TestTerminalTeardown(unittest.TestCase):
+    """After exit the shell prompt must come back exactly as it was: console
+    mode restored on Windows, no stale input delivered on POSIX."""
+
+    def test_restore_vt_is_safe_when_nothing_was_changed(self):
+        old = roost._VT_ORIGINAL
+        roost._VT_ORIGINAL = None
+        try:
+            roost.restore_vt()  # must not raise
+        finally:
+            roost._VT_ORIGINAL = old
+
+    def test_posix_restore_flushes_pending_input(self):
+        # TCSADRAIN handed queued arrow-sequence tails to the shell after exit;
+        # the restore must discard them instead.
+        src = (ROOT / "roost.py").read_text(encoding="utf-8")
+        self.assertIn("termios.TCSAFLUSH", src)
+        self.assertNotIn("termios.TCSADRAIN,", src)
+
+    def test_key_reader_never_reads_buffered_stdin(self):
+        # sys.stdin.read buffers past what select() sees; keys then leak to the
+        # shell prompt after exit. Only raw os.read on the fd is allowed.
+        src = (ROOT / "roost.py").read_text(encoding="utf-8")
+        self.assertNotIn("sys.stdin.read(", src)
 
 
 if __name__ == "__main__":
