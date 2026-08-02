@@ -9,6 +9,13 @@ Versions are published to [PyPI](https://pypi.org/project/roost-top/) and
 a signed apt repository — so a version number here is the same version on all
 four.
 
+## [0.5.0](https://github.com/gmhoward9289-ops/roost/compare/v0.4.0...v0.5.0) (2026-08-02)
+
+
+### Fixed
+
+* point Homebrew formula at a tracked release asset ([1a52b2f](https://github.com/gmhoward9289-ops/roost/commit/1a52b2f99405d56c5f1d70d28fb1feb195d46208))
+
 ## [Unreleased]
 
 ### Added
