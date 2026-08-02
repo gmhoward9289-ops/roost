@@ -22,6 +22,10 @@ drift out of date.
 - **LOCAL MODELS panel** ([#16](https://github.com/gmhoward9289-ops/roost/pull/16))
   — surfaces the models on the box, and stops hiding the ones that aren't
   currently loaded.
+- **winget install and a Windows exe** — `winget install gmhoward9289-ops.roost`
+  installs a frozen executable, no Python required. The same build is attached
+  to every tagged release as `roost-<version>-windows-x64.zip` for anyone who
+  wants the zip directly.
 - **npm distribution** — `roost-top` is now installable with `npx roost-top` or
   `npm install -g roost-top`, alongside the existing PyPI, Homebrew and apt
   channels ([#12](https://github.com/gmhoward9289-ops/roost/pull/12)). The

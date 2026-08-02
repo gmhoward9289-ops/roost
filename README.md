@@ -101,9 +101,21 @@ curl -o roost https://raw.githubusercontent.com/gmhoward9289-ops/roost/main/roos
 chmod +x roost && ./roost
 ```
 
-Windows: save it as `roost.py` and run it — `.PY` is in `PATHEXT`, so `roost.py`
-works from anywhere on `PATH`. Beyond npm above there is no Windows package; the
-single file is the install.
+With winget:
+
+```powershell
+winget install gmhoward9289-ops.roost
+```
+
+That installs a frozen Windows executable — no Python required. It's built and
+attached to every tagged release alongside a `roost-<version>-windows-x64.zip`
+on the [Releases page](https://github.com/gmhoward9289-ops/roost/releases), if
+you'd rather grab the zip directly.
+
+Or, without any of that: save `roost.py` and run it — `.PY` is in `PATHEXT`,
+so `roost.py` works from anywhere on `PATH`. That route and the npm one above
+both still need a Python interpreter on `PATH`; the winget install is the one
+that doesn't, since it ships a frozen exe.
 
 The man page (`man roost`) ships with the Homebrew and `.deb` installs. A pipx
 install puts it under the venv's own `share/man`, which is not on the default
