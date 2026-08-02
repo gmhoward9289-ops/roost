@@ -1690,15 +1690,23 @@ def render(workers, sel=None):
     wid = [max([len(head[i])] + [len(row[i]) for row in body])
            for i in range(len(cols))]
 
+    # The group label is a gutter column, not a line of its own: a header row
+    # per group cost a screen line each and pushed the table down past a short
+    # window. On the first row of each group only, blank on the rest.
+    lw = max([len(b[1]) for (b, _) in shown] or [0])
+
     if shown:
-        lines.append(c("  " + "  ".join(head[i].ljust(wid[i]) for i in range(len(cols)))
+        lines.append(c("  " + " " * lw + "  "
+                       + "  ".join(head[i].ljust(wid[i]) for i in range(len(cols)))
                        + "  TASK", BOLD))
     last = None
     for i, ((b, w), row) in enumerate(zip(shown, body)):
         if b[1] != last:
             last = b[1]
-            lines.append(c(b[1], BOLD, BUCKET_COLORS.get(b[0], DIM)))
-        cells = [style_cell(cols[j][0], row[j].ljust(wid[j]), w) for j in range(len(cols))]
+            label = c(b[1].ljust(lw), BOLD, BUCKET_COLORS.get(b[0], DIM))
+        else:
+            label = " " * lw
+        cells = [label] + [style_cell(cols[j][0], row[j].ljust(wid[j]), w) for j in range(len(cols))]
         # Last gate before the terminal. Sanitised at collection too, but this
         # is the boundary that matters: every task string reaches the screen here.
         task = ascii_safe(w.get("task") or "")
