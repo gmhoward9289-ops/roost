@@ -9,17 +9,19 @@ Versions are published to [PyPI](https://pypi.org/project/roost-top/) and
 a signed apt repository — so a version number here is the same version on all
 four.
 
-## [0.5.0](https://github.com/gmhoward9289-ops/roost/compare/v0.4.0...v0.5.0) (2026-08-02)
+Releases are cut by [release-please](.github/workflows/release-please.yml),
+which prepends a generated section here when the release PR merges. There is
+deliberately no `Unreleased` heading: unreleased work lives in the open release
+PR, and a hand-maintained section would sort below each new generated one and
+drift out of date.
 
-
-### Fixed
-
-* point Homebrew formula at a tracked release asset ([1a52b2f](https://github.com/gmhoward9289-ops/roost/commit/1a52b2f99405d56c5f1d70d28fb1feb195d46208))
-
-## [Unreleased]
+## [0.5.0](https://github.com/gmhoward9289-ops/roost/compare/v0.4...v0.5.0) (2026-08-02)
 
 ### Added
 
+- **LOCAL MODELS panel** ([#16](https://github.com/gmhoward9289-ops/roost/pull/16))
+  — surfaces the models on the box, and stops hiding the ones that aren't
+  currently loaded.
 - **npm distribution** — `roost-top` is now installable with `npx roost-top` or
   `npm install -g roost-top`, alongside the existing PyPI, Homebrew and apt
   channels ([#12](https://github.com/gmhoward9289-ops/roost/pull/12)). The
@@ -29,9 +31,24 @@ four.
   ([#1](https://github.com/gmhoward9289-ops/roost/pull/1)) — advice lines
   identify a session by what it is working on, so acting on them doesn't require
   cross-referencing the table first.
+- **`llms.txt`**, so AI crawlers get a plain-language summary of what roost is.
+
+### Fixed
+
+- **Homebrew formula points at a tracked release asset**
+  ([`1a52b2f`](https://github.com/gmhoward9289-ops/roost/commit/1a52b2f99405d56c5f1d70d28fb1feb195d46208))
+  rather than a tarball whose checksum moved.
 
 ### Changed
 
+- **Releases run through release-please**
+  ([#19](https://github.com/gmhoward9289-ops/roost/pull/19),
+  [#20](https://github.com/gmhoward9289-ops/roost/pull/20)) — the version bump
+  and tag are cut by merging a release PR instead of by hand, and npm and
+  Homebrew tap publishing are automated on release
+  ([#18](https://github.com/gmhoward9289-ops/roost/pull/18)).
+- This changelog was written and backfilled to cover v0.01 through v0.4
+  ([#13](https://github.com/gmhoward9289-ops/roost/pull/13)).
 - README points at the `help wanted` issues.
 - Demo recording re-cut against 0.4.
 
@@ -123,7 +140,6 @@ Initial release.
   the tier is inferred — and printed, so the assumption stays visible rather
   than silently wrong.
 
-[Unreleased]: https://github.com/gmhoward9289-ops/roost/compare/v0.4...HEAD
 [0.4]: https://github.com/gmhoward9289-ops/roost/compare/v0.3...v0.4
 [0.3]: https://github.com/gmhoward9289-ops/roost/compare/v0.2...v0.3
 [0.2]: https://github.com/gmhoward9289-ops/roost/compare/v0.01...v0.2
