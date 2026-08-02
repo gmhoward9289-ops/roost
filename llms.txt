@@ -1,0 +1,39 @@
+# roost
+
+> `top` for Claude Code: a terminal dashboard for every live Claude Code session on a
+> machine — the model each one is on, how much context window it has burned, whether it
+> is working, idle, or stuck waiting for input — and, unlike any other tool in this space,
+> the subagents each session has spawned underneath it.
+
+Single-file, dependency-free Python 3.9+ program. Runs on macOS, Linux, and Windows.
+Read-only: it inspects local Claude Code session state and never modifies a session,
+a working tree, or a git repository.
+
+## What it's for
+
+Anyone running several Claude Code sessions at once — across multiple projects,
+worktrees, or machines — loses track of which ones need attention. roost groups
+sessions by how costly they are to ignore: sessions near their context limit surface
+first, sessions parked mid-task with a large context bill next, then everything
+actively working, then quiet sessions collapse into a single line. It also surfaces
+subagents spawned by a session (background Task/Agent calls), which is otherwise
+invisible from outside that session.
+
+## Install
+
+- Homebrew (macOS/Linux): `brew install gmhoward9289-ops/tap/roost`
+- Debian/Ubuntu (apt, with upgrade support): see README
+- npm: `npm install -g roost-top` (note: the package name on npm is `roost-top`,
+  not `roost` — the bare name `roost` on the npm registry belongs to an unrelated
+  "system provisioning toolkit" package)
+- Direct download: GitHub Releases
+
+## Links
+
+- Repository: https://github.com/gmhoward9289-ops/roost
+- README (full usage, install matrix, screenshots): https://github.com/gmhoward9289-ops/roost/blob/main/README.md
+- Changelog: https://github.com/gmhoward9289-ops/roost/blob/main/CHANGELOG.md
+- License: MIT
+- Related tool: leghorn (https://github.com/gmhoward9289-ops/leghorn) — a live
+  dashboard for Claude Code sessions joined to git state and GitHub CI, complementary
+  to roost's focus on model/context/subagent state.
