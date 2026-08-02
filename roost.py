@@ -72,6 +72,14 @@ HOME = Path.home()
 SESSIONS_DIR = HOME / ".claude" / "sessions"
 PROJECTS_DIR = HOME / ".claude" / "projects"
 
+# The real Anthropic meter -- session/weekly/Fable caps -- has no local source;
+# this cache is written by the "claude-usage-scrape" scheduled task (a Claude
+# session driving claude-in-chrome against claude.ai/settings/usage), not by
+# roost itself. Missing/stale is the normal state on a machine without that
+# task, or on hyrule, which has no browser control at all.
+USAGE_CACHE = HOME / "claude-usage" / "usage.json"
+USAGE_STALE_SECS = 4 * 2 * 3600  # 4x the scrape task's 2h cadence
+
 # ---- config ----------------------------------------------------------------
 # Seconds between automatic repaints. Override per-run with `-w N`; space forces
 # an immediate repaint regardless.
@@ -156,19 +164,124 @@ _SPARK = {}
 # per transcript per roost run.
 _USAGE_CACHE = {}
 
-# Nothing in the transcript records which context window a session was opened with,
-# so it is inferred: the smallest standard tier the observed usage still fits in.
-# A session on the 1M window read 482k cache tokens in one call here -- scoring that
-# against 200k is what produced a nonsense "242%". The chosen tier is displayed
-# rather than assumed silently.
+# Nothing in the transcript records which context window a session was opened
+# with. Best source: the model name itself -- Anthropic documents each model's
+# real window, and unlike usage that is exact regardless of how little of it
+# has been used. A claude-fable-5 worker at 177k tokens is ~18% of its real 1M
+# window; scored against the wrong 200k tier (usage-only inference) that read
+# as an alarming 89% and tripped a false NEAR LIMIT warning.
+#
+# MODEL_WINDOWS is exact-match first, then longest-matching-prefix, so a dated
+# snapshot under a known family (any claude-haiku-4-5-*) resolves without its
+# own table row. A model this table has never heard of falls back to the old
+# behaviour -- the smallest standard tier the observed usage still fits in --
+# and its label is "~"-marked so an inferred window never looks as certain as
+# a known one on screen.
+MODEL_WINDOWS = {
+    "claude-fable-5": 1000000,
+    "claude-opus-5": 1000000,
+    "claude-sonnet-5": 1000000,
+    "claude-haiku-4-5": 200000,
+    # Legacy -- may still appear in old transcripts.
+    "claude-opus-4-8": 1000000,
+    "claude-opus-4-7": 1000000,
+    "claude-opus-4-6": 1000000,
+    "claude-sonnet-4-6": 1000000,
+    "claude-sonnet-4-5-20250929": 200000,
+    "claude-opus-4-5-20251101": 200000,
+    "claude-opus-4-1-20250805": 200000,
+}
+
 WINDOW_TIERS = ((200000, "200k"), (1000000, "1M"))
 
 
-def window_for(tokens):
+def model_window(model):
+    """Known window size for `model`, or None if it is not in MODEL_WINDOWS --
+    exact match first, then the longest matching prefix."""
+    if not model:
+        return None
+    if model in MODEL_WINDOWS:
+        return MODEL_WINDOWS[model]
+    best_key, best_size = "", None
+    for key, size in MODEL_WINDOWS.items():
+        if model.startswith(key) and len(key) > len(best_key):
+            best_key, best_size = key, size
+    return best_size
+
+
+def _window_label(size):
+    return "1M" if size >= 1000000 else "%dk" % (size // 1000)
+
+
+def window_for(tokens, model=None):
+    """(window_size, label) for a session's context window. Known models
+    resolve exactly off MODEL_WINDOWS; anything else falls back to the old
+    usage-based inference, its label "~"-marked to say so."""
+    size = model_window(model)
+    if size is not None:
+        return size, _window_label(size)
     for size, label in WINDOW_TIERS:
         if tokens <= size:
-            return size, label
-    return WINDOW_TIERS[-1]
+            return size, "~" + label
+    return WINDOW_TIERS[-1][0], "~" + WINDOW_TIERS[-1][1]
+
+
+# ---- auto-compact resolution ------------------------------------------------
+# autoCompactEnabled is a Claude Code setting -- never written to a session lock
+# file or a transcript, so seeing a worker with it off takes walking the same
+# settings.json hierarchy Claude Code itself merges: managed, then a project's
+# own .claude/settings.local.json, then its .claude/settings.json, then the
+# user's ~/.claude/settings.json. Highest scope that sets the key wins; a file
+# that exists but never mentions autoCompactEnabled (or its env-var twin,
+# DISABLE_AUTO_COMPACT) is transparent, same as Claude Code's own merge.
+#
+# What this cannot see: a CLI flag the session itself was launched with, or
+# DISABLE_AUTO_COMPACT exported in a shell rather than written into a
+# settings.json's own "env" block -- roost reads files, not another process's
+# environment or argv.
+AUTO_COMPACT_KEY = "autoCompactEnabled"
+AUTO_COMPACT_ENV_KEY = "DISABLE_AUTO_COMPACT"
+MANAGED_SETTINGS_PATH = {
+    "win32": Path(r"C:\Program Files\ClaudeCode\managed-settings.json"),
+    "darwin": Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+}.get(sys.platform, Path("/etc/claude-code/managed-settings.json"))
+
+
+def _auto_compact_from_file(path):
+    """True/False if this scope's settings.json decides the setting, else None
+    -- meaning fall through to the next scope down."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if AUTO_COMPACT_KEY in data:
+        return bool(data[AUTO_COMPACT_KEY])
+    env = data.get("env")
+    if isinstance(env, dict) and AUTO_COMPACT_ENV_KEY in env:
+        # DISABLE_AUTO_COMPACT is the env-var mirror of the settings key --
+        # truthy disables, so the boolean it decides is inverted.
+        return str(env[AUTO_COMPACT_ENV_KEY]).strip().lower() not in ("1", "true", "yes")
+    return None
+
+
+def auto_compact_enabled(cwd):
+    """Effective autoCompactEnabled for a session launched from `cwd`. Defaults
+    True -- Claude Code's own built-in default -- if nothing in the chain sets
+    it anywhere."""
+    if not cwd:
+        return True
+    base = Path(cwd)
+    for path in (MANAGED_SETTINGS_PATH,
+                 base / ".claude" / "settings.local.json",
+                 base / ".claude" / "settings.json",
+                 HOME / ".claude" / "settings.json"):
+        result = _auto_compact_from_file(path)
+        if result is not None:
+            return result
+    return True
+
 
 SERVICES = (
     ("ollama", 11434, "/api/ps"),
@@ -589,7 +702,7 @@ def collect_subagents(live_sids):
         pct = None
         win_label = "-"
         if info["ctx_tokens"]:
-            window, win_label = window_for(info["ctx_tokens"])
+            window, win_label = window_for(info["ctx_tokens"], model)
             pct = 100.0 * info["ctx_tokens"] / float(window)
 
         # Parent liveness gates everything: if the parent process is gone, nothing
@@ -625,6 +738,7 @@ def collect_workers():
     if not SESSIONS_DIR.is_dir():
         return rows
     now = time.time()
+    ac_cache = {}
     for f in sorted(SESSIONS_DIR.glob("*.json")):
         try:
             s = json.loads(f.read_text())
@@ -638,7 +752,7 @@ def collect_workers():
         pct = None
         win_label = "-"
         if info["ctx_tokens"]:
-            window, win_label = window_for(info["ctx_tokens"])
+            window, win_label = window_for(info["ctx_tokens"], info["model"])
             pct = 100.0 * info["ctx_tokens"] / float(window)
         idle = None
         if info["last_write"]:
@@ -662,12 +776,15 @@ def collect_workers():
 
         started = s.get("startedAt")
         age = (now - started / 1000.0) if isinstance(started, (int, float)) else None
+        cwd = s.get("cwd") or ""
+        if cwd not in ac_cache:
+            ac_cache[cwd] = auto_compact_enabled(cwd)
         rows.append({
             "name": s.get("name") or "-",
             "pid": pid,
             "session_id": sid,
-            "cwd": s.get("cwd") or "",
-            "project": Path(s.get("cwd") or ".").name or "-",
+            "cwd": cwd,
+            "project": Path(cwd or ".").name or "-",
             "model": info["model"] or "-",
             "ctx_tokens": info["ctx_tokens"],
             "ctx_pct": pct,
@@ -682,6 +799,7 @@ def collect_workers():
             "idle_secs": idle,
             "age_secs": age,
             "flow": flow,
+            "auto_compact": ac_cache[cwd],
         })
     return rows
 
@@ -705,6 +823,23 @@ def collect_infra():
                 detail = "no model resident"
         out.append({"name": name, "port": port, "up": True, "detail": detail})
     return out
+
+
+def collect_usage_caps():
+    """The real 5-hour/weekly/Fable caps, from the claude-usage-scrape cache.
+
+    Returns None if the cache has never been written (task not yet run, or not
+    installed on this machine) -- distinct from a stale-but-present cache, which
+    render_usage_caps shows with an age instead of hiding.
+    """
+    try:
+        with open(USAGE_CACHE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    last_success = data.get("last_success_epoch")
+    data["age_secs"] = (time.time() - last_success) if last_success else None
+    return data
 
 
 def _iso_to_epoch(ts):
@@ -1269,9 +1404,15 @@ def advise(workers):
                         % (idle_h, "{:,}".format(tok), "{:,}".format(TYPICAL_BASELINE),
                            "{:,}".format(saving))))
         elif pct >= NEAR_LIMIT_PCT:
-            out.append((saving, c("NEAR LIMIT", BOLD, YELLOW), tag, task,
-                        "at %.0f%% of its window. Wrap up or /compact before it "
-                        "auto-compacts mid-task." % pct))
+            if r.get("auto_compact", True):
+                detail = ("at %.0f%% of its window. Wrap up or /compact before it "
+                           "auto-compacts mid-task." % pct)
+            else:
+                detail = ("at %.0f%% of its window with auto-compact off for this "
+                           "session -- there is no safety net here. Wrap up or "
+                           "/compact now, or it errors out instead of compacting."
+                           % pct)
+            out.append((saving, c("NEAR LIMIT", BOLD, YELLOW), tag, task, detail))
         elif tok >= EXPENSIVE_TOKENS:
             out.append((saving, c("EXPENSIVE", YELLOW), tag, task,
                         "every turn now reprocesses %s tokens. Fine to finish the "
@@ -1448,6 +1589,12 @@ def render(workers, sel=None):
         task = ascii_safe(w.get("task") or "")
         if w.get("task_src") == "prompt" and task:
             task = c(task, DIM)  # not yet named -- this is the raw last prompt
+        if not w.get("auto_compact", True):
+            # The one WORKERS-row marker that is not about token economics --
+            # auto-compact off means NEAR LIMIT has no safety net, so it is
+            # called out even on a session nowhere near its window yet.
+            tag = c("[no-compact]", BOLD, YELLOW)
+            task = tag + " " + task if task else tag
         # The marker is printed whether or not colour is on: over SSH, in a pipe,
         # or on a terminal with no reverse video it is the only thing that says
         # which row x would act on.
@@ -1481,6 +1628,58 @@ def render_infra(infra):
             extra = " " + c(s["detail"], CYAN)
         parts.append("%s:%d %s%s" % (c(s["name"], BOLD), s["port"], mark, extra))
     return [c("INFRA  ", BOLD) + "   ".join(parts), ""]
+
+
+def _pct_color(pct):
+    if pct is None:
+        return DIM
+    if pct >= 80:
+        return (BOLD, RED)
+    if pct >= 50:
+        return (YELLOW,)
+    return (GREEN,)
+
+
+def render_usage_caps(usage):
+    """Real Anthropic caps, one line, always visible next to INFRA -- same
+    "quiet until it matters" weight, refreshed on a 2h cadence rather than
+    every frame, since the source is a scrape cache, not a live probe."""
+    label = c("CAPS   ", BOLD)
+    if usage is None:
+        return [label + c("no data yet -- claude-usage-scrape task hasn't run "
+                           "(see claude-usage/README.md)", DIM), ""]
+
+    caps = usage.get("caps") or {}
+    age = usage.get("age_secs")
+    stale = age is not None and age > USAGE_STALE_SECS
+
+    def cell(key, tag):
+        c_ = caps.get(key) or {}
+        if not c_.get("visible"):
+            return None
+        pct = c_.get("pct")
+        if pct is None:
+            return None
+        return "%s: %s" % (tag, c(str(pct) + "%", *_pct_color(pct)))
+
+    parts = [p for p in (
+        cell("five_hour", "5h"),
+        cell("weekly_all_models", "Weekly"),
+        cell("weekly_sonnet", "Sonnet"),
+        cell("fable5_max", "Fable5"),
+    ) if p]
+
+    if not parts:
+        return [label + c("cache present but no caps parsed", DIM), ""]
+
+    if age is None:
+        age_txt = "age unknown"
+    else:
+        age_txt = "%dm ago" % (age / 60) if age < 3600 else "%.1fh ago" % (age / 3600)
+    age_style = (BOLD, RED) if stale else (DIM,)
+    suffix = c("  (stale, %s)" % age_txt, *age_style) if stale else c("  (%s)" % age_txt, DIM)
+
+    return [label + "  ".join(parts) + suffix, ""]
 
 
 MODEL_COLORS = {"opus": MAGENTA, "sonnet": BLUE, "fable": CYAN, "haiku": GREEN}
@@ -1676,7 +1875,7 @@ def frame(view=None, sel=None):
         sel = min(sel, len(rows) - 1) if rows else None
     # Infra leads because it is a constant: one quiet line you skim past, which
     # is exactly the weight it deserves until something turns red.
-    lines = render_infra(collect_infra()) + render(workers, sel)
+    lines = render_infra(collect_infra()) + render_usage_caps(collect_usage_caps()) + render(workers, sel)
     if view == "agents":
         live_sids = set(w["session_id"] for w in workers if w.get("session_id"))
         lines.extend(render_subagents(collect_subagents(live_sids)))
@@ -1904,6 +2103,7 @@ def main():
         print(json.dumps({
             "workers": collect_workers(),
             "infra": collect_infra(),
+            "usage_caps": collect_usage_caps(),
             "local_models": collect_local_models(),
             "gateway": collect_gateway(),
         }, indent=2))
