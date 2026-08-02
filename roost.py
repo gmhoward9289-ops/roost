@@ -65,7 +65,7 @@ from pathlib import Path
 # greedy `sed -n 's/^__version__ = "\(.*\)"/\1/p'`, which would swallow a
 # trailing comment into the version string.
 # x-release-please-start-version
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 # x-release-please-end
 
 HOME = Path.home()
