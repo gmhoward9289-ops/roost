@@ -52,6 +52,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -606,6 +607,46 @@ def collect_infra():
     return out
 
 
+# collect_infra blocks on sockets, and a service that is DOWN is the worst
+# case: the connect burns its full timeout (0.35 s measured on Windows, where
+# a filtered localhost port times out instead of refusing). Inside the render
+# loop that stalls every repaint and keypress, so the loop reads a snapshot
+# that a daemon thread keeps fresh instead of probing inline.
+INFRA_REFRESH_SECONDS = 3.0
+_INFRA_LOCK = threading.Lock()
+_INFRA_SNAPSHOT = None
+_INFRA_THREAD = None
+
+
+def _infra_worker():
+    global _INFRA_SNAPSHOT
+    while True:
+        snap = collect_infra()
+        with _INFRA_LOCK:
+            _INFRA_SNAPSHOT = snap
+        time.sleep(INFRA_REFRESH_SECONDS)
+
+
+def infra_cached():
+    """Snapshot view of collect_infra for the render loop.
+
+    The first call probes synchronously so a one-shot frame is never missing
+    the INFRA line, then hands refreshing to a daemon thread. Staleness is
+    bounded by INFRA_REFRESH_SECONDS plus one probe."""
+    global _INFRA_SNAPSHOT, _INFRA_THREAD
+    with _INFRA_LOCK:
+        snap = _INFRA_SNAPSHOT
+    if snap is None:
+        snap = collect_infra()
+        with _INFRA_LOCK:
+            _INFRA_SNAPSHOT = snap
+    if _INFRA_THREAD is None:
+        _INFRA_THREAD = threading.Thread(
+            target=_infra_worker, name="infra-probe", daemon=True)
+        _INFRA_THREAD.start()
+    return snap
+
+
 def _iso_to_epoch(ts):
     """Ollama's expires_at is RFC3339 with an offset, e.g.
     '2026-08-01T15:04:05.123456-07:00'. Any format surprise just drops the
@@ -1044,7 +1085,7 @@ def frame(with_advice=False, with_agents=True, with_models=False, with_help=Fals
         sel = min(sel, len(rows) - 1) if rows else None
     # Infra leads because it is a constant: one quiet line you skim past, which
     # is exactly the weight it deserves until something turns red.
-    lines = render_infra(collect_infra()) + render(workers, sel)
+    lines = render_infra(infra_cached()) + render(workers, sel)
     if with_agents:
         live_sids = set(w["session_id"] for w in workers if w.get("session_id"))
         lines.extend(render_subagents(collect_subagents(live_sids)))
