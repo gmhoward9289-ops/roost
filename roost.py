@@ -1590,26 +1590,28 @@ def main():
                 if not keys.enabled:
                     hint = "Ctrl-C to stop"
                 else:
-                    # The armed/disarmed state is spelled out, not just tinted:
-                    # a lone green "i" reads as decoration, and the one mode
-                    # that can end a process should never be ambiguous.
+                    # One hint for every state. Its text never changes when
+                    # interactive is armed or a cursor is raised -- only the
+                    # colours do -- so the header cannot reflow underfoot
+                    # ("off" is even padded to ARMED's width). The armed state
+                    # is spelled out, not just tinted: a lone green "i" reads
+                    # as decoration, and the one mode that can end a process
+                    # should never be ambiguous. Cursor keys sit dimmed until
+                    # they can do something.
                     if interactive:
                         i_tag = c("i", BOLD, GREEN) + " interactive " + c("ARMED", BOLD, GREEN)
+                        cur_tag = "j/k x y esc"
                     else:
-                        i_tag = c("i", BOLD) + " interactive " + c("off", DIM)
+                        i_tag = c("i", BOLD) + " interactive " + c("off  ", DIM)
+                        cur_tag = c("j/k x y esc", DIM)
                     a_tag = c("a", BOLD, GREEN) if view == "advice" else "a"
                     s_tag = c("s", BOLD, GREEN) if view == "agents" else "s"
                     m_tag = c("m", BOLD, GREEN) if view == "models" else "m"
                     u_tag = c("u", BOLD, GREEN) if view == "usage" else "u"
                     h_tag = c("h", BOLD, GREEN) if view == "help" else "h"
-                    if not interactive:
-                        hint = "space refresh | %s | %s advice | %s agents | %s models | %s usage | %s help | q quit" % (
-                            i_tag, a_tag, s_tag, m_tag, u_tag, h_tag)
-                    elif sel is None:
-                        hint = "j/k select | space refresh | %s | %s advice | %s agents | %s models | %s usage | %s help | q quit" % (
-                            i_tag, a_tag, s_tag, m_tag, u_tag, h_tag)
-                    else:
-                        hint = "j/k move | x stop | y yank id | esc deselect | %s | q quit" % i_tag
+                    hint = ("space refresh | %s | %s | %s advice | %s agents | "
+                            "%s models | %s usage | %s help | q quit") % (
+                        i_tag, cur_tag, a_tag, s_tag, m_tag, u_tag, h_tag)
                 lines, rows, sel = frame(view, sel)
                 # A session can exit while its confirmation is on screen. Matching
                 # on pid rather than on the row dict is what makes that detectable:
