@@ -288,17 +288,31 @@ jobs:
           path: tap
           token: ${{ secrets.TAP_PUSH_TOKEN }}
 
-      - name: Compute the release tarball checksum
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+
+      # Points at the sdist already uploaded to the GitHub Release by the
+      # "Attach to the release" step above, not GitHub's auto-generated
+      # archive/refs/tags/ URL -- that URL isn't a release asset at all, so
+      # GitHub doesn't count `brew install` downloads in the repo's release
+      # download_count the way it does for the .deb/.whl assets.
+      - name: Compute the release asset checksum
         run: |
-          url="https://github.com/${{ github.repository }}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
-          sha256=$(curl -sL "$url" | sha256sum | cut -d' ' -f1)
+          sdist=$(ls dist/*.tar.gz)
+          version="${GITHUB_REF_NAME#v}"
+          url="https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/$(basename "$sdist")"
+          sha256=$(sha256sum "$sdist" | cut -d' ' -f1)
           echo "URL=$url" >> "$GITHUB_ENV"
           echo "SHA256=$sha256" >> "$GITHUB_ENV"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
 
-      - name: Write the formula with this release's url and checksum
+      - name: Write the formula with this release's url, checksum, and version
         run: |
           sed -e "s#^  url \".*\"#  url \"$URL\"#" \
               -e "s#^  sha256 \".*\"#  sha256 \"$SHA256\"#" \
+              -e "s#^  version \".*\"#  version \"$VERSION\"#" \
               src/packaging/roost.rb > tap/Formula/roost.rb
 
       - name: Commit and push
