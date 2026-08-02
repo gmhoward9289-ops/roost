@@ -1,4 +1,4 @@
-"""Tests for roost.
+﻿"""Tests for roost.
 
 Written against stdlib unittest so `python -m unittest` works with nothing
 installed; pytest collects them unchanged in CI.
@@ -32,6 +32,7 @@ def worker(**kw):
         "cwd": "/tmp/demo", "project": "demo", "model": "claude-opus-5",
         "ctx_tokens": 50000, "ctx_pct": 25.0, "window": "200k",
         "idle_secs": 120.0, "age_secs": 600.0, "task": "a task", "task_src": "title",
+        "auto_compact": True,
     }
     base.update(kw)
     return base
@@ -39,24 +40,157 @@ def worker(**kw):
 
 class TestWindowInference(unittest.TestCase):
     """A 1M-window session reads 480k+ cache tokens in one call; scoring that
-    against 200k is what produced a nonsense '242%' reading."""
+    against 200k is what produced a nonsense '242%' reading. Known models now
+    resolve their real window by name instead of guessing from usage -- the bug
+    this fixed: a claude-fable-5 worker at 177k tokens used to read as '200k
+    window, 89%' when the real window is 1M and usage is ~18%."""
 
-    def test_small_usage_picks_200k(self):
-        self.assertEqual(roost.window_for(100000), (200000, "200k"))
+    def test_known_model_resolves_exactly_regardless_of_usage(self):
+        size, label = roost.window_for(177000, "claude-fable-5")
+        self.assertEqual((size, label), (1000000, "1M"))
+        self.assertNotIn("~", label)
 
-    def test_usage_over_200k_escalates_to_1m(self):
-        self.assertEqual(roost.window_for(484030), (1000000, "1M"))
+    def test_haiku_4_5_dated_snapshot_matches_by_prefix(self):
+        self.assertEqual(
+            roost.window_for(1000, "claude-haiku-4-5-20251001"), (200000, "200k"))
 
-    def test_boundary_is_inclusive(self):
-        self.assertEqual(roost.window_for(200000)[1], "200k")
+    def test_unseen_dated_snapshot_still_matches_known_family_prefix(self):
+        self.assertEqual(
+            roost.window_for(1000, "claude-haiku-4-5-99999999"), (200000, "200k"))
 
-    def test_absurd_usage_clamps_to_largest_tier(self):
-        self.assertEqual(roost.window_for(9_000_000)[1], "1M")
+    def test_legacy_dated_model_is_an_exact_match(self):
+        self.assertEqual(
+            roost.window_for(1000, "claude-opus-4-5-20251101"), (200000, "200k"))
+
+    def test_unknown_model_falls_back_to_inference_and_is_marked(self):
+        self.assertEqual(
+            roost.window_for(100000, "claude-nonexistent-9"), (200000, "~200k"))
+
+    def test_no_model_falls_back_to_inference_and_is_marked(self):
+        self.assertEqual(roost.window_for(100000), (200000, "~200k"))
+
+    def test_usage_over_200k_escalates_to_1m_when_inferring(self):
+        self.assertEqual(roost.window_for(484030), (1000000, "~1M"))
+
+    def test_boundary_is_inclusive_when_inferring(self):
+        self.assertEqual(roost.window_for(200000, "unknown-model")[1], "~200k")
+
+    def test_absurd_usage_clamps_to_largest_tier_when_inferring(self):
+        self.assertEqual(roost.window_for(9_000_000)[1], "~1M")
 
     def test_no_percentage_exceeds_100_for_known_tiers(self):
         for tokens in (1, 199_999, 200_000, 200_001, 999_999, 1_000_000):
             size, _ = roost.window_for(tokens)
             self.assertLessEqual(100.0 * tokens / size, 100.0)
+
+    def test_model_window_exact_and_prefix(self):
+        self.assertEqual(roost.model_window("claude-opus-5"), 1000000)
+        self.assertEqual(roost.model_window("claude-haiku-4-5-20251001"), 200000)
+        self.assertIsNone(roost.model_window("claude-not-a-real-model"))
+        self.assertIsNone(roost.model_window(None))
+        self.assertIsNone(roost.model_window(""))
+
+
+class TestAutoCompactResolution(unittest.TestCase):
+    """autoCompactEnabled is never written to a session lock or transcript --
+    roost has to walk the same settings.json hierarchy Claude Code itself
+    merges, or a session with it truly off looks identical to a normal one
+    that just has not hit NEAR LIMIT yet."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cwd = os.path.join(self.tmp, "project")
+        os.makedirs(os.path.join(self.cwd, ".claude"))
+        self.home = os.path.join(self.tmp, "home", ".claude")
+        os.makedirs(self.home)
+        self._home = roost.HOME
+        self._managed = roost.MANAGED_SETTINGS_PATH
+        roost.HOME = Path(self.tmp) / "home"
+        roost.MANAGED_SETTINGS_PATH = Path(self.tmp) / "no-managed-file.json"
+
+    def tearDown(self):
+        roost.HOME = self._home
+        roost.MANAGED_SETTINGS_PATH = self._managed
+
+    def test_defaults_true_with_nothing_on_disk(self):
+        self.assertTrue(roost.auto_compact_enabled(self.cwd))
+
+    def test_user_settings_can_turn_it_off(self):
+        Path(self.home, "settings.json").write_text(
+            json.dumps({"autoCompactEnabled": False}))
+        self.assertFalse(roost.auto_compact_enabled(self.cwd))
+
+    def test_project_settings_overrides_user_settings(self):
+        Path(self.home, "settings.json").write_text(
+            json.dumps({"autoCompactEnabled": False}))
+        Path(self.cwd, ".claude", "settings.json").write_text(
+            json.dumps({"autoCompactEnabled": True}))
+        self.assertTrue(roost.auto_compact_enabled(self.cwd))
+
+    def test_local_settings_overrides_project_settings(self):
+        Path(self.cwd, ".claude", "settings.json").write_text(
+            json.dumps({"autoCompactEnabled": True}))
+        Path(self.cwd, ".claude", "settings.local.json").write_text(
+            json.dumps({"autoCompactEnabled": False}))
+        self.assertFalse(roost.auto_compact_enabled(self.cwd))
+
+    def test_managed_settings_wins_over_everything(self):
+        managed = Path(self.tmp) / "managed-settings.json"
+        managed.write_text(json.dumps({"autoCompactEnabled": True}))
+        roost.MANAGED_SETTINGS_PATH = managed
+        Path(self.cwd, ".claude", "settings.local.json").write_text(
+            json.dumps({"autoCompactEnabled": False}))
+        self.assertTrue(roost.auto_compact_enabled(self.cwd))
+
+    def test_disable_auto_compact_env_key_is_equivalent(self):
+        Path(self.cwd, ".claude", "settings.json").write_text(
+            json.dumps({"env": {"DISABLE_AUTO_COMPACT": "1"}}))
+        self.assertFalse(roost.auto_compact_enabled(self.cwd))
+
+    def test_a_scope_that_sets_neither_key_falls_through(self):
+        Path(self.cwd, ".claude", "settings.local.json").write_text(json.dumps({"other": 1}))
+        Path(self.cwd, ".claude", "settings.json").write_text(
+            json.dumps({"autoCompactEnabled": False}))
+        self.assertFalse(roost.auto_compact_enabled(self.cwd))
+
+    def test_malformed_json_is_skipped_not_fatal(self):
+        Path(self.cwd, ".claude", "settings.local.json").write_text("{not json")
+        Path(self.cwd, ".claude", "settings.json").write_text(
+            json.dumps({"autoCompactEnabled": False}))
+        self.assertFalse(roost.auto_compact_enabled(self.cwd))
+
+    def test_no_cwd_defaults_true(self):
+        self.assertTrue(roost.auto_compact_enabled(""))
+        self.assertTrue(roost.auto_compact_enabled(None))
+
+
+class TestAutoCompactDisplay(unittest.TestCase):
+    def setUp(self):
+        self._color = roost.COLOR
+        roost.COLOR = False
+
+    def tearDown(self):
+        roost.COLOR = self._color
+
+    def test_tag_appears_only_when_auto_compact_is_off(self):
+        # idle_secs under a minute keeps the row in WORKING NOW rather than
+        # collapsing into the QUIET summary line, where task text (and so the
+        # tag) would not be shown at all.
+        on = worker(name="a", pid=1, idle_secs=5, auto_compact=True)
+        off = worker(name="b", pid=2, idle_secs=5, auto_compact=False)
+        self.assertNotIn("no-compact", "\n".join(roost.render([on])))
+        self.assertIn("no-compact", "\n".join(roost.render([off])))
+
+    def test_advice_warns_there_is_no_safety_net_when_auto_compact_is_off(self):
+        out = "\n".join(roost.advise([worker(
+            ctx_tokens=400000, ctx_pct=85.0, idle_secs=10, auto_compact=False)]))
+        self.assertIn("NEAR LIMIT", out)
+        self.assertIn("auto-compact off", out)
+
+    def test_advice_keeps_the_normal_wording_when_auto_compact_is_on(self):
+        out = "\n".join(roost.advise([worker(
+            ctx_tokens=400000, ctx_pct=85.0, idle_secs=10, auto_compact=True)]))
+        self.assertIn("auto-compacts mid-task", out)
 
 
 class TestDuration(unittest.TestCase):
@@ -258,6 +392,132 @@ class TestSubagentDiscovery(unittest.TestCase):
         rows = roost.collect_subagents(set())
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["state"], "orphan")
+
+
+class TestSubagentTypeAndCtx(unittest.TestCase):
+    """The AGENT column shows the harvested type, and CTX shows tokens/window."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.parent_sid = "parent-sid-2"
+        d = Path(self.tmp) / "slug" / self.parent_sid / "subagents"
+        d.mkdir(parents=True)
+        with open(str(d / "agent-def456.jsonl"), "w") as fh:
+            fh.write(json.dumps({
+                "type": "user", "isSidechain": True, "agentId": "def456",
+                "message": {"role": "user", "content": "Scout"},
+            }) + "\n")
+            fh.write(json.dumps({
+                "type": "assistant",
+                "message": {"model": "claude-opus-5", "usage": {
+                    "input_tokens": 1, "cache_read_input_tokens": 48000,
+                    "cache_creation_input_tokens": 0}},
+            }) + "\n")
+        # Parent transcript: an early result with no type (async launch), then
+        # the completed one that carries it. First-write-wins would keep "".
+        with open(str(Path(self.tmp) / "slug" / (self.parent_sid + ".jsonl")), "w") as fh:
+            fh.write(json.dumps({"toolUseResult": {
+                "agentId": "def456", "status": "queued"}}) + "\n")
+            fh.write(json.dumps({"toolUseResult": {
+                "agentId": "def456", "status": "completed",
+                "agentType": "Explore", "description": "Scout the loaders",
+                "resolvedModel": "claude-opus-5"}}) + "\n")
+        self._orig = roost.PROJECTS_DIR
+        roost.PROJECTS_DIR = Path(self.tmp)
+        roost._SCAN_CACHE.clear()
+        roost._AGENT_META.clear()
+        roost._AGENT_LABEL.clear()
+        roost._HARVEST_POS.clear()
+        roost.COLOR = False
+
+    def tearDown(self):
+        roost.PROJECTS_DIR = self._orig
+
+    def test_later_result_fills_the_type_the_early_record_lacked(self):
+        rows = roost.collect_subagents({self.parent_sid})
+        self.assertEqual(rows[0]["agent_type"], "Explore")
+
+    def test_agent_column_reads_type_slash_short_id(self):
+        out = "\n".join(roost.render_subagents(
+            roost.collect_subagents({self.parent_sid})))
+        self.assertIn("Explore/def45", out)
+
+    def test_ctx_column_reads_tokens_over_window(self):
+        # claude-opus-5 is a known model (MODEL_WINDOWS) -- its real window is
+        # 1M, not the old 200k usage-inferred tier.
+        out = "\n".join(roost.render_subagents(
+            roost.collect_subagents({self.parent_sid})))
+        self.assertIn("48k/1M", out)
+
+    def test_running_agent_without_a_type_keeps_the_hex_id(self):
+        roost._AGENT_META.clear()
+        os.remove(str(Path(self.tmp) / "slug" / (self.parent_sid + ".jsonl")))
+        roost._HARVEST_POS.clear()
+        rows = roost.collect_subagents({self.parent_sid})
+        out = "\n".join(roost.render_subagents(rows))
+        self.assertEqual(rows[0]["agent_type"], "")
+        self.assertIn("def456", out)
+
+
+class TestSpark(unittest.TestCase):
+    """FLOW is shape, not volume: normalised to the buffer's own max."""
+
+    def test_empty_history_is_blank(self):
+        self.assertEqual(roost.spark([]), " " * roost.SPARK_LEN)
+
+    def test_zero_flow_samples_show_as_dots(self):
+        out = roost.spark([0, 0, 0])
+        self.assertEqual(out, ("..." ).rjust(roost.SPARK_LEN))
+
+    def test_the_busiest_sample_gets_the_hottest_glyph(self):
+        out = roost.spark([1, 50, 100]).strip()
+        self.assertEqual(out[-1], roost.SPARK_RAMP[-1])
+        self.assertNotEqual(out[0], roost.SPARK_RAMP[-1])
+
+    def test_stays_ascii(self):
+        """Block-drawing characters mojibake in the Windows console; the ramp
+        must never drift back to them."""
+        for ch in roost.spark([0, 1, 2, 3, 1000]):
+            self.assertLess(ord(ch), 127)
+
+
+class TestUsage(unittest.TestCase):
+    def setUp(self):
+        roost.COLOR = False
+
+    def test_parse_budget(self):
+        self.assertEqual(roost.parse_budget("60M"), 60000000)
+        self.assertEqual(roost.parse_budget("850k"), 850000)
+        self.assertEqual(roost.parse_budget("1234"), 1234)
+        self.assertIsNone(roost.parse_budget(None))
+        self.assertIsNone(roost.parse_budget("a lot"))
+
+    def test_local_models_are_flagged_and_kept_out_of_the_budget_math(self):
+        days = {"2026-08-02": {"claude-opus-5": 1000000, "gemma4-32k": 5000000}}
+        os.environ[roost.USAGE_BUDGET_ENV] = "10M"
+        try:
+            out = "\n".join(roost.render_usage(days))
+        finally:
+            del os.environ[roost.USAGE_BUDGET_ENV]
+        self.assertIn("gemma4-32k (local)", out)
+        self.assertIn("(10%)", out)  # 1M cloud of 10M -- not 60% with gemma in
+
+    def test_tally_ignores_cache_reads(self):
+        counts = {}
+        roost._tally_lines([json.dumps({
+            "type": "assistant", "timestamp": "2026-08-02T10:00:00.000Z",
+            "message": {"role": "assistant", "model": "claude-opus-5",
+                        "usage": {"input_tokens": 10, "output_tokens": 5,
+                                  "cache_read_input_tokens": 900000}},
+        })], counts)
+        self.assertEqual(counts[("2026-08-02", "claude-opus-5")], 15)
+
+    def test_without_a_budget_the_panel_still_tallies(self):
+        out = "\n".join(roost.render_usage(
+            {"2026-08-02": {"claude-opus-5": 500}}))
+        self.assertIn("cloud", out)
+        self.assertNotIn("budget (", out)
+        self.assertIn(roost.USAGE_BUDGET_ENV, out)
 
 
 class TestCursor(unittest.TestCase):
@@ -672,7 +932,7 @@ class TestRenderHelp(unittest.TestCase):
 
     def test_is_reachable_through_frame(self):
         """The 'h' toggle wires through frame() the same way a/s/m do."""
-        lines, _, _ = roost.frame(with_help=True)
+        lines, _, _ = roost.frame(view="help")
         self.assertIn(roost.c("HELP", roost.BOLD), lines)
 
 
@@ -721,6 +981,95 @@ class TestAdviceNamesTheTask(unittest.TestCase):
         out = "\n".join(roost.advise([worker(ctx_tokens=20000, ctx_pct=10.0,
                                              idle_secs=60)]))
         self.assertIn("nothing to act on", out)
+
+class TestUsageCacheEviction(unittest.TestCase):
+    """A deleted transcript's cache entry lived forever and its tokens were
+    still summed into the USAGE panel -- wrong numbers plus a slow leak."""
+
+    def setUp(self):
+        roost._USAGE_CACHE.clear()
+
+    def tearDown(self):
+        roost._USAGE_CACHE.clear()
+
+    def test_deleted_transcript_is_evicted_and_uncounted(self):
+        roost._USAGE_CACHE["gone.jsonl"] = {
+            "mtime": time.time(), "size": 10,
+            "counts": {("2026-08-01", "claude-opus-5"): 1234}}
+        days = roost.collect_usage()
+        self.assertNotIn("gone.jsonl", roost._USAGE_CACHE)
+        for byday in days.values():
+            self.assertNotIn(1234, byday.values())
+
+
+class TestCachePruning(unittest.TestCase):
+    """The scan/agent caches grew for as long as the dashboard stayed open --
+    days -- because nothing ever removed sessions and agents that had exited."""
+
+    def setUp(self):
+        for d in (roost._SCAN_CACHE, roost._AGENT_META, roost._AGENT_LABEL):
+            d.clear()
+        roost._SEEN_PATHS.clear()
+        roost._SEEN_AGENTS.clear()
+
+    def test_unseen_entries_are_evicted(self):
+        roost._SCAN_CACHE["dead.jsonl"] = (1.0, {})
+        roost._AGENT_META["dead-agent"] = {"description": "x"}
+        roost._AGENT_LABEL["dead-agent"] = "x"
+        roost.prune_caches()
+        self.assertEqual(roost._SCAN_CACHE, {})
+        self.assertEqual(roost._AGENT_META, {})
+        self.assertEqual(roost._AGENT_LABEL, {})
+
+    def test_seen_entries_survive(self):
+        roost._SCAN_CACHE["live.jsonl"] = (1.0, {})
+        roost._AGENT_META["live-agent"] = {"description": "x"}
+        roost._SEEN_PATHS.add("live.jsonl")
+        roost._SEEN_AGENTS.add("live-agent")
+        roost.prune_caches()
+        self.assertIn("live.jsonl", roost._SCAN_CACHE)
+        self.assertIn("live-agent", roost._AGENT_META)
+
+    def test_seen_sets_reset_after_prune(self):
+        roost._SEEN_PATHS.add("live.jsonl")
+        roost.prune_caches()
+        self.assertEqual(roost._SEEN_PATHS, set())
+        self.assertEqual(roost._SEEN_AGENTS, set())
+
+    def test_scan_transcript_registers_its_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "s.jsonl")
+            with open(p, "w") as fh:
+                fh.write("\n")
+            roost.scan_transcript(p)
+            self.assertIn(p, roost._SEEN_PATHS)
+
+
+class TestTerminalTeardown(unittest.TestCase):
+    """After exit the shell prompt must come back exactly as it was: console
+    mode restored on Windows, no stale input delivered on POSIX."""
+
+    def test_restore_vt_is_safe_when_nothing_was_changed(self):
+        old = roost._VT_ORIGINAL
+        roost._VT_ORIGINAL = None
+        try:
+            roost.restore_vt()  # must not raise
+        finally:
+            roost._VT_ORIGINAL = old
+
+    def test_posix_restore_flushes_pending_input(self):
+        # TCSADRAIN handed queued arrow-sequence tails to the shell after exit;
+        # the restore must discard them instead.
+        src = (ROOT / "roost.py").read_text(encoding="utf-8")
+        self.assertIn("termios.TCSAFLUSH", src)
+        self.assertNotIn("termios.TCSADRAIN,", src)
+
+    def test_key_reader_never_reads_buffered_stdin(self):
+        # sys.stdin.read buffers past what select() sees; keys then leak to the
+        # shell prompt after exit. Only raw os.read on the fd is allowed.
+        src = (ROOT / "roost.py").read_text(encoding="utf-8")
+        self.assertNotIn("sys.stdin.read(", src)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
