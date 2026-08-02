@@ -260,6 +260,130 @@ class TestSubagentDiscovery(unittest.TestCase):
         self.assertEqual(rows[0]["state"], "orphan")
 
 
+class TestSubagentTypeAndCtx(unittest.TestCase):
+    """The AGENT column shows the harvested type, and CTX shows tokens/window."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.parent_sid = "parent-sid-2"
+        d = Path(self.tmp) / "slug" / self.parent_sid / "subagents"
+        d.mkdir(parents=True)
+        with open(str(d / "agent-def456.jsonl"), "w") as fh:
+            fh.write(json.dumps({
+                "type": "user", "isSidechain": True, "agentId": "def456",
+                "message": {"role": "user", "content": "Scout"},
+            }) + "\n")
+            fh.write(json.dumps({
+                "type": "assistant",
+                "message": {"model": "claude-opus-5", "usage": {
+                    "input_tokens": 1, "cache_read_input_tokens": 48000,
+                    "cache_creation_input_tokens": 0}},
+            }) + "\n")
+        # Parent transcript: an early result with no type (async launch), then
+        # the completed one that carries it. First-write-wins would keep "".
+        with open(str(Path(self.tmp) / "slug" / (self.parent_sid + ".jsonl")), "w") as fh:
+            fh.write(json.dumps({"toolUseResult": {
+                "agentId": "def456", "status": "queued"}}) + "\n")
+            fh.write(json.dumps({"toolUseResult": {
+                "agentId": "def456", "status": "completed",
+                "agentType": "Explore", "description": "Scout the loaders",
+                "resolvedModel": "claude-opus-5"}}) + "\n")
+        self._orig = roost.PROJECTS_DIR
+        roost.PROJECTS_DIR = Path(self.tmp)
+        roost._SCAN_CACHE.clear()
+        roost._AGENT_META.clear()
+        roost._AGENT_LABEL.clear()
+        roost._HARVEST_POS.clear()
+        roost.COLOR = False
+
+    def tearDown(self):
+        roost.PROJECTS_DIR = self._orig
+
+    def test_later_result_fills_the_type_the_early_record_lacked(self):
+        rows = roost.collect_subagents({self.parent_sid})
+        self.assertEqual(rows[0]["agent_type"], "Explore")
+
+    def test_agent_column_reads_type_slash_short_id(self):
+        out = "\n".join(roost.render_subagents(
+            roost.collect_subagents({self.parent_sid})))
+        self.assertIn("Explore/def45", out)
+
+    def test_ctx_column_reads_tokens_over_window(self):
+        out = "\n".join(roost.render_subagents(
+            roost.collect_subagents({self.parent_sid})))
+        self.assertIn("48k/200k", out)
+
+    def test_running_agent_without_a_type_keeps_the_hex_id(self):
+        roost._AGENT_META.clear()
+        os.remove(str(Path(self.tmp) / "slug" / (self.parent_sid + ".jsonl")))
+        roost._HARVEST_POS.clear()
+        rows = roost.collect_subagents({self.parent_sid})
+        out = "\n".join(roost.render_subagents(rows))
+        self.assertEqual(rows[0]["agent_type"], "")
+        self.assertIn("def456", out)
+
+
+class TestSpark(unittest.TestCase):
+    """FLOW is shape, not volume: normalised to the buffer's own max."""
+
+    def test_empty_history_is_blank(self):
+        self.assertEqual(roost.spark([]), " " * roost.SPARK_LEN)
+
+    def test_zero_flow_samples_show_as_dots(self):
+        out = roost.spark([0, 0, 0])
+        self.assertEqual(out, ("..." ).rjust(roost.SPARK_LEN))
+
+    def test_the_busiest_sample_gets_the_hottest_glyph(self):
+        out = roost.spark([1, 50, 100]).strip()
+        self.assertEqual(out[-1], roost.SPARK_RAMP[-1])
+        self.assertNotEqual(out[0], roost.SPARK_RAMP[-1])
+
+    def test_stays_ascii(self):
+        """Block-drawing characters mojibake in the Windows console; the ramp
+        must never drift back to them."""
+        for ch in roost.spark([0, 1, 2, 3, 1000]):
+            self.assertLess(ord(ch), 127)
+
+
+class TestUsage(unittest.TestCase):
+    def setUp(self):
+        roost.COLOR = False
+
+    def test_parse_budget(self):
+        self.assertEqual(roost.parse_budget("60M"), 60000000)
+        self.assertEqual(roost.parse_budget("850k"), 850000)
+        self.assertEqual(roost.parse_budget("1234"), 1234)
+        self.assertIsNone(roost.parse_budget(None))
+        self.assertIsNone(roost.parse_budget("a lot"))
+
+    def test_local_models_are_flagged_and_kept_out_of_the_budget_math(self):
+        days = {"2026-08-02": {"claude-opus-5": 1000000, "gemma4-32k": 5000000}}
+        os.environ[roost.USAGE_BUDGET_ENV] = "10M"
+        try:
+            out = "\n".join(roost.render_usage(days))
+        finally:
+            del os.environ[roost.USAGE_BUDGET_ENV]
+        self.assertIn("gemma4-32k (local)", out)
+        self.assertIn("(10%)", out)  # 1M cloud of 10M -- not 60% with gemma in
+
+    def test_tally_ignores_cache_reads(self):
+        counts = {}
+        roost._tally_lines([json.dumps({
+            "type": "assistant", "timestamp": "2026-08-02T10:00:00.000Z",
+            "message": {"role": "assistant", "model": "claude-opus-5",
+                        "usage": {"input_tokens": 10, "output_tokens": 5,
+                                  "cache_read_input_tokens": 900000}},
+        })], counts)
+        self.assertEqual(counts[("2026-08-02", "claude-opus-5")], 15)
+
+    def test_without_a_budget_the_panel_still_tallies(self):
+        out = "\n".join(roost.render_usage(
+            {"2026-08-02": {"claude-opus-5": 500}}))
+        self.assertIn("cloud", out)
+        self.assertNotIn("budget (", out)
+        self.assertIn(roost.USAGE_BUDGET_ENV, out)
+
+
 class TestCursor(unittest.TestCase):
     """The cursor addresses a row that x will stop. Anything that lets the screen
     and the index disagree is a wrong-session kill, so the invariants are here."""
@@ -672,7 +796,7 @@ class TestRenderHelp(unittest.TestCase):
 
     def test_is_reachable_through_frame(self):
         """The 'h' toggle wires through frame() the same way a/s/m do."""
-        lines, _, _ = roost.frame(with_help=True)
+        lines, _, _ = roost.frame(view="help")
         self.assertIn(roost.c("HELP", roost.BOLD), lines)
 
 
@@ -721,6 +845,26 @@ class TestAdviceNamesTheTask(unittest.TestCase):
         out = "\n".join(roost.advise([worker(ctx_tokens=20000, ctx_pct=10.0,
                                              idle_secs=60)]))
         self.assertIn("nothing to act on", out)
+
+class TestUsageCacheEviction(unittest.TestCase):
+    """A deleted transcript's cache entry lived forever and its tokens were
+    still summed into the USAGE panel -- wrong numbers plus a slow leak."""
+
+    def setUp(self):
+        roost._USAGE_CACHE.clear()
+
+    def tearDown(self):
+        roost._USAGE_CACHE.clear()
+
+    def test_deleted_transcript_is_evicted_and_uncounted(self):
+        roost._USAGE_CACHE["gone.jsonl"] = {
+            "mtime": time.time(), "size": 10,
+            "counts": {("2026-08-01", "claude-opus-5"): 1234}}
+        days = roost.collect_usage()
+        self.assertNotIn("gone.jsonl", roost._USAGE_CACHE)
+        for byday in days.values():
+            self.assertNotIn(1234, byday.values())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

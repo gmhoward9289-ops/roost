@@ -53,6 +53,7 @@ import socket
 import subprocess
 import sys
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -84,6 +85,23 @@ AGENT_RECENT_SECS = 3600
 # A subagent counts as working if its transcript was written this recently.
 AGENT_ACTIVE_SECS = 30
 
+# Token-flow sparkline on the WORKER table: sample count kept per session, and
+# the minimum seconds between samples so a keypress-forced repaint does not
+# stuff the history with extra zeros.
+SPARK_LEN = 15
+SPARK_MIN_STEP = 1.0
+# ASCII ramp, dimmest to hottest. Block-drawing characters mojibake in the
+# Windows console (same reason bar() is ASCII), so the ramp is punctuation.
+# "." is a taken sample with zero flow; a space means no sample yet.
+SPARK_RAMP = ".:-=+*#"
+
+# USAGE panel: how far back the tally reaches, and the weekly budget it is
+# measured against. There is no local source for the real Anthropic meter, so
+# the budget is a number the user sets once after looking at /usage --
+# e.g. ROOST_WEEKLY_BUDGET=60M or 850k or a plain integer of tokens.
+USAGE_DAYS = 7
+USAGE_BUDGET_ENV = "ROOST_WEEKLY_BUDGET"
+
 # Every session roost stops gets one JSON line here. Same shape and the same cap
 # as the hook logs next to it, so the same one-liners read all of them.
 LOG_PATH = HOME / ".claude" / "logs" / "roost.jsonl"
@@ -93,15 +111,27 @@ LOG_MAX_LINES = 5000
 # Set in main(); --no-log turns it off.
 LOGGING = True
 
-# agentId -> {description, status, model}, harvested from the parent transcript.
-# Descriptions never change, so this is filled once and never invalidated.
+# agentId -> {description, status, model, type}, harvested from the parent
+# transcript. Merged as records arrive; never invalidated.
 _AGENT_META = {}
 _AGENT_LABEL = {}
+
+# parent transcript path -> bytes already harvested for agent meta.
+_HARVEST_POS = {}
 
 # path -> (mtime, parsed result). At a 1s refresh, re-reading 256 KB from every
 # transcript each tick is megabytes of disk per second for no new information --
 # a transcript that has not been written to cannot have a new model or usage.
 _SCAN_CACHE = {}
+
+# sessionId -> {"prev": last ctx_tokens, "t": last sample time, "hist": deque}.
+# In-memory only: the sparkline shows flow since roost started, nothing older.
+_SPARK = {}
+
+# path -> {"mtime", "size", "counts": {(day, model): tokens}}. Incremental: on
+# growth only the appended bytes are read, so the full-file pass happens once
+# per transcript per roost run.
+_USAGE_CACHE = {}
 
 # Nothing in the transcript records which context window a session was opened with,
 # so it is inferred: the smallest standard tier the observed usage still fits in.
@@ -427,13 +457,32 @@ def harvest_agent_meta(parent_transcript):
     """Pull subagent description/status out of the parent's tool results.
 
     A subagent's own transcript never states what it was asked to do in short
-    form -- only the parent's `toolUseResult` carries `description`, `status` and
-    `resolvedModel`, keyed by agentId. Scanning the tail is enough for anything
-    recent, and results are cached permanently since they never change.
+    form -- only the parent's `toolUseResult` carries `description`, `status`,
+    `resolvedModel` and `agentType`, keyed by agentId. Incremental rather than
+    tail-only: a busy parent grows past TAIL_BYTES with its agents' results in
+    the half a tail read never sees. The full pass happens once per parent per
+    roost run; after that only appended bytes are read, so the every-tick call
+    for a still-running agent costs one getsize().
     """
     if not parent_transcript:
         return
-    for line in read_tail(parent_transcript):
+    pos = _HARVEST_POS.get(parent_transcript, 0)
+    try:
+        size = os.path.getsize(parent_transcript)
+        if size < pos:
+            pos = 0  # truncated or replaced -- start over
+        if size == pos:
+            return
+        with open(parent_transcript, "rb") as fh:
+            fh.seek(pos)
+            data = fh.read()
+    except OSError:
+        return
+    # Consume whole lines only; a half-written trailing line waits for the
+    # next pass instead of being parsed as garbage and skipped forever.
+    cut = data.rfind(b"\n") + 1
+    _HARVEST_POS[parent_transcript] = pos + cut
+    for line in data[:cut].decode("utf-8", "replace").splitlines():
         if '"agentId"' not in line:
             continue
         try:
@@ -444,12 +493,18 @@ def harvest_agent_meta(parent_transcript):
         if not isinstance(r, dict):
             continue
         aid = r.get("agentId")
-        if aid and aid not in _AGENT_META:
-            _AGENT_META[aid] = {
-                "description": r.get("description") or "",
-                "status": r.get("status") or "",
-                "model": r.get("resolvedModel") or "",
-            }
+        if not aid:
+            continue
+        # Merge rather than first-write-wins: an async launch writes an early
+        # record with no agentType, and the completed result that carries it
+        # would otherwise be discarded.
+        meta = _AGENT_META.setdefault(
+            aid, {"description": "", "status": "", "model": "", "type": ""})
+        for key, field in (("description", "description"), ("status", "status"),
+                           ("model", "resolvedModel"), ("type", "agentType")):
+            val = r.get(field)
+            if val:
+                meta[key] = val
 
 
 def agent_first_prompt(path, agent_id):
@@ -499,7 +554,9 @@ def collect_subagents(live_sids):
         if not parent_live and (age is None or age > AGENT_RECENT_SECS):
             continue  # finished long ago -- history, not a live worker
 
-        if agent_id not in _AGENT_META:
+        # Re-harvest while the type is still missing: a running agent's early
+        # records carry no agentType; the completed result does.
+        if not (_AGENT_META.get(agent_id) or {}).get("type"):
             harvest_agent_meta(transcript_for(parent_sid))
         meta = _AGENT_META.get(agent_id) or {}
 
@@ -523,6 +580,9 @@ def collect_subagents(live_sids):
 
         rows.append({
             "agent_id": agent_id,
+            # Sanitised like task text: it comes out of a transcript, and a
+            # crafted agentType could otherwise carry escapes into the TUI.
+            "agent_type": ascii_safe(meta.get("type") or ""),
             "parent_sid": parent_sid,
             "task": label,
             "model": model,
@@ -560,6 +620,23 @@ def collect_workers():
         idle = None
         if info["last_write"]:
             idle = now - info["last_write"]
+
+        # Token-flow sample for the FLOW sparkline: growth of the newest turn's
+        # context since the last sample is a cheap throughput proxy. Compaction
+        # shrinks the context -- that is not negative flow, so it clamps to 0.
+        # Throttled so a keypress-forced repaint cannot stuff the history.
+        flow = " " * SPARK_LEN
+        if sid:
+            st = _SPARK.setdefault(
+                sid, {"prev": None, "t": 0.0, "hist": deque(maxlen=SPARK_LEN)})
+            tok = info["ctx_tokens"]
+            if tok is not None and now - st["t"] >= SPARK_MIN_STEP:
+                if st["prev"] is not None:
+                    st["hist"].append(max(0, tok - st["prev"]))
+                st["prev"] = tok
+                st["t"] = now
+            flow = spark(st["hist"])
+
         started = s.get("startedAt")
         age = (now - started / 1000.0) if isinstance(started, (int, float)) else None
         rows.append({
@@ -581,6 +658,7 @@ def collect_workers():
             "task_src": "title" if info["title"] else ("prompt" if info["prompt"] else "-"),
             "idle_secs": idle,
             "age_secs": age,
+            "flow": flow,
         })
     return rows
 
@@ -648,6 +726,160 @@ def collect_local_models():
             "expires_secs": expires_secs,
         })
     return out
+
+
+def parse_budget(s):
+    """'60M', '850k', or a plain token count. None on unset or garbage."""
+    if not s:
+        return None
+    s = s.strip()
+    try:
+        if s and s[-1] in "kK":
+            return int(float(s[:-1]) * 1000)
+        if s and s[-1] in "mM":
+            return int(float(s[:-1]) * 1000000)
+        return int(float(s))
+    except ValueError:
+        return None
+
+
+def _tally_lines(lines, counts):
+    """Accumulate (day, model) -> input+output tokens from assistant turns.
+
+    Cache reads/creation are deliberately excluded: they are billed and
+    rate-limited differently, and counting them would swamp the number with
+    re-reads of unchanged context. What is left is closest to "work done".
+    """
+    for line in lines:
+        if '"usage"' not in line or '"assistant"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        msg = d.get("message") or {}
+        usage = msg.get("usage") or {}
+        if not usage:
+            continue
+        day = str(d.get("timestamp") or "")[:10]
+        if len(day) != 10:
+            continue
+        # Raw model name kept: the "claude-" prefix is what later separates
+        # cloud burn (counts against the plan) from local models (free).
+        # Sanitised: it is transcript text headed for the TUI.
+        model = ascii_safe(msg.get("model") or "?") or "?"
+        tok = (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
+        key = (day, model)
+        counts[key] = counts.get(key, 0) + tok
+
+
+def collect_usage():
+    """Observed tokens per day per model over the last USAGE_DAYS.
+
+    Incremental: each transcript is read in full exactly once per roost run
+    (only files touched inside the window), then only appended bytes after
+    that. Only called while the USAGE panel is open, so the one full pass
+    happens on the first `u`, not at launch.
+    """
+    cutoff = time.time() - USAGE_DAYS * 86400
+    paths = set(glob.glob(str(PROJECTS_DIR / "*" / "*.jsonl")))
+    paths.update(glob.glob(
+        str(PROJECTS_DIR / "*" / "*" / "subagents" / "agent-*.jsonl")))
+
+    # A deleted transcript never reappears in the glob, so its entry would sit
+    # in the cache forever -- still counted into the panel, and a slow leak.
+    for path in [p for p in _USAGE_CACHE if p not in paths]:
+        del _USAGE_CACHE[path]
+
+    for path in paths:
+        try:
+            mtime = os.path.getmtime(path)
+            size = os.path.getsize(path)
+        except OSError:
+            _USAGE_CACHE.pop(path, None)  # deleted between glob and stat
+            continue
+        if mtime < cutoff:
+            _USAGE_CACHE.pop(path, None)
+            continue
+        st = _USAGE_CACHE.get(path)
+        if st and st["size"] == size and st["mtime"] == mtime:
+            continue
+        if st and size >= st["size"]:
+            pos, counts = st["size"], st["counts"]
+        else:
+            pos, counts = 0, {}  # new file, or it shrank -- start over
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(pos)
+                data = fh.read()
+        except OSError:
+            continue
+        # Consume only whole lines; a half-written trailing line is left for
+        # the next pass rather than being parsed as garbage and lost.
+        cut = data.rfind(b"\n") + 1
+        _tally_lines(data[:cut].decode("utf-8", "replace").splitlines(), counts)
+        _USAGE_CACHE[path] = {"mtime": mtime, "size": pos + cut, "counts": counts}
+
+    days = {}
+    for st in _USAGE_CACHE.values():
+        for (day, model), tok in st["counts"].items():
+            byday = days.setdefault(day, {})
+            byday[model] = byday.get(model, 0) + tok
+    return days
+
+
+def render_usage(days):
+    lines = ["", c("USAGE", BOLD) + "  "
+             + c("observed transcript tokens (input+output) -- an estimate, "
+                 "not the Anthropic meter", DIM)]
+    # Day keys come from transcript timestamps, which are UTC -- so the day
+    # boundary is UTC too. Keep only the window and newest first.
+    recent = sorted(days, reverse=True)[:USAGE_DAYS]
+    if not recent:
+        lines.append(c("  nothing recorded in the last %d days" % USAGE_DAYS, DIM))
+        return lines
+
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    rows = []
+    for day in recent:
+        by_model = days[day]
+        # Cloud burn is what counts against the plan; local Ollama models cost
+        # nothing, so they show in the breakdown but not the budget math.
+        cloud = sum(t for m, t in by_model.items() if m.startswith("claude-"))
+        top = sorted(by_model.items(), key=lambda kv: -kv[1])
+        detail = ", ".join(
+            "%s %s" % (m.replace("claude-", "") if m.startswith("claude-")
+                       else m + " (local)", compact(t))
+            for m, t in top[:3])
+        if len(top) > 3:
+            detail += ", +%d more" % (len(top) - 3)
+        rows.append((day, cloud, detail))
+
+    wid = max(len(compact(t)) for _, t, _ in rows)
+    for day, cloud, detail in rows:
+        mark = c(" <- today", GREEN) if day == today else ""
+        lines.append("  %s  %s  %s%s" % (
+            c(day, BOLD if day == today else DIM),
+            compact(cloud).rjust(wid), c(detail, DIM), mark))
+
+    week_total = sum(t for _, t, _ in rows)
+    today_cloud = sum(t for m, t in days.get(today, {}).items()
+                      if m.startswith("claude-"))
+    summary = "today %s  |  %dd %s cloud" % (
+        compact(today_cloud), len(rows), compact(week_total))
+    budget = parse_budget(os.environ.get(USAGE_BUDGET_ENV))
+    lines.append("")
+    if budget:
+        pct = 100.0 * week_total / float(budget)
+        code = (BOLD, RED) if pct >= 80 else ((YELLOW,) if pct >= 50 else (GREEN,))
+        lines.append("  " + c(summary, BOLD) + "  "
+                     + c("/ %s budget (%.0f%%)" % (compact(budget), pct), *code))
+    else:
+        lines.append("  " + c(summary, BOLD))
+        lines.append("  " + c("set %s (e.g. 60M) to measure against your plan -- "
+                              "calibrate the number from /usage once" % USAGE_BUDGET_ENV,
+                              DIM))
+    return lines
 
 
 # ---- advisory thresholds ----------------------------------------------------
@@ -745,6 +977,26 @@ def compact(n):
     return str(n)
 
 
+def spark(hist):
+    """ASCII sparkline of recent token flow, newest sample at the right.
+
+    Normalised to the buffer's own max, so it shows the *shape* of activity --
+    bursts and quiet stretches -- not absolute volume. Left-padded: history
+    grows in from the right as samples arrive.
+    """
+    if not hist:
+        return " " * SPARK_LEN
+    mx = max(hist)
+    out = []
+    for v in hist:
+        if v <= 0 or mx <= 0:
+            out.append(SPARK_RAMP[0])
+        else:
+            idx = 1 + int((v / float(mx)) * (len(SPARK_RAMP) - 2))
+            out.append(SPARK_RAMP[min(idx, len(SPARK_RAMP) - 1)])
+    return "".join(out).rjust(SPARK_LEN)
+
+
 BAR_WIDTH = 12
 
 
@@ -820,6 +1072,7 @@ def render(workers, sel=None):
         ("CONTEXT", lambda r: bar(r["ctx_pct"])),
         ("CTX", lambda r: "-" if r["ctx_pct"] is None else "%.0f%%" % r["ctx_pct"]),
         ("TOKENS", lambda r: "-" if not r["ctx_tokens"] else compact(r["ctx_tokens"])),
+        ("FLOW", lambda r: r.get("flow") or " " * SPARK_LEN),
         ("IDLE", lambda r: dur(r["idle_secs"])),
     ]
 
@@ -911,6 +1164,8 @@ def style_cell(header, text, row):
         return text
     if header == "NAME":
         return c(text, BOLD)
+    if header == "FLOW":
+        return c(text, CYAN)
     if header in ("TOKENS", "WIN", "PID"):
         return c(text, DIM)
     return text
@@ -926,9 +1181,17 @@ def render_subagents(agents):
 
     cols = [
         ("STATE", lambda r: r["state"]),
-        ("AGENT", lambda r: r["agent_id"][:10]),
+        # The agent type is the readable name, but the parent only records it in
+        # the tool result -- a still-running agent has no type yet, so the hex id
+        # is kept as a suffix (and the whole label while running) to stay unique.
+        ("AGENT", lambda r: ("%s/%s" % (r["agent_type"], r["agent_id"][:5]))
+            if r["agent_type"] else r["agent_id"][:10]),
         ("MODEL", lambda r: (r["model"] or "-").replace("claude-", "")),
-        ("CTX", lambda r: "-" if r["ctx_pct"] is None else "%.0f%%" % r["ctx_pct"]),
+        # Absolute over window, not a bare percentage: 48k/200k says both how
+        # much is loaded and how much room is left. The window label is inferred
+        # (see WINDOW_TIERS); colour still follows ctx_pct.
+        ("CTX", lambda r: "-" if not r["ctx_tokens"]
+            else "%s/%s" % (compact(r["ctx_tokens"]), r["window"])),
         ("IDLE", lambda r: dur(r["idle_secs"])),
         ("TASK", lambda r: r["task"]),
     ]
@@ -1002,16 +1265,25 @@ HELP_SCREENS = (
      "ollama / litellm / openwebui: up or down, plus what's resident in Ollama's VRAM right now."),
     ("WORKERS", None,
      "every live Claude Code session: model, context window used, idle time, current task. "
-     "QUIET collapses idle sessions to one line; raise the cursor to expand it."),
+     "FLOW is a sparkline of recent token throughput -- '.' is a quiet sample, the ramp is "
+     "activity; history starts when roost starts. QUIET collapses idle sessions to one line; "
+     "raise the cursor to expand it."),
     ("SUBAGENTS", "s",
      "work a session farmed out. Invisible in any pid-based view, since a subagent shares its "
-     "parent's process rather than running as one of its own."),
+     "parent's process rather than running as one of its own. AGENT shows the agent's type once "
+     "it finishes (hex id while running); CTX is tokens over the inferred window."),
     ("ADVICE", "a",
      "concrete actions, ranked by how many tokens each would save -- which sessions are "
      "expensive to resume, near their context limit, or just idle clutter."),
     ("LOCAL MODELS", "m",
      "everything Ollama has installed, not just what's resident in VRAM -- disk size, "
      "residency, and time until an idle model unloads."),
+    ("USAGE", "u",
+     "tokens per day per model over the last week, tallied from the transcripts on disk. "
+     "An estimate of burn, not the real Anthropic meter; set ROOST_WEEKLY_BUDGET to see "
+     "it as a share of your plan. Local (non claude-*) models are flagged and excluded "
+     "from the budget math. First open scans a week of transcripts and can pause for a "
+     "moment; after that it reads only what was appended."),
 )
 
 
@@ -1029,8 +1301,9 @@ def render_help():
     return lines
 
 
-def frame(with_advice=False, with_agents=True, with_models=False, with_help=False, sel=None):
-    """Returns (lines, rows, sel).
+def frame(view=None, sel=None):
+    """Returns (lines, rows, sel). `view` is the open panel: "agents",
+    "models", "advice", "usage", "help", or None for the bare worker table.
 
     `rows` is what the cursor indexes, handed back so the key handler acts on the
     frame the user was actually looking at. `sel` comes back clamped: sessions
@@ -1045,14 +1318,16 @@ def frame(with_advice=False, with_agents=True, with_models=False, with_help=Fals
     # Infra leads because it is a constant: one quiet line you skim past, which
     # is exactly the weight it deserves until something turns red.
     lines = render_infra(collect_infra()) + render(workers, sel)
-    if with_agents:
+    if view == "agents":
         live_sids = set(w["session_id"] for w in workers if w.get("session_id"))
         lines.extend(render_subagents(collect_subagents(live_sids)))
-    if with_models:
+    elif view == "models":
         lines.extend(render_models(collect_local_models()))
-    if with_help:
+    elif view == "usage":
+        lines.extend(render_usage(collect_usage()))
+    elif view == "help":
         lines.extend(render_help())
-    if with_advice:
+    elif view == "advice":
         lines.append("")
         lines.extend(advise(workers))
     return lines, rows, sel
@@ -1235,6 +1510,10 @@ def main():
                     help="start with the SUBAGENTS panel closed (toggle live with 's')")
     ap.add_argument("--models", action="store_true",
                     help="start with the LOCAL MODELS panel open (toggle live with 'm')")
+    ap.add_argument("--usage", action="store_true",
+                    help="start with the USAGE panel open (toggle live with 'u'); "
+                         "set %s (e.g. 60M) to show weekly burn against a budget"
+                         % USAGE_BUDGET_ENV)
     ap.add_argument("--interactive", action="store_true",
                     help="start with interactive mode armed -- cursor, x/y, and the "
                          "EXPERIMENTAL tag (default off; toggle live with 'i')")
@@ -1242,7 +1521,8 @@ def main():
                     help="do not record stopped sessions to %s" % LOG_PATH)
     ap.epilog = (
         "keys while running:  space = refresh now   a = advice panel   "
-        "s = subagents panel   m = local models panel   h or ? = what am I looking at   "
+        "s = subagents panel   m = local models panel   u = usage panel   "
+        "h or ? = what am I looking at   "
         "i = arm interactive mode   q = quit\n"
         "interactive mode (armed with i):  j/k or arrows move a cursor   "
         "x = stop the session (confirms)   y = copy its sessionId   esc = deselect")
@@ -1281,6 +1561,8 @@ def main():
         view = "advice"
     elif args.models:
         view = "models"
+    elif args.usage:
+        view = "usage"
     elif args.no_agents:
         view = None
     else:
@@ -1289,8 +1571,7 @@ def main():
     # Live is the default, as with top/htop -- `-h` is argparse's help and exits,
     # so keys have nothing to act on there. A single frame is opt-in.
     if args.once:
-        print("\n".join(frame(view == "advice", view == "agents", view == "models",
-                               view == "help")[0]))
+        print("\n".join(frame(view)[0]))
         return
     interval = args.watch if args.watch else REFRESH_SECONDS
 
@@ -1309,21 +1590,29 @@ def main():
                 if not keys.enabled:
                     hint = "Ctrl-C to stop"
                 else:
-                    i_tag = c("i", BOLD, GREEN) if interactive else "i"
+                    # One hint for every state. Its text never changes when
+                    # interactive is armed or a cursor is raised -- only the
+                    # colours do -- so the header cannot reflow underfoot
+                    # ("off" is even padded to ARMED's width). The armed state
+                    # is spelled out, not just tinted: a lone green "i" reads
+                    # as decoration, and the one mode that can end a process
+                    # should never be ambiguous. Cursor keys sit dimmed until
+                    # they can do something.
+                    if interactive:
+                        i_tag = c("i", BOLD, GREEN) + " interactive " + c("ARMED", BOLD, GREEN)
+                        cur_tag = "j/k x y esc"
+                    else:
+                        i_tag = c("i", BOLD) + " interactive " + c("off  ", DIM)
+                        cur_tag = c("j/k x y esc", DIM)
                     a_tag = c("a", BOLD, GREEN) if view == "advice" else "a"
                     s_tag = c("s", BOLD, GREEN) if view == "agents" else "s"
                     m_tag = c("m", BOLD, GREEN) if view == "models" else "m"
+                    u_tag = c("u", BOLD, GREEN) if view == "usage" else "u"
                     h_tag = c("h", BOLD, GREEN) if view == "help" else "h"
-                    if not interactive:
-                        hint = "space refresh | %s interactive | %s advice | %s agents | %s models | %s help | q quit" % (
-                            i_tag, a_tag, s_tag, m_tag, h_tag)
-                    elif sel is None:
-                        hint = "j/k select | space refresh | %s interactive | %s advice | %s agents | %s models | %s help | q quit" % (
-                            i_tag, a_tag, s_tag, m_tag, h_tag)
-                    else:
-                        hint = "j/k move | x stop | y yank id | esc deselect | %s interactive | q quit" % i_tag
-                lines, rows, sel = frame(view == "advice", view == "agents", view == "models",
-                                          view == "help", sel)
+                    hint = ("space refresh | %s | %s | %s advice | %s agents | "
+                            "%s models | %s usage | %s help | q quit") % (
+                        i_tag, cur_tag, a_tag, s_tag, m_tag, u_tag, h_tag)
+                lines, rows, sel = frame(view, sel)
                 # A session can exit while its confirmation is on screen. Matching
                 # on pid rather than on the row dict is what makes that detectable:
                 # every frame rebuilds the dicts, so identity and equality both
@@ -1399,6 +1688,9 @@ def main():
                         break
                     if key in ("m", "M"):
                         view = None if view == "models" else "models"
+                        break
+                    if key in ("u", "U"):
+                        view = None if view == "usage" else "usage"
                         break
                     if key in ("h", "H", "?"):
                         view = None if view == "help" else "help"
