@@ -53,6 +53,7 @@ import socket
 import re
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from collections import deque
@@ -1998,11 +1999,19 @@ HELP_SCREENS = (
 def render_help():
     """What each screen means, not how to drive it -- the footer hint already
     lists the keys, and roost has few enough screens that this fits on one page."""
+    labels = ["%s (%s)" % (n, k) if k else n for n, k, _ in HELP_SCREENS]
+    lw = max(len(x) for x in labels)
+    # Same gutter shape as the worker table: label beside its text, not above
+    # it. That halves the panel's height, and the text wraps to the window
+    # instead of running off the right edge as one clipped line.
+    body = max(20, shutil.get_terminal_size((150, 40)).columns - lw - 5)
+
     lines = ["", c("HELP", BOLD)]
-    for name, key, text in HELP_SCREENS:
-        label = "%s (%s)" % (name, key) if key else name
-        lines.append("  " + c(label, BOLD))
-        lines.append("      " + c(text, DIM))
+    for label, (_, _, text) in zip(labels, HELP_SCREENS):
+        wrapped = textwrap.wrap(text, body) or [""]
+        for i, part in enumerate(wrapped):
+            gutter = c(label.ljust(lw), BOLD) if i == 0 else " " * lw
+            lines.append("  " + gutter + "  " + c(part, DIM))
     lines.append("")
     lines.append("  " + c("interactive mode (i) arms the cursor: j/k select, x stop, "
                           "y copy sessionId, esc deselect.", DIM))
