@@ -841,6 +841,54 @@ def collect_infra():
     return out
 
 
+# collect_infra blocks on sockets, and a service that is DOWN is the worst
+# case: the connect burns its full timeout (0.35 s measured on Windows, where
+# a filtered localhost port times out instead of refusing). Inside the render
+# loop that stalls every repaint and keypress, so the loop reads a snapshot
+# that a daemon thread keeps fresh instead of probing inline.
+INFRA_REFRESH_SECONDS = 3.0
+_INFRA_LOCK = threading.Lock()
+_INFRA_SNAPSHOT = None
+_INFRA_THREAD = None
+
+
+def _infra_worker():
+    global _INFRA_SNAPSHOT
+    while True:
+        # A raise here would kill the daemon thread silently and freeze the
+        # INFRA line at its last snapshot forever -- stale data with no tell.
+        # Keeping the old snapshot and retrying next cycle is strictly better
+        # than dying quietly; on main the same raise was at least visible.
+        try:
+            snap = collect_infra()
+        except Exception:
+            snap = None
+        if snap is not None:
+            with _INFRA_LOCK:
+                _INFRA_SNAPSHOT = snap
+        time.sleep(INFRA_REFRESH_SECONDS)
+
+
+def infra_cached():
+    """Snapshot view of collect_infra for the render loop.
+
+    The first call probes synchronously so a one-shot frame is never missing
+    the INFRA line, then hands refreshing to a daemon thread. Staleness is
+    bounded by INFRA_REFRESH_SECONDS plus one probe."""
+    global _INFRA_SNAPSHOT, _INFRA_THREAD
+    with _INFRA_LOCK:
+        snap = _INFRA_SNAPSHOT
+    if snap is None:
+        snap = collect_infra()
+        with _INFRA_LOCK:
+            _INFRA_SNAPSHOT = snap
+    if _INFRA_THREAD is None:
+        _INFRA_THREAD = threading.Thread(
+            target=_infra_worker, name="infra-probe", daemon=True)
+        _INFRA_THREAD.start()
+    return snap
+
+
 def collect_usage_caps():
     """The real 5-hour/weekly/Fable caps, from the claude-usage-scrape cache.
 
@@ -1891,7 +1939,7 @@ def frame(view=None, sel=None):
         sel = min(sel, len(rows) - 1) if rows else None
     # Infra leads because it is a constant: one quiet line you skim past, which
     # is exactly the weight it deserves until something turns red.
-    lines = render_infra(collect_infra()) + render(workers, sel)
+    lines = render_infra(infra_cached()) + render(workers, sel)
     if view == "agents":
         live_sids = set(w["session_id"] for w in workers if w.get("session_id"))
         lines.extend(render_subagents(collect_subagents(live_sids)))

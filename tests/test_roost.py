@@ -1070,6 +1070,69 @@ class TestTerminalTeardown(unittest.TestCase):
         src = (ROOT / "roost.py").read_text(encoding="utf-8")
         self.assertNotIn("sys.stdin.read(", src)
 
+class TestInfraCached(unittest.TestCase):
+    """The render loop must not block on infra sockets. A DOWN service costs
+    the full connect timeout (0.35 s measured on Windows), and that stall
+    shipped: every keypress and repaint lagged by it while OpenWebUI was off.
+    """
+
+    def setUp(self):
+        self._orig = roost.collect_infra
+        roost._INFRA_SNAPSHOT = None
+        roost._INFRA_THREAD = None
+
+    def tearDown(self):
+        roost.collect_infra = self._orig
+        roost._INFRA_SNAPSHOT = None
+        roost._INFRA_THREAD = None
+
+    def test_first_call_probes_synchronously(self):
+        roost.collect_infra = lambda: [{"name": "x", "port": 1, "up": True,
+                                        "detail": ""}]
+        snap = roost.infra_cached()
+        self.assertEqual(snap[0]["name"], "x")
+
+    def test_later_calls_never_probe_inline(self):
+        calls = []
+
+        def slow_probe():
+            calls.append(time.perf_counter())
+            time.sleep(0.35)  # a DOWN service burning its socket timeout
+            return [{"name": "x", "port": 1, "up": False, "detail": "not running"}]
+
+        roost.collect_infra = slow_probe
+        roost.infra_cached()  # seeds and starts the worker
+        t0 = time.perf_counter()
+        for _ in range(5):
+            roost.infra_cached()
+        elapsed = time.perf_counter() - t0
+        self.assertLess(elapsed, 0.1,
+                        "infra_cached blocked the caller after seeding "
+                        "(%.3fs for 5 calls)" % elapsed)
+
+    def test_worker_refreshes_the_snapshot(self):
+        state = {"n": 0}
+
+        def counting_probe():
+            state["n"] += 1
+            return [{"name": "x", "port": 1, "up": True,
+                     "detail": "gen %d" % state["n"]}]
+
+        roost.collect_infra = counting_probe
+        old = roost.INFRA_REFRESH_SECONDS
+        roost.INFRA_REFRESH_SECONDS = 0.05
+        try:
+            first = roost.infra_cached()
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                if roost.infra_cached() != first:
+                    break
+                time.sleep(0.02)
+            self.assertNotEqual(roost.infra_cached(), first,
+                                "background worker never refreshed the snapshot")
+        finally:
+            roost.INFRA_REFRESH_SECONDS = old
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
