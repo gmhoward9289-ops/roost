@@ -1590,20 +1590,26 @@ def main():
                 if not keys.enabled:
                     hint = "Ctrl-C to stop"
                 else:
-                    i_tag = c("i", BOLD, GREEN) if interactive else "i"
+                    # The armed/disarmed state is spelled out, not just tinted:
+                    # a lone green "i" reads as decoration, and the one mode
+                    # that can end a process should never be ambiguous.
+                    if interactive:
+                        i_tag = c("i", BOLD, GREEN) + " interactive " + c("ARMED", BOLD, GREEN)
+                    else:
+                        i_tag = c("i", BOLD) + " interactive " + c("off", DIM)
                     a_tag = c("a", BOLD, GREEN) if view == "advice" else "a"
                     s_tag = c("s", BOLD, GREEN) if view == "agents" else "s"
                     m_tag = c("m", BOLD, GREEN) if view == "models" else "m"
                     u_tag = c("u", BOLD, GREEN) if view == "usage" else "u"
                     h_tag = c("h", BOLD, GREEN) if view == "help" else "h"
                     if not interactive:
-                        hint = "space refresh | %s interactive | %s advice | %s agents | %s models | %s usage | %s help | q quit" % (
+                        hint = "space refresh | %s | %s advice | %s agents | %s models | %s usage | %s help | q quit" % (
                             i_tag, a_tag, s_tag, m_tag, u_tag, h_tag)
                     elif sel is None:
-                        hint = "j/k select | space refresh | %s interactive | %s advice | %s agents | %s models | %s usage | %s help | q quit" % (
+                        hint = "j/k select | space refresh | %s | %s advice | %s agents | %s models | %s usage | %s help | q quit" % (
                             i_tag, a_tag, s_tag, m_tag, u_tag, h_tag)
                     else:
-                        hint = "j/k move | x stop | y yank id | esc deselect | %s interactive | q quit" % i_tag
+                        hint = "j/k move | x stop | y yank id | esc deselect | %s | q quit" % i_tag
                 lines, rows, sel = frame(view, sel)
                 # A session can exit while its confirmation is on screen. Matching
                 # on pid rather than on the row dict is what makes that detectable:
