@@ -50,10 +50,12 @@ import os
 import shutil
 import signal
 import socket
+import re
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -70,6 +72,14 @@ HOME = Path.home()
 SESSIONS_DIR = HOME / ".claude" / "sessions"
 PROJECTS_DIR = HOME / ".claude" / "projects"
 
+# The real Anthropic meter -- session/weekly/Fable caps -- has no local source;
+# this cache is written by the "claude-usage-scrape" scheduled task (a Claude
+# session driving claude-in-chrome against claude.ai/settings/usage), not by
+# roost itself. Missing/stale is the normal state on a machine without that
+# task, or on hyrule, which has no browser control at all.
+USAGE_CACHE = HOME / "claude-usage" / "usage.json"
+USAGE_STALE_SECS = 4 * 2 * 3600  # 4x the scrape task's 2h cadence
+
 # ---- config ----------------------------------------------------------------
 # Seconds between automatic repaints. Override per-run with `-w N`; space forces
 # an immediate repaint regardless.
@@ -85,6 +95,44 @@ AGENT_RECENT_SECS = 3600
 # A subagent counts as working if its transcript was written this recently.
 AGENT_ACTIVE_SECS = 30
 
+# Token-flow sparkline on the WORKER table: sample count kept per session, and
+# the minimum seconds between samples so a keypress-forced repaint does not
+# stuff the history with extra zeros.
+SPARK_LEN = 15
+SPARK_MIN_STEP = 1.0
+# ASCII ramp, dimmest to hottest. Block-drawing characters mojibake in the
+# Windows console (same reason bar() is ASCII), so the ramp is punctuation.
+# "." is a taken sample with zero flow; a space means no sample yet.
+SPARK_RAMP = ".:-=+*#"
+
+# USAGE panel: how far back the tally reaches, and the weekly budget it is
+# measured against. There is no local source for the real Anthropic meter, so
+# the budget is a number the user sets once after looking at /usage --
+# e.g. ROOST_WEEKLY_BUDGET=60M or 850k or a plain integer of tokens.
+USAGE_DAYS = 7
+USAGE_BUDGET_ENV = "ROOST_WEEKLY_BUDGET"
+
+# GATEWAY panel: where the batch pipeline writes its runs, and where the job
+# queue lives. The gateway itself is DB-less, so every activity endpoint 400s --
+# the filesystem is the source of truth for what it has been doing.
+BATCH_DIR_ENV = "ROOST_BATCH_DIR"
+JOBS_DIR_ENV = "JOBS_ROOT"
+# A batch run counts as actively writing if its newest output landed within
+# ~2x the slower lane's per-item time (~110s for gemma; see the batch README).
+BATCH_ACTIVE_SECS = 240
+PROXY_LOG_TAIL = 65536
+
+# REMOTE panel: ssh aliases come from the environment only, never from file
+# contents -- anything writable over the network must not choose ssh targets.
+REMOTES_ENV = "ROOST_REMOTES"
+REMOTE_CMD_ENV = "ROOST_REMOTE_CMD"
+# ssh runs a non-login shell, whose PATH misses Homebrew and per-user bin dirs
+# -- so the default widens PATH rather than assuming an install location.
+REMOTE_CMD_DEFAULT = (
+    'PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:$HOME/Claude/bin" roost --json')
+REMOTE_REFRESH_SECS = 30
+REMOTE_TIMEOUT_SECS = 15
+
 # Every session roost stops gets one JSON line here. Same shape and the same cap
 # as the hook logs next to it, so the same one-liners read all of them.
 LOG_PATH = HOME / ".claude" / "logs" / "roost.jsonl"
@@ -94,29 +142,153 @@ LOG_MAX_LINES = 5000
 # Set in main(); --no-log turns it off.
 LOGGING = True
 
-# agentId -> {description, status, model}, harvested from the parent transcript.
-# Descriptions never change, so this is filled once and never invalidated.
+# agentId -> {description, status, model, type}, harvested from the parent
+# transcript. Merged as records arrive; evicted only when the agent itself is
+# gone (prune_caches below).
 _AGENT_META = {}
 _AGENT_LABEL = {}
+
+# parent transcript path -> bytes already harvested for agent meta.
+_HARVEST_POS = {}
+
+# Keys touched since the last prune. Anything not re-touched belongs to a
+# session or agent that no longer exists; keeping it is a slow leak in a
+# dashboard left open for days.
+_SEEN_PATHS = set()
+_SEEN_AGENTS = set()
 
 # path -> (mtime, parsed result). At a 1s refresh, re-reading 256 KB from every
 # transcript each tick is megabytes of disk per second for no new information --
 # a transcript that has not been written to cannot have a new model or usage.
 _SCAN_CACHE = {}
 
-# Nothing in the transcript records which context window a session was opened with,
-# so it is inferred: the smallest standard tier the observed usage still fits in.
-# A session on the 1M window read 482k cache tokens in one call here -- scoring that
-# against 200k is what produced a nonsense "242%". The chosen tier is displayed
-# rather than assumed silently.
+# sessionId -> {"prev": last ctx_tokens, "t": last sample time, "hist": deque}.
+# In-memory only: the sparkline shows flow since roost started, nothing older.
+_SPARK = {}
+
+# path -> {"mtime", "size", "counts": {(day, model): tokens}}. Incremental: on
+# growth only the appended bytes are read, so the full-file pass happens once
+# per transcript per roost run.
+_USAGE_CACHE = {}
+
+# Nothing in the transcript records which context window a session was opened
+# with. Best source: the model name itself -- Anthropic documents each model's
+# real window, and unlike usage that is exact regardless of how little of it
+# has been used. A claude-fable-5 worker at 177k tokens is ~18% of its real 1M
+# window; scored against the wrong 200k tier (usage-only inference) that read
+# as an alarming 89% and tripped a false NEAR LIMIT warning.
+#
+# MODEL_WINDOWS is exact-match first, then longest-matching-prefix, so a dated
+# snapshot under a known family (any claude-haiku-4-5-*) resolves without its
+# own table row. A model this table has never heard of falls back to the old
+# behaviour -- the smallest standard tier the observed usage still fits in --
+# and its label is "~"-marked so an inferred window never looks as certain as
+# a known one on screen.
+MODEL_WINDOWS = {
+    "claude-fable-5": 1000000,
+    "claude-opus-5": 1000000,
+    "claude-sonnet-5": 1000000,
+    "claude-haiku-4-5": 200000,
+    # Legacy -- may still appear in old transcripts.
+    "claude-opus-4-8": 1000000,
+    "claude-opus-4-7": 1000000,
+    "claude-opus-4-6": 1000000,
+    "claude-sonnet-4-6": 1000000,
+    "claude-sonnet-4-5-20250929": 200000,
+    "claude-opus-4-5-20251101": 200000,
+    "claude-opus-4-1-20250805": 200000,
+}
+
 WINDOW_TIERS = ((200000, "200k"), (1000000, "1M"))
 
 
-def window_for(tokens):
+def model_window(model):
+    """Known window size for `model`, or None if it is not in MODEL_WINDOWS --
+    exact match first, then the longest matching prefix."""
+    if not model:
+        return None
+    if model in MODEL_WINDOWS:
+        return MODEL_WINDOWS[model]
+    best_key, best_size = "", None
+    for key, size in MODEL_WINDOWS.items():
+        if model.startswith(key) and len(key) > len(best_key):
+            best_key, best_size = key, size
+    return best_size
+
+
+def _window_label(size):
+    return "1M" if size >= 1000000 else "%dk" % (size // 1000)
+
+
+def window_for(tokens, model=None):
+    """(window_size, label) for a session's context window. Known models
+    resolve exactly off MODEL_WINDOWS; anything else falls back to the old
+    usage-based inference, its label "~"-marked to say so."""
+    size = model_window(model)
+    if size is not None:
+        return size, _window_label(size)
     for size, label in WINDOW_TIERS:
         if tokens <= size:
-            return size, label
-    return WINDOW_TIERS[-1]
+            return size, "~" + label
+    return WINDOW_TIERS[-1][0], "~" + WINDOW_TIERS[-1][1]
+
+
+# ---- auto-compact resolution ------------------------------------------------
+# autoCompactEnabled is a Claude Code setting -- never written to a session lock
+# file or a transcript, so seeing a worker with it off takes walking the same
+# settings.json hierarchy Claude Code itself merges: managed, then a project's
+# own .claude/settings.local.json, then its .claude/settings.json, then the
+# user's ~/.claude/settings.json. Highest scope that sets the key wins; a file
+# that exists but never mentions autoCompactEnabled (or its env-var twin,
+# DISABLE_AUTO_COMPACT) is transparent, same as Claude Code's own merge.
+#
+# What this cannot see: a CLI flag the session itself was launched with, or
+# DISABLE_AUTO_COMPACT exported in a shell rather than written into a
+# settings.json's own "env" block -- roost reads files, not another process's
+# environment or argv.
+AUTO_COMPACT_KEY = "autoCompactEnabled"
+AUTO_COMPACT_ENV_KEY = "DISABLE_AUTO_COMPACT"
+MANAGED_SETTINGS_PATH = {
+    "win32": Path(r"C:\Program Files\ClaudeCode\managed-settings.json"),
+    "darwin": Path("/Library/Application Support/ClaudeCode/managed-settings.json"),
+}.get(sys.platform, Path("/etc/claude-code/managed-settings.json"))
+
+
+def _auto_compact_from_file(path):
+    """True/False if this scope's settings.json decides the setting, else None
+    -- meaning fall through to the next scope down."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if AUTO_COMPACT_KEY in data:
+        return bool(data[AUTO_COMPACT_KEY])
+    env = data.get("env")
+    if isinstance(env, dict) and AUTO_COMPACT_ENV_KEY in env:
+        # DISABLE_AUTO_COMPACT is the env-var mirror of the settings key --
+        # truthy disables, so the boolean it decides is inverted.
+        return str(env[AUTO_COMPACT_ENV_KEY]).strip().lower() not in ("1", "true", "yes")
+    return None
+
+
+def auto_compact_enabled(cwd):
+    """Effective autoCompactEnabled for a session launched from `cwd`. Defaults
+    True -- Claude Code's own built-in default -- if nothing in the chain sets
+    it anywhere."""
+    if not cwd:
+        return True
+    base = Path(cwd)
+    for path in (MANAGED_SETTINGS_PATH,
+                 base / ".claude" / "settings.local.json",
+                 base / ".claude" / "settings.json",
+                 HOME / ".claude" / "settings.json"):
+        result = _auto_compact_from_file(path)
+        if result is not None:
+            return result
+    return True
+
 
 SERVICES = (
     ("ollama", 11434, "/api/ps"),
@@ -373,6 +545,7 @@ def scan_transcript(path):
            "title": None, "prompt": None}
     if not path:
         return out
+    _SEEN_PATHS.add(path)
     try:
         out["last_write"] = os.path.getmtime(path)
     except OSError:
@@ -428,13 +601,36 @@ def harvest_agent_meta(parent_transcript):
     """Pull subagent description/status out of the parent's tool results.
 
     A subagent's own transcript never states what it was asked to do in short
-    form -- only the parent's `toolUseResult` carries `description`, `status` and
-    `resolvedModel`, keyed by agentId. Scanning the tail is enough for anything
-    recent, and results are cached permanently since they never change.
+    form -- only the parent's `toolUseResult` carries `description`, `status`,
+    `resolvedModel` and `agentType`, keyed by agentId. Incremental rather than
+    tail-only: a busy parent grows past TAIL_BYTES with its agents' results in
+    the half a tail read never sees. The full pass happens once per parent per
+    roost run; after that only appended bytes are read, so the every-tick call
+    for a still-running agent costs one getsize().
     """
     if not parent_transcript:
         return
-    for line in read_tail(parent_transcript):
+    # Keeps the byte position alive across prunes while anything still asks
+    # about this parent; without it an orphan's dead parent would be evicted
+    # and re-read from byte 0 every tick.
+    _SEEN_PATHS.add(parent_transcript)
+    pos = _HARVEST_POS.get(parent_transcript, 0)
+    try:
+        size = os.path.getsize(parent_transcript)
+        if size < pos:
+            pos = 0  # truncated or replaced -- start over
+        if size == pos:
+            return
+        with open(parent_transcript, "rb") as fh:
+            fh.seek(pos)
+            data = fh.read()
+    except OSError:
+        return
+    # Consume whole lines only; a half-written trailing line waits for the
+    # next pass instead of being parsed as garbage and skipped forever.
+    cut = data.rfind(b"\n") + 1
+    _HARVEST_POS[parent_transcript] = pos + cut
+    for line in data[:cut].decode("utf-8", "replace").splitlines():
         if '"agentId"' not in line:
             continue
         try:
@@ -445,12 +641,21 @@ def harvest_agent_meta(parent_transcript):
         if not isinstance(r, dict):
             continue
         aid = r.get("agentId")
-        if aid and aid not in _AGENT_META:
-            _AGENT_META[aid] = {
-                "description": r.get("description") or "",
-                "status": r.get("status") or "",
-                "model": r.get("resolvedModel") or "",
-            }
+        if not aid:
+            continue
+        # Marked seen even when the agent has no live row: evicting it here
+        # would just force a re-harvest next tick.
+        _SEEN_AGENTS.add(aid)
+        # Merge rather than first-write-wins: an async launch writes an early
+        # record with no agentType, and the completed result that carries it
+        # would otherwise be discarded.
+        meta = _AGENT_META.setdefault(
+            aid, {"description": "", "status": "", "model": "", "type": ""})
+        for key, field in (("description", "description"), ("status", "status"),
+                           ("model", "resolvedModel"), ("type", "agentType")):
+            val = r.get(field)
+            if val:
+                meta[key] = val
 
 
 def agent_first_prompt(path, agent_id):
@@ -500,7 +705,10 @@ def collect_subagents(live_sids):
         if not parent_live and (age is None or age > AGENT_RECENT_SECS):
             continue  # finished long ago -- history, not a live worker
 
-        if agent_id not in _AGENT_META:
+        _SEEN_AGENTS.add(agent_id)
+        # Re-harvest while the type is still missing: a running agent's early
+        # records carry no agentType; the completed result does.
+        if not (_AGENT_META.get(agent_id) or {}).get("type"):
             harvest_agent_meta(transcript_for(parent_sid))
         meta = _AGENT_META.get(agent_id) or {}
 
@@ -510,7 +718,7 @@ def collect_subagents(live_sids):
         pct = None
         win_label = "-"
         if info["ctx_tokens"]:
-            window, win_label = window_for(info["ctx_tokens"])
+            window, win_label = window_for(info["ctx_tokens"], model)
             pct = 100.0 * info["ctx_tokens"] / float(window)
 
         # Parent liveness gates everything: if the parent process is gone, nothing
@@ -524,6 +732,9 @@ def collect_subagents(live_sids):
 
         rows.append({
             "agent_id": agent_id,
+            # Sanitised like task text: it comes out of a transcript, and a
+            # crafted agentType could otherwise carry escapes into the TUI.
+            "agent_type": ascii_safe(meta.get("type") or ""),
             "parent_sid": parent_sid,
             "task": label,
             "model": model,
@@ -543,6 +754,7 @@ def collect_workers():
     if not SESSIONS_DIR.is_dir():
         return rows
     now = time.time()
+    ac_cache = {}
     for f in sorted(SESSIONS_DIR.glob("*.json")):
         try:
             s = json.loads(f.read_text())
@@ -556,19 +768,39 @@ def collect_workers():
         pct = None
         win_label = "-"
         if info["ctx_tokens"]:
-            window, win_label = window_for(info["ctx_tokens"])
+            window, win_label = window_for(info["ctx_tokens"], info["model"])
             pct = 100.0 * info["ctx_tokens"] / float(window)
         idle = None
         if info["last_write"]:
             idle = now - info["last_write"]
+
+        # Token-flow sample for the FLOW sparkline: growth of the newest turn's
+        # context since the last sample is a cheap throughput proxy. Compaction
+        # shrinks the context -- that is not negative flow, so it clamps to 0.
+        # Throttled so a keypress-forced repaint cannot stuff the history.
+        flow = " " * SPARK_LEN
+        if sid:
+            st = _SPARK.setdefault(
+                sid, {"prev": None, "t": 0.0, "hist": deque(maxlen=SPARK_LEN)})
+            tok = info["ctx_tokens"]
+            if tok is not None and now - st["t"] >= SPARK_MIN_STEP:
+                if st["prev"] is not None:
+                    st["hist"].append(max(0, tok - st["prev"]))
+                st["prev"] = tok
+                st["t"] = now
+            flow = spark(st["hist"])
+
         started = s.get("startedAt")
         age = (now - started / 1000.0) if isinstance(started, (int, float)) else None
+        cwd = s.get("cwd") or ""
+        if cwd not in ac_cache:
+            ac_cache[cwd] = auto_compact_enabled(cwd)
         rows.append({
             "name": s.get("name") or "-",
             "pid": pid,
             "session_id": sid,
-            "cwd": s.get("cwd") or "",
-            "project": Path(s.get("cwd") or ".").name or "-",
+            "cwd": cwd,
+            "project": Path(cwd or ".").name or "-",
             "model": info["model"] or "-",
             "ctx_tokens": info["ctx_tokens"],
             "ctx_pct": pct,
@@ -582,6 +814,8 @@ def collect_workers():
             "task_src": "title" if info["title"] else ("prompt" if info["prompt"] else "-"),
             "idle_secs": idle,
             "age_secs": age,
+            "flow": flow,
+            "auto_compact": ac_cache[cwd],
         })
     return rows
 
@@ -647,6 +881,23 @@ def infra_cached():
     return snap
 
 
+def collect_usage_caps():
+    """The real 5-hour/weekly/Fable caps, from the claude-usage-scrape cache.
+
+    Returns None if the cache has never been written (task not yet run, or not
+    installed on this machine) -- distinct from a stale-but-present cache, which
+    render_usage_caps shows with an age instead of hiding.
+    """
+    try:
+        with open(USAGE_CACHE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    last_success = data.get("last_success_epoch")
+    data["age_secs"] = (time.time() - last_success) if last_success else None
+    return data
+
+
 def _iso_to_epoch(ts):
     """Ollama's expires_at is RFC3339 with an offset, e.g.
     '2026-08-01T15:04:05.123456-07:00'. Any format surprise just drops the
@@ -691,6 +942,486 @@ def collect_local_models():
     return out
 
 
+def _batch_root():
+    return Path(os.environ.get(BATCH_DIR_ENV,
+                               str(HOME / "litellm-server" / "batch")))
+
+
+def _jobs_root():
+    return Path(os.environ.get(JOBS_DIR_ENV, str(HOME / "jobs")))
+
+
+def _proxy_log_activity(path):
+    """Last-request age and requests/min, read off the tail of proxy.log.
+
+    Best-effort by design: the log format is LiteLLM's to change, so anything
+    that fails to parse just drops these two numbers rather than the panel.
+    Only timestamped lines mentioning a completions route count as requests.
+    """
+    lines = read_tail(str(path), PROXY_LOG_TAIL)
+    stamp = re.compile(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})")
+    now = time.time()
+    last = None
+    recent = 0
+    for line in lines:
+        if "completion" not in line and "chat" not in line:
+            continue
+        m = stamp.search(line)
+        if not m:
+            continue
+        try:
+            t = time.mktime(time.strptime(
+                m.group(1) + " " + m.group(2), "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            continue
+        last = t if last is None else max(last, t)
+        if now - t <= 60:
+            recent += 1
+    return {"last_req_secs": (now - last) if last is not None else None,
+            "req_per_min": recent if last is not None else None}
+
+
+def collect_gateway():
+    """LiteLLM liveliness plus batch-run progress, derived from files.
+
+    The gateway is DB-less, so its activity endpoints all 400 -- but the batch
+    pipeline is resumable by construction (one output file per finished item),
+    which means progress is fully derivable from the filesystem with zero
+    cooperation from the running process. _run.json, when extract.py wrote one,
+    pins the worklist and model; without it the run still shows, just with less.
+    """
+    now = time.time()
+    out = {"litellm_up": port_open(4000), "runs": [], "jobs": None,
+           "last_req_secs": None, "req_per_min": None}
+
+    root = _batch_root()
+    log = root.parent / "proxy.log"
+    if log.exists():
+        out.update(_proxy_log_activity(log))
+
+    if root.is_dir():
+        for d in sorted(root.iterdir()):
+            if not d.is_dir():
+                continue
+            try:
+                outputs = [p for p in d.glob("*.json")
+                           if not p.name.startswith("_")]
+                failures = d / "_failures.jsonl"
+                failed = 0
+                if failures.exists():
+                    failed = sum(
+                        1 for ln in failures.read_text(
+                            encoding="utf-8", errors="replace").splitlines()
+                        if ln.strip())
+                meta = {}
+                rj = d / "_run.json"
+                if rj.exists():
+                    try:
+                        meta = json.loads(rj.read_text(encoding="utf-8"))
+                    except ValueError:
+                        meta = {}
+                # A dir of loose JSON is not automatically a run: schemas/ and
+                # the like would otherwise show up as one. Without a _run.json
+                # only the results-* naming convention identifies a run.
+                if not meta and not failed and not d.name.startswith("results"):
+                    continue
+                if not outputs and not failed and not meta:
+                    continue  # empty results dir, nothing to say yet
+
+                mtimes = sorted(p.stat().st_mtime for p in outputs)
+                newest = mtimes[-1] if mtimes else None
+                # Rate from the spread of the newest outputs rather than from
+                # the start time: a resumed run's start says nothing about the
+                # pace it is writing at now.
+                rate_hr = None
+                recent = mtimes[-50:]
+                if len(recent) >= 2 and recent[-1] > recent[0]:
+                    rate_hr = (len(recent) - 1) / (recent[-1] - recent[0]) * 3600.0
+                total = meta.get("total")
+                eta_secs = None
+                if rate_hr and isinstance(total, int):
+                    remaining = total - len(outputs) - failed
+                    if remaining > 0:
+                        eta_secs = remaining / rate_hr * 3600.0
+                worklist = meta.get("worklist")
+                out["runs"].append({
+                    "name": d.name,
+                    "model": meta.get("model"),
+                    "worklist": Path(worklist).name if worklist else None,
+                    "done": len(outputs),
+                    "total": total,
+                    "failed": failed,
+                    "rate_hr": rate_hr,
+                    "eta_secs": eta_secs,
+                    "last_write_secs": (now - newest) if newest else None,
+                    "active": newest is not None
+                              and (now - newest) <= BATCH_ACTIVE_SECS,
+                })
+            except OSError:
+                continue
+        out["runs"].sort(key=lambda r: (not r["active"],
+                                        r["last_write_secs"] or 1e12))
+
+    jobs = _jobs_root()
+    if jobs.is_dir():
+        depth = {}
+        for state in ("inbox", "running", "done", "failed"):
+            sub = jobs / state
+            if state in ("done", "failed"):
+                depth[state] = sum(1 for p in sub.iterdir()
+                                   if p.is_dir()) if sub.is_dir() else 0
+            else:
+                depth[state] = len(list(sub.glob("*.json"))) if sub.is_dir() else 0
+        out["jobs"] = depth
+    return out
+
+
+def render_gateway(gw):
+    """LiteLLM plus everything it has been fed, without asking it anything --
+    a DB-less gateway keeps no history, so the batch pipeline's own output
+    files carry the progress story."""
+    lines = ["", c("GATEWAY", BOLD)]
+    mark = c("up", GREEN) if gw["litellm_up"] else c("DOWN", BOLD, RED)
+    head = "  litellm %s (127.0.0.1:4000)" % mark
+    if gw["last_req_secs"] is not None:
+        head += "   last request %s ago" % dur(gw["last_req_secs"])
+    if gw["req_per_min"] is not None:
+        head += "   %d req/min" % gw["req_per_min"]
+    lines.append(head)
+    if gw["jobs"] is not None:
+        j = gw["jobs"]
+        inbox = str(j["inbox"])
+        lines.append("  jobs queue: inbox %s  running %s  done %s  failed %s" % (
+            c(inbox, BOLD, YELLOW) if j["inbox"] else inbox,
+            c(str(j["running"]), GREEN) if j["running"] else j["running"],
+            j["done"],
+            c(str(j["failed"]), RED) if j["failed"] else j["failed"]))
+
+    if not gw["runs"]:
+        lines.append(c("  no batch runs found", DIM))
+        return lines
+
+    cols = [
+        ("BATCH RUN", lambda r: r["name"]),
+        ("MODEL", lambda r: r["model"] or "?"),
+        ("DONE/TOTAL", lambda r: "%d/%s" % (
+            r["done"], r["total"] if r["total"] is not None else "?")),
+        ("FAIL", lambda r: str(r["failed"])),
+        ("RATE", lambda r: "-" if not r["rate_hr"] else "%d/hr" % round(r["rate_hr"])),
+        ("ETA", lambda r: dur(r["eta_secs"]) if r["eta_secs"]
+            else ("done" if r["total"] is not None
+                  and r["done"] + r["failed"] >= r["total"] else "-")),
+        ("LAST", lambda r: "-" if r["last_write_secs"] is None
+            else dur(r["last_write_secs"]) + " ago"),
+    ]
+    table = [[h for h, _ in cols]] + [[f(r) for _, f in cols] for r in gw["runs"]]
+    w = [max(len(row[i]) for row in table) for i in range(len(cols))]
+    lines.append("  " + c("  ".join(
+        table[0][i].ljust(w[i]) for i in range(len(cols))), BOLD))
+    for row, r in zip(table[1:], gw["runs"]):
+        cells = [row[i].ljust(w[i]) for i in range(len(cols))]
+        # Same colouring rule as LOCAL MODELS: green while actively writing,
+        # dim once done or stale.
+        line = "  " + "  ".join(cells)
+        lines.append(c(line, GREEN) if r["active"] else c(line, DIM))
+    active = sum(1 for r in gw["runs"] if r["active"])
+    lines.append("  " + c("%d run(s), %d active" % (len(gw["runs"]), active), DIM))
+    return lines
+
+
+# host -> {"data", "t", "err", "thread"}. Fetches run on daemon threads so a
+# host behind a closed MacBook lid shows as stale rather than hanging the UI.
+_REMOTE = {}
+_REMOTE_LOCK = threading.Lock()
+
+
+def _fetch_remote(host):
+    cmd = os.environ.get(REMOTE_CMD_ENV, REMOTE_CMD_DEFAULT)
+    err, data = None, None
+    try:
+        p = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, cmd],
+            capture_output=True, text=True, timeout=REMOTE_TIMEOUT_SECS)
+        if p.returncode == 0:
+            data = json.loads(p.stdout)
+        else:
+            tail = (p.stderr or "").strip().splitlines()
+            err = tail[-1][:60] if tail else "exit %d" % p.returncode
+    except subprocess.TimeoutExpired:
+        err = "timeout after %ds" % REMOTE_TIMEOUT_SECS
+    except (OSError, ValueError) as e:
+        err = str(e)[:60]
+    with _REMOTE_LOCK:
+        st = _REMOTE.setdefault(host, {})
+        if data is not None:
+            st["data"] = data
+            st["t"] = time.time()
+            st["err"] = None
+        else:
+            st["err"] = err  # keep the last good data and its timestamp
+        st["thread"] = None
+
+
+def collect_remote():
+    hosts = [h.strip() for h in
+             os.environ.get(REMOTES_ENV, "hyrule").split(",") if h.strip()]
+    rows = []
+    now = time.time()
+    for host in hosts:
+        with _REMOTE_LOCK:
+            st = _REMOTE.setdefault(host, {})
+            age = (now - st["t"]) if st.get("t") else None
+            if st.get("thread") is None and (age is None
+                                             or age >= REMOTE_REFRESH_SECS):
+                t = threading.Thread(target=_fetch_remote, args=(host,),
+                                     daemon=True)
+                st["thread"] = t
+                t.start()
+                first_try = not st.get("t") and not st.get("err")
+            else:
+                t, first_try = None, False
+        # Only the very first attempt per host gets a blocking grace period --
+        # it is what makes --once useful. A host that already failed once (the
+        # closed-lid case) never blocks again; its row shows the error instead.
+        if t is not None and first_try:
+            t.join(REMOTE_TIMEOUT_SECS + 2)
+        with _REMOTE_LOCK:
+            st = _REMOTE[host]
+            age = (time.time() - st["t"]) if st.get("t") else None
+            rows.append({"host": host, "data": st.get("data"),
+                         "age_secs": age, "err": st.get("err"),
+                         "fetching": st.get("thread") is not None})
+    return rows
+
+
+def render_remote(remotes):
+    """One summary row per remote host, rendered from that host's own
+    `roost --json` over ssh. Data is cached: a host that stops answering keeps
+    its last good row with the age saying how old it is."""
+    lines = ["", c("REMOTE", BOLD)]
+    if not remotes:
+        lines.append(c("  set %s (comma-separated ssh aliases)" % REMOTES_ENV, DIM))
+        return lines
+
+    cols = [
+        ("HOST", lambda r: r["host"]),
+        ("WORKERS", lambda r: r["nworkers"]),
+        ("WORKING", lambda r: r["working"]),
+        ("RESIDENT MODELS", lambda r: r["resident"]),
+        ("BATCH", lambda r: r["batch"]),
+        ("JOBS", lambda r: r["jobs"]),
+        ("AGE", lambda r: r["age"]),
+    ]
+    view = []
+    for r in remotes:
+        d = r["data"]
+        if d is None:
+            view.append({"host": r["host"], "nworkers": "-", "working": "-",
+                         "resident": "-", "batch": "-", "jobs": "-",
+                         "age": "fetching..." if r["fetching"]
+                                else (r["err"] or "-"), "stale": True})
+            continue
+        workers = d.get("workers") or []
+        working = sum(1 for w in workers
+                      if w.get("idle_secs") is not None and w["idle_secs"] < 60)
+        resident = ", ".join(m["name"] for m in (d.get("local_models") or [])
+                             if m.get("resident")) or "-"
+        gw = d.get("gateway") or {}
+        runs = [x for x in (gw.get("runs") or []) if x.get("active")]
+        if runs:
+            batch = ", ".join("%s %d/%s" % (
+                x["name"], x["done"],
+                x["total"] if x.get("total") is not None else "?")
+                for x in runs)
+        else:
+            batch = "-"
+        j = gw.get("jobs")
+        jobs = ("in %d run %d fail %d" % (j["inbox"], j["running"], j["failed"])
+                if j else "-")
+        age = dur(r["age_secs"]) if r["age_secs"] is not None else "-"
+        stale = r["age_secs"] is not None and r["age_secs"] > 3 * REMOTE_REFRESH_SECS
+        if r["err"]:
+            age += " (%s)" % r["err"]
+        elif stale:
+            age += " (stale)"
+        view.append({"host": r["host"], "nworkers": str(len(workers)),
+                     "working": str(working), "resident": resident,
+                     "batch": batch, "jobs": jobs, "age": age, "stale": stale})
+
+    table = [[h for h, _ in cols]] + [[f(r) for _, f in cols] for r in view]
+    w = [max(len(row[i]) for row in table) for i in range(len(cols))]
+    lines.append("  " + c("  ".join(
+        table[0][i].ljust(w[i]) for i in range(len(cols))), BOLD))
+    for row, r in zip(table[1:], view):
+        cells = []
+        for i, (header, _) in enumerate(cols):
+            txt = row[i].ljust(w[i])
+            if header == "HOST":
+                cells.append(c(txt, BOLD))
+            elif header == "WORKING" and not r["stale"] and row[i] not in ("0", "-"):
+                cells.append(c(txt, GREEN))
+            elif r["stale"] or header == "AGE":
+                cells.append(c(txt, DIM))
+            else:
+                cells.append(txt)
+        lines.append("  " + "  ".join(cells))
+    return lines
+
+
+def parse_budget(s):
+    """'60M', '850k', or a plain token count. None on unset or garbage."""
+    if not s:
+        return None
+    s = s.strip()
+    try:
+        if s and s[-1] in "kK":
+            return int(float(s[:-1]) * 1000)
+        if s and s[-1] in "mM":
+            return int(float(s[:-1]) * 1000000)
+        return int(float(s))
+    except ValueError:
+        return None
+
+
+def _tally_lines(lines, counts):
+    """Accumulate (day, model) -> input+output tokens from assistant turns.
+
+    Cache reads/creation are deliberately excluded: they are billed and
+    rate-limited differently, and counting them would swamp the number with
+    re-reads of unchanged context. What is left is closest to "work done".
+    """
+    for line in lines:
+        if '"usage"' not in line or '"assistant"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        msg = d.get("message") or {}
+        usage = msg.get("usage") or {}
+        if not usage:
+            continue
+        day = str(d.get("timestamp") or "")[:10]
+        if len(day) != 10:
+            continue
+        # Raw model name kept: the "claude-" prefix is what later separates
+        # cloud burn (counts against the plan) from local models (free).
+        # Sanitised: it is transcript text headed for the TUI.
+        model = ascii_safe(msg.get("model") or "?") or "?"
+        tok = (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
+        key = (day, model)
+        counts[key] = counts.get(key, 0) + tok
+
+
+def collect_usage():
+    """Observed tokens per day per model over the last USAGE_DAYS.
+
+    Incremental: each transcript is read in full exactly once per roost run
+    (only files touched inside the window), then only appended bytes after
+    that. Only called while the USAGE panel is open, so the one full pass
+    happens on the first `u`, not at launch.
+    """
+    cutoff = time.time() - USAGE_DAYS * 86400
+    paths = set(glob.glob(str(PROJECTS_DIR / "*" / "*.jsonl")))
+    paths.update(glob.glob(
+        str(PROJECTS_DIR / "*" / "*" / "subagents" / "agent-*.jsonl")))
+
+    # A deleted transcript never reappears in the glob, so its entry would sit
+    # in the cache forever -- still counted into the panel, and a slow leak.
+    for path in [p for p in _USAGE_CACHE if p not in paths]:
+        del _USAGE_CACHE[path]
+
+    for path in paths:
+        try:
+            mtime = os.path.getmtime(path)
+            size = os.path.getsize(path)
+        except OSError:
+            _USAGE_CACHE.pop(path, None)  # deleted between glob and stat
+            continue
+        if mtime < cutoff:
+            _USAGE_CACHE.pop(path, None)
+            continue
+        st = _USAGE_CACHE.get(path)
+        if st and st["size"] == size and st["mtime"] == mtime:
+            continue
+        if st and size >= st["size"]:
+            pos, counts = st["size"], st["counts"]
+        else:
+            pos, counts = 0, {}  # new file, or it shrank -- start over
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(pos)
+                data = fh.read()
+        except OSError:
+            continue
+        # Consume only whole lines; a half-written trailing line is left for
+        # the next pass rather than being parsed as garbage and lost.
+        cut = data.rfind(b"\n") + 1
+        _tally_lines(data[:cut].decode("utf-8", "replace").splitlines(), counts)
+        _USAGE_CACHE[path] = {"mtime": mtime, "size": pos + cut, "counts": counts}
+
+    days = {}
+    for st in _USAGE_CACHE.values():
+        for (day, model), tok in st["counts"].items():
+            byday = days.setdefault(day, {})
+            byday[model] = byday.get(model, 0) + tok
+    return days
+
+
+def render_usage(days):
+    lines = ["", c("USAGE", BOLD) + "  "
+             + c("observed transcript tokens (input+output) -- an estimate, "
+                 "not the Anthropic meter", DIM)]
+    # Day keys come from transcript timestamps, which are UTC -- so the day
+    # boundary is UTC too. Keep only the window and newest first.
+    recent = sorted(days, reverse=True)[:USAGE_DAYS]
+    if not recent:
+        lines.append(c("  nothing recorded in the last %d days" % USAGE_DAYS, DIM))
+        return lines
+
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    rows = []
+    for day in recent:
+        by_model = days[day]
+        # Cloud burn is what counts against the plan; local Ollama models cost
+        # nothing, so they show in the breakdown but not the budget math.
+        cloud = sum(t for m, t in by_model.items() if m.startswith("claude-"))
+        top = sorted(by_model.items(), key=lambda kv: -kv[1])
+        detail = ", ".join(
+            "%s %s" % (m.replace("claude-", "") if m.startswith("claude-")
+                       else m + " (local)", compact(t))
+            for m, t in top[:3])
+        if len(top) > 3:
+            detail += ", +%d more" % (len(top) - 3)
+        rows.append((day, cloud, detail))
+
+    wid = max(len(compact(t)) for _, t, _ in rows)
+    for day, cloud, detail in rows:
+        mark = c(" <- today", GREEN) if day == today else ""
+        lines.append("  %s  %s  %s%s" % (
+            c(day, BOLD if day == today else DIM),
+            compact(cloud).rjust(wid), c(detail, DIM), mark))
+
+    week_total = sum(t for _, t, _ in rows)
+    today_cloud = sum(t for m, t in days.get(today, {}).items()
+                      if m.startswith("claude-"))
+    summary = "today %s  |  %dd %s cloud" % (
+        compact(today_cloud), len(rows), compact(week_total))
+    budget = parse_budget(os.environ.get(USAGE_BUDGET_ENV))
+    lines.append("")
+    if budget:
+        pct = 100.0 * week_total / float(budget)
+        code = (BOLD, RED) if pct >= 80 else ((YELLOW,) if pct >= 50 else (GREEN,))
+        lines.append("  " + c(summary, BOLD) + "  "
+                     + c("/ %s budget (%.0f%%)" % (compact(budget), pct), *code))
+    else:
+        lines.append("  " + c(summary, BOLD))
+        lines.append("  " + c("set %s (e.g. 60M) to measure against your plan -- "
+                              "calibrate the number from /usage once" % USAGE_BUDGET_ENV,
+                              DIM))
+    return lines
+
+
 # ---- advisory thresholds ----------------------------------------------------
 # A turn costs whatever the context currently holds, so a fat session is
 # expensive on every future turn, not once. These are the lines where that stops
@@ -729,9 +1460,15 @@ def advise(workers):
                         % (idle_h, "{:,}".format(tok), "{:,}".format(TYPICAL_BASELINE),
                            "{:,}".format(saving))))
         elif pct >= NEAR_LIMIT_PCT:
-            out.append((saving, c("NEAR LIMIT", BOLD, YELLOW), tag, task,
-                        "at %.0f%% of its window. Wrap up or /compact before it "
-                        "auto-compacts mid-task." % pct))
+            if r.get("auto_compact", True):
+                detail = ("at %.0f%% of its window. Wrap up or /compact before it "
+                           "auto-compacts mid-task." % pct)
+            else:
+                detail = ("at %.0f%% of its window with auto-compact off for this "
+                           "session -- there is no safety net here. Wrap up or "
+                           "/compact now, or it errors out instead of compacting."
+                           % pct)
+            out.append((saving, c("NEAR LIMIT", BOLD, YELLOW), tag, task, detail))
         elif tok >= EXPENSIVE_TOKENS:
             out.append((saving, c("EXPENSIVE", YELLOW), tag, task,
                         "every turn now reprocesses %s tokens. Fine to finish the "
@@ -784,6 +1521,26 @@ def compact(n):
     if n >= 1000:
         return "%dk" % (n // 1000)
     return str(n)
+
+
+def spark(hist):
+    """ASCII sparkline of recent token flow, newest sample at the right.
+
+    Normalised to the buffer's own max, so it shows the *shape* of activity --
+    bursts and quiet stretches -- not absolute volume. Left-padded: history
+    grows in from the right as samples arrive.
+    """
+    if not hist:
+        return " " * SPARK_LEN
+    mx = max(hist)
+    out = []
+    for v in hist:
+        if v <= 0 or mx <= 0:
+            out.append(SPARK_RAMP[0])
+        else:
+            idx = 1 + int((v / float(mx)) * (len(SPARK_RAMP) - 2))
+            out.append(SPARK_RAMP[min(idx, len(SPARK_RAMP) - 1)])
+    return "".join(out).rjust(SPARK_LEN)
 
 
 BAR_WIDTH = 12
@@ -861,6 +1618,7 @@ def render(workers, sel=None):
         ("CONTEXT", lambda r: bar(r["ctx_pct"])),
         ("CTX", lambda r: "-" if r["ctx_pct"] is None else "%.0f%%" % r["ctx_pct"]),
         ("TOKENS", lambda r: "-" if not r["ctx_tokens"] else compact(r["ctx_tokens"])),
+        ("FLOW", lambda r: r.get("flow") or " " * SPARK_LEN),
         ("IDLE", lambda r: dur(r["idle_secs"])),
     ]
 
@@ -887,6 +1645,12 @@ def render(workers, sel=None):
         task = ascii_safe(w.get("task") or "")
         if w.get("task_src") == "prompt" and task:
             task = c(task, DIM)  # not yet named -- this is the raw last prompt
+        if not w.get("auto_compact", True):
+            # The one WORKERS-row marker that is not about token economics --
+            # auto-compact off means NEAR LIMIT has no safety net, so it is
+            # called out even on a session nowhere near its window yet.
+            tag = c("[no-compact]", BOLD, YELLOW)
+            task = tag + " " + task if task else tag
         # The marker is printed whether or not colour is on: over SSH, in a pipe,
         # or on a terminal with no reverse video it is the only thing that says
         # which row x would act on.
@@ -922,6 +1686,58 @@ def render_infra(infra):
     return [c("INFRA  ", BOLD) + "   ".join(parts), ""]
 
 
+def _pct_color(pct):
+    if pct is None:
+        return DIM
+    if pct >= 80:
+        return (BOLD, RED)
+    if pct >= 50:
+        return (YELLOW,)
+    return (GREEN,)
+
+
+def render_usage_caps(usage):
+    """Real Anthropic caps, one line, always visible next to INFRA -- same
+    "quiet until it matters" weight, refreshed on a 2h cadence rather than
+    every frame, since the source is a scrape cache, not a live probe."""
+    label = c("CAPS   ", BOLD)
+    if usage is None:
+        return [label + c("no data yet -- claude-usage-scrape task hasn't run "
+                           "(see claude-usage/README.md)", DIM), ""]
+
+    caps = usage.get("caps") or {}
+    age = usage.get("age_secs")
+    stale = age is not None and age > USAGE_STALE_SECS
+
+    def cell(key, tag):
+        c_ = caps.get(key) or {}
+        if not c_.get("visible"):
+            return None
+        pct = c_.get("pct")
+        if pct is None:
+            return None
+        return "%s: %s" % (tag, c(str(pct) + "%", *_pct_color(pct)))
+
+    parts = [p for p in (
+        cell("five_hour", "5h"),
+        cell("weekly_all_models", "Weekly"),
+        cell("weekly_sonnet", "Sonnet"),
+        cell("fable5_max", "Fable5"),
+    ) if p]
+
+    if not parts:
+        return [label + c("cache present but no caps parsed", DIM), ""]
+
+    if age is None:
+        age_txt = "age unknown"
+    else:
+        age_txt = "%dm ago" % (age / 60) if age < 3600 else "%.1fh ago" % (age / 3600)
+    age_style = (BOLD, RED) if stale else (DIM,)
+    suffix = c("  (stale, %s)" % age_txt, *age_style) if stale else c("  (%s)" % age_txt, DIM)
+
+    return [label + "  ".join(parts) + suffix, ""]
+
+
 MODEL_COLORS = {"opus": MAGENTA, "sonnet": BLUE, "fable": CYAN, "haiku": GREEN}
 
 
@@ -952,6 +1768,8 @@ def style_cell(header, text, row):
         return text
     if header == "NAME":
         return c(text, BOLD)
+    if header == "FLOW":
+        return c(text, CYAN)
     if header in ("TOKENS", "WIN", "PID"):
         return c(text, DIM)
     return text
@@ -967,9 +1785,17 @@ def render_subagents(agents):
 
     cols = [
         ("STATE", lambda r: r["state"]),
-        ("AGENT", lambda r: r["agent_id"][:10]),
+        # The agent type is the readable name, but the parent only records it in
+        # the tool result -- a still-running agent has no type yet, so the hex id
+        # is kept as a suffix (and the whole label while running) to stay unique.
+        ("AGENT", lambda r: ("%s/%s" % (r["agent_type"], r["agent_id"][:5]))
+            if r["agent_type"] else r["agent_id"][:10]),
         ("MODEL", lambda r: (r["model"] or "-").replace("claude-", "")),
-        ("CTX", lambda r: "-" if r["ctx_pct"] is None else "%.0f%%" % r["ctx_pct"]),
+        # Absolute over window, not a bare percentage: 48k/200k says both how
+        # much is loaded and how much room is left. The window label is inferred
+        # (see WINDOW_TIERS); colour still follows ctx_pct.
+        ("CTX", lambda r: "-" if not r["ctx_tokens"]
+            else "%s/%s" % (compact(r["ctx_tokens"]), r["window"])),
         ("IDLE", lambda r: dur(r["idle_secs"])),
         ("TASK", lambda r: r["task"]),
     ]
@@ -1043,16 +1869,35 @@ HELP_SCREENS = (
      "ollama / litellm / openwebui: up or down, plus what's resident in Ollama's VRAM right now."),
     ("WORKERS", None,
      "every live Claude Code session: model, context window used, idle time, current task. "
-     "QUIET collapses idle sessions to one line; raise the cursor to expand it."),
+     "FLOW is a sparkline of recent token throughput -- '.' is a quiet sample, the ramp is "
+     "activity; history starts when roost starts. QUIET collapses idle sessions to one line; "
+     "raise the cursor to expand it."),
     ("SUBAGENTS", "s",
      "work a session farmed out. Invisible in any pid-based view, since a subagent shares its "
-     "parent's process rather than running as one of its own."),
+     "parent's process rather than running as one of its own. AGENT shows the agent's type once "
+     "it finishes (hex id while running); CTX is tokens over the inferred window."),
     ("ADVICE", "a",
      "concrete actions, ranked by how many tokens each would save -- which sessions are "
      "expensive to resume, near their context limit, or just idle clutter."),
     ("LOCAL MODELS", "m",
      "everything Ollama has installed, not just what's resident in VRAM -- disk size, "
      "residency, and time until an idle model unloads."),
+    ("USAGE", "u",
+     "tokens per day per model over the last week, tallied from the transcripts on disk. "
+     "An estimate of burn, not the real Anthropic meter; set ROOST_WEEKLY_BUDGET to see "
+     "it as a share of your plan. Local (non claude-*) models are flagged and excluded "
+     "from the budget math. First open scans a week of transcripts and can pause for a "
+     "moment; after that it reads only what was appended."),
+    ("GATEWAY", "g",
+     "LiteLLM liveliness plus batch-run progress. The gateway is DB-less so it keeps no "
+     "request history -- progress is derived from the batch pipeline's own output files "
+     "(one JSON per finished item), the job queue dirs, and a best-effort read of "
+     "proxy.log. Green rows are actively writing."),
+    ("REMOTE", "r",
+     "other machines' roost, over ssh. One row per host in ROOST_REMOTES: workers, "
+     "resident models, batch progress, job queue. Fetched on a background thread and "
+     "cached, so an unreachable host shows its last good row with an age instead of "
+     "hanging the display."),
 )
 
 
@@ -1070,8 +1915,9 @@ def render_help():
     return lines
 
 
-def frame(with_advice=False, with_agents=True, with_models=False, with_help=False, sel=None):
-    """Returns (lines, rows, sel).
+def frame(view=None, sel=None):
+    """Returns (lines, rows, sel). `view` is the open panel: "agents",
+    "models", "advice", "usage", "help", or None for the bare worker table.
 
     `rows` is what the cursor indexes, handed back so the key handler acts on the
     frame the user was actually looking at. `sel` comes back clamped: sessions
@@ -1086,17 +1932,46 @@ def frame(with_advice=False, with_agents=True, with_models=False, with_help=Fals
     # Infra leads because it is a constant: one quiet line you skim past, which
     # is exactly the weight it deserves until something turns red.
     lines = render_infra(infra_cached()) + render(workers, sel)
-    if with_agents:
+    if view == "agents":
         live_sids = set(w["session_id"] for w in workers if w.get("session_id"))
         lines.extend(render_subagents(collect_subagents(live_sids)))
-    if with_models:
+    elif view == "models":
         lines.extend(render_models(collect_local_models()))
-    if with_help:
+    elif view == "usage":
+        lines.extend(render_usage(collect_usage()))
+    elif view == "gateway":
+        lines.extend(render_gateway(collect_gateway()))
+    elif view == "remote":
+        lines.extend(render_remote(collect_remote()))
+    elif view == "help":
         lines.extend(render_help())
-    if with_advice:
+    elif view == "advice":
         lines.append("")
         lines.extend(advise(workers))
+    prune_caches()
     return lines, rows, sel
+
+
+def prune_caches():
+    """Evict cache entries whose session or agent vanished since the last frame.
+
+    Every live path and agent re-registers itself each tick, so anything left
+    over is history -- without this the caches grow for as long as the dashboard
+    stays open, which is days.
+    """
+    for cache in (_SCAN_CACHE, _HARVEST_POS):
+        for k in [k for k in cache if k not in _SEEN_PATHS]:
+            del cache[k]
+    for cache in (_AGENT_META, _AGENT_LABEL):
+        for k in [k for k in cache if k not in _SEEN_AGENTS]:
+            del cache[k]
+    _SEEN_PATHS.clear()
+    _SEEN_AGENTS.clear()
+
+
+# (handle, original mode) when enable_vt() changed the console, else None.
+# Conhost keeps a mutated mode after the process exits, so it must be put back.
+_VT_ORIGINAL = None
 
 
 def enable_vt():
@@ -1105,6 +1980,7 @@ def enable_vt():
     Without it the cursor-home and erase sequences are ignored, so every frame is
     appended below the last instead of overwriting it -- the screen pages away.
     """
+    global _VT_ORIGINAL
     if os.name != "nt":
         return True
     try:
@@ -1118,9 +1994,24 @@ def enable_vt():
         ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
         if mode.value & ENABLE_VIRTUAL_TERMINAL_PROCESSING:
             return True
-        return bool(k.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
+        if k.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING):
+            _VT_ORIGINAL = (handle, mode.value)
+            return True
+        return False
     except Exception:
         return False
+
+
+def restore_vt():
+    """Put the console mode back exactly as enable_vt() found it."""
+    if _VT_ORIGINAL is None:
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.SetConsoleMode(_VT_ORIGINAL[0], _VT_ORIGINAL[1])
+    except Exception:
+        pass
 
 
 class KeyReader(object):
@@ -1166,7 +2057,10 @@ class KeyReader(object):
             try:
                 import termios
 
-                termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved)
+                # TCSAFLUSH, not TCSADRAIN: discard queued input (the tail of an
+                # arrow sequence, keys typed during a slow frame) instead of
+                # delivering it to the shell prompt after exit.
+                termios.tcsetattr(self._fd, termios.TCSAFLUSH, self._saved)
             except Exception:
                 pass
         return False
@@ -1196,19 +2090,27 @@ class KeyReader(object):
             return None
         import select
 
-        r, _, _ = select.select([sys.stdin], [], [], timeout)
+        # os.read on the raw fd, never sys.stdin.read: the buffered TextIO can
+        # slurp several bytes into user space, after which select() on the fd
+        # reports "not ready" while input sits in the buffer -- arrow tails then
+        # surface as stray characters, or spill to the shell after exit.
+        def read1():
+            b = os.read(self._fd, 1)
+            return b.decode("utf-8", "replace") if b else ""
+
+        r, _, _ = select.select([self._fd], [], [], timeout)
         if not r:
             return None
-        ch = sys.stdin.read(1)
+        ch = read1()
         if ch != "\x1b":
             return ch
         # A bare Esc and the start of an arrow sequence are the same byte. The
         # rest of a real CSI arrives in the same burst, so nothing further within
         # a beat means the user pressed Esc.
-        r, _, _ = select.select([sys.stdin], [], [], 0.05)
-        if not r or sys.stdin.read(1) != "[":
+        r, _, _ = select.select([self._fd], [], [], 0.05)
+        if not r or read1() != "[":
             return "ESC"
-        return {"A": "UP", "B": "DOWN"}.get(sys.stdin.read(1))
+        return {"A": "UP", "B": "DOWN"}.get(read1())
 
 
 def term_size():
@@ -1234,7 +2136,7 @@ def paint(lines, vt):
     if len(body) > rows - 1:
         hidden = len(body) - (rows - 2)
         body = body[: rows - 2] + [clip_ansi(
-            c("... %d more line(s) below -- taller window, or s/a/m/h to close a panel"
+            c("... %d more line(s) below -- taller window, or s/a/m/u/g/r/h to close a panel"
               % hidden, DIM), cols - 1)]
 
     # Version, bottom-right. Stamped onto whatever the last visible line turns
@@ -1276,6 +2178,15 @@ def main():
                     help="start with the SUBAGENTS panel closed (toggle live with 's')")
     ap.add_argument("--models", action="store_true",
                     help="start with the LOCAL MODELS panel open (toggle live with 'm')")
+    ap.add_argument("--usage", action="store_true",
+                    help="start with the USAGE panel open (toggle live with 'u'); "
+                         "set %s (e.g. 60M) to show weekly burn against a budget"
+                         % USAGE_BUDGET_ENV)
+    ap.add_argument("--gateway", action="store_true",
+                    help="start with the GATEWAY panel open (toggle live with 'g')")
+    ap.add_argument("--remote", action="store_true",
+                    help="start with the REMOTE panel open (toggle live with 'r'); "
+                         "hosts come from %s (comma-separated ssh aliases)" % REMOTES_ENV)
     ap.add_argument("--interactive", action="store_true",
                     help="start with interactive mode armed -- cursor, x/y, and the "
                          "EXPERIMENTAL tag (default off; toggle live with 'i')")
@@ -1283,7 +2194,9 @@ def main():
                     help="do not record stopped sessions to %s" % LOG_PATH)
     ap.epilog = (
         "keys while running:  space = refresh now   a = advice panel   "
-        "s = subagents panel   m = local models panel   h or ? = what am I looking at   "
+        "s = subagents panel   m = local models panel   u = usage panel   "
+        "g = gateway panel   r = remote panel   "
+        "h or ? = what am I looking at   "
         "i = arm interactive mode   q = quit\n"
         "interactive mode (armed with i):  j/k or arrows move a cursor   "
         "x = stop the session (confirms)   y = copy its sessionId   esc = deselect")
@@ -1296,9 +2209,18 @@ def main():
         print(json.dumps({
             "workers": collect_workers(),
             "infra": collect_infra(),
+            "usage_caps": collect_usage_caps(),
             "local_models": collect_local_models(),
+            "gateway": collect_gateway(),
         }, indent=2))
         return
+
+    # Die by unwinding, not by default disposition: a plain kill would skip the
+    # KeyReader __exit__ and the cursor/console restore below, leaving the tty
+    # in cbreak/no-echo with the cursor hidden. SystemExit runs both.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, lambda *_: sys.exit(0))
 
     vt = enable_vt()
 
@@ -1322,6 +2244,12 @@ def main():
         view = "advice"
     elif args.models:
         view = "models"
+    elif args.usage:
+        view = "usage"
+    elif args.gateway:
+        view = "gateway"
+    elif args.remote:
+        view = "remote"
     elif args.no_agents:
         view = None
     else:
@@ -1330,8 +2258,7 @@ def main():
     # Live is the default, as with top/htop -- `-h` is argparse's help and exits,
     # so keys have nothing to act on there. A single frame is opt-in.
     if args.once:
-        print("\n".join(frame(view == "advice", view == "agents", view == "models",
-                               view == "help")[0]))
+        print("\n".join(frame(view)[0]))
         return
     interval = args.watch if args.watch else REFRESH_SECONDS
 
@@ -1350,21 +2277,33 @@ def main():
                 if not keys.enabled:
                     hint = "Ctrl-C to stop"
                 else:
-                    i_tag = c("i", BOLD, GREEN) if interactive else "i"
+                    # One hint for every state. Its text never changes when
+                    # interactive is armed or a cursor is raised -- only the
+                    # colours do -- so the header cannot reflow underfoot
+                    # ("off" is even padded to ARMED's width). The armed state
+                    # is spelled out, not just tinted: a lone green "i" reads
+                    # as decoration, and the one mode that can end a process
+                    # should never be ambiguous. Cursor keys sit dimmed until
+                    # they can do something.
+                    if interactive:
+                        i_tag = c("i", BOLD, GREEN) + " interactive " + c("ARMED", BOLD, GREEN)
+                        cur_tag = "j/k x y esc"
+                    else:
+                        i_tag = c("i", BOLD) + " interactive " + c("off  ", DIM)
+                        cur_tag = c("j/k x y esc", DIM)
                     a_tag = c("a", BOLD, GREEN) if view == "advice" else "a"
                     s_tag = c("s", BOLD, GREEN) if view == "agents" else "s"
                     m_tag = c("m", BOLD, GREEN) if view == "models" else "m"
+                    u_tag = c("u", BOLD, GREEN) if view == "usage" else "u"
+                    g_tag = c("g", BOLD, GREEN) if view == "gateway" else "g"
+                    r_tag = c("r", BOLD, GREEN) if view == "remote" else "r"
                     h_tag = c("h", BOLD, GREEN) if view == "help" else "h"
-                    if not interactive:
-                        hint = "space refresh | %s interactive | %s advice | %s agents | %s models | %s help | q quit" % (
-                            i_tag, a_tag, s_tag, m_tag, h_tag)
-                    elif sel is None:
-                        hint = "j/k select | space refresh | %s interactive | %s advice | %s agents | %s models | %s help | q quit" % (
-                            i_tag, a_tag, s_tag, m_tag, h_tag)
-                    else:
-                        hint = "j/k move | x stop | y yank id | esc deselect | %s interactive | q quit" % i_tag
-                lines, rows, sel = frame(view == "advice", view == "agents", view == "models",
-                                          view == "help", sel)
+                    hint = ("space refresh | %s | %s | %s advice | %s agents | "
+                            "%s models | %s usage | %s gateway | %s remote | "
+                            "%s help | q quit") % (
+                        i_tag, cur_tag, a_tag, s_tag, m_tag, u_tag, g_tag,
+                        r_tag, h_tag)
+                lines, rows, sel = frame(view, sel)
                 # A session can exit while its confirmation is on screen. Matching
                 # on pid rather than on the row dict is what makes that detectable:
                 # every frame rebuilds the dicts, so identity and equality both
@@ -1441,6 +2380,15 @@ def main():
                     if key in ("m", "M"):
                         view = None if view == "models" else "models"
                         break
+                    if key in ("u", "U"):
+                        view = None if view == "usage" else "usage"
+                        break
+                    if key in ("g", "G"):
+                        view = None if view == "gateway" else "gateway"
+                        break
+                    if key in ("r", "R"):
+                        view = None if view == "remote" else "remote"
+                        break
                     if key in ("h", "H", "?"):
                         view = None if view == "help" else "help"
                         break
@@ -1497,6 +2445,7 @@ def main():
         if vt:
             sys.stdout.write("\033[?25h\n")  # restore the cursor on the way out
             sys.stdout.flush()
+        restore_vt()
 
 
 if __name__ == "__main__":

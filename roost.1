@@ -27,6 +27,18 @@ ports.
 127.0.0.1 ports \(em ollama, litellm, openwebui.
 .RE
 .PP
+The worker table's
+.B FLOW
+column is an ASCII sparkline of each session's recent token throughput,
+normalised to its own busiest sample, newest at the right; a dot is a sample
+with no flow. History begins when roost starts and nothing persists. The
+subagent table's
+.B CTX
+column reads tokens over the inferred window (48k/200k), and its
+.B AGENT
+column shows the agent's type (Explore/a812a) once the parent has recorded
+it, falling back to the hex id while the agent is still running.
+.PP
 Sessions are grouped by what it costs to ignore them rather than by size.
 .B NEAR LIMIT
 is about to stop working,
@@ -57,6 +69,16 @@ Start with the SUBAGENTS panel closed. Toggle it live with
 Start with the LOCAL MODELS panel open. Toggle it live with
 .BR m .
 .TP
+.B \-\-usage
+Start with the USAGE panel open. Toggle it live with
+.BR u .
+Set
+.B ROOST_WEEKLY_BUDGET
+(e.g. 60M) to show the week's cloud burn against a budget; calibrate the
+number from Claude Code's /usage once. The tally is an estimate read from
+transcripts, not the real Anthropic meter; models without a claude\- name
+are flagged (local) and excluded from the budget math.
+.TP
 .B \-\-interactive
 Start with interactive mode armed \(em the cursor,
 .BR x / y ,
@@ -82,8 +104,8 @@ Print the version and exit.
 .B space
 Repaint immediately instead of waiting out the interval.
 .TP
-.BR a ", " s ", " m ", " h
-Show the ADVICE, SUBAGENTS, LOCAL MODELS, or HELP panel; pressing the key
+.BR a ", " s ", " m ", " u ", " h
+Show the ADVICE, SUBAGENTS, LOCAL MODELS, USAGE, or HELP panel; pressing the key
 again closes it. Only one panel is open at a time, so asking for one closes
 the others. Opening more than one used to push the rest past the bottom of
 the terminal, which looked like the key had done nothing.

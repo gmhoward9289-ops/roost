@@ -10,13 +10,13 @@ One file, no dependencies, Python 3.9+. Runs on macOS, Linux and Windows.
 ![roost watching a fleet: buckets, subagents, the advice panel, and a cancelled stop](demo/roost-demo.gif)
 
 ```
-  WORKER    MODEL    CTX  IDLE    TASK
+  WORKER    MODEL    CTX  TOKENS  FLOW             IDLE    TASK
 NEAR LIMIT
-  demo-a1   opus-5   85%  12s     refactor the parser
+  demo-a1   opus-5   85%  170k       ..:-=+#+=-..  12s     refactor the parser
 PARKED + COSTLY
-  demo-b2   opus-5   61%  4h10m   audit the build scripts
+  demo-b2   opus-5   61%  122k    ..............   4h10m   audit the build scripts
 WORKING NOW
-  demo-c3   fable-5  22%  3s      add integration tests
+  demo-c3   fable-5  22%  44k          ...:=+*#+   3s      add integration tests
 STARTING
   demo-d4   -        -    -
 
@@ -25,9 +25,9 @@ QUIET (4)  demo-e5 . demo-f6 . demo-g7 . demo-h8
 8 worker(s)  |  fable-5, opus-5
 
 SUBAGENTS
-  STATE    AGENT       MODEL     CTX  IDLE   TASK
-  working  a812aca59f  opus-5    33%  2s     survey the config loaders
-  idle     adaffaba4b  sonnet-5  67%  1h22m  draft the migration notes
+  STATE    AGENT          MODEL     CTX       IDLE   TASK
+  working  Explore/a812a  opus-5    66k/200k  2s     survey the config loaders
+  idle     adaffaba4b     sonnet-5  484k/1M   1h22m  draft the migration notes
 
   2 subagent(s), 1 working
 
@@ -119,7 +119,20 @@ roost -1           one frame, then exit
 roost --json       joined records, for piping
 ```
 
-While running: `space` refresh now · `a` advice panel · `s` subagents panel · `m` local models panel · `h` or `?` what am I looking at · `i` arm interactive · `q` quit
+While running: `space` refresh now · `a` advice panel · `s` subagents panel · `m` local models panel · `u` usage panel · `g` gateway panel · `r` remote panel · `h` or `?` what am I looking at · `i` arm interactive · `q` quit
+
+The `FLOW` column is a sparkline of each session's recent token throughput —
+context growth per refresh, normalised to its own busiest moment, newest at the
+right. A `.` is a sample with no flow; the ramp `:-=+*#` is increasing activity.
+It is ASCII on purpose (block-drawing characters mojibake in the Windows
+console) and starts empty: history begins when roost starts, nothing persists.
+
+The subagent `CTX` column reads `48k/200k` — tokens loaded over the window.
+The window is inferred (the smallest standard tier the observed usage fits in),
+because nothing in a transcript records which window the session was opened
+with. The `AGENT` column shows the agent's type (`Explore/a812a`) once the
+parent has recorded it — which only happens when the agent finishes, so a
+still-running agent shows its hex id.
 
 ## Acting on a session
 
@@ -160,8 +173,8 @@ roost refuses to stop its own process or its parent — run it from inside the
 session it is pointed at and the cursor can land on the row that owns your
 terminal.
 
-Only one panel is open at a time: `a`, `s`, `m`, and `h` flip between ADVICE,
-SUBAGENTS, LOCAL MODELS, and HELP rather than stacking. With two dozen sessions
+Only one panel is open at a time: `a`, `s`, `m`, `u`, `g`, `r`, and `h` flip between
+ADVICE, SUBAGENTS, LOCAL MODELS, USAGE, GATEWAY, REMOTE, and HELP rather than stacking. With two dozen sessions
 on screen a stacked second panel lands below the bottom of the terminal, which
 is indistinguishable from the key not working. For the same reason the frame
 now says `... N more line(s) below` instead of quietly truncating.
@@ -170,8 +183,9 @@ now says `... N more line(s) below` instead of quietly truncating.
 
 `h` or `?` opens a HELP panel — not a keybinding reference (the footer hint
 already lists the keys), but a one-line-each rundown of what each screen on
-the display means: INFRA, WORKERS, SUBAGENTS, ADVICE, LOCAL MODELS. roost is
-small enough that this is the whole manual.
+the display means: INFRA, WORKERS, SUBAGENTS, ADVICE, LOCAL MODELS, USAGE,
+GATEWAY, REMOTE.
+roost is small enough that this is the whole manual.
 
 ## Local models
 
@@ -184,6 +198,86 @@ Press `m` for the full picture: every model `ollama list` knows about, each
 row showing disk size, residency, VRAM when loaded, and how long until Ollama
 unloads it. It reads `/api/tags` merged with `/api/ps`; if Ollama isn't
 running, the panel says so instead of showing nothing.
+
+## Usage and the weekly budget
+
+`u` opens the USAGE panel: tokens per day per model over the last week, tallied
+from the transcripts on disk (input + output from each assistant turn; cache
+reads are excluded on purpose — they are billed and limited differently, and
+counting them would swamp the number with re-reads of unchanged context).
+
+```
+USAGE  observed transcript tokens (input+output) -- an estimate, not the Anthropic meter
+  2026-08-02  2.9M  opus-5 1.6M, sonnet-5 965k, fable-5 253k <- today
+  2026-08-01  9.1M  opus-5 4.5M, fable-5 3.3M, sonnet-5 984k
+  2026-07-29  1.9M  gemma4-32k (local) 5.3M, opus-5 1.9M
+
+  today 2.9M  |  7d 24.8M cloud  / 60.0M budget (41%)
+```
+
+Two honesty rules bake into this panel. First, **it is an estimate, not the
+Anthropic meter** — there is no local file or API that records a plan's real
+rate-limit balance, so the budget is a number you set yourself:
+
+```bash
+export ROOST_WEEKLY_BUDGET=60M    # or 850k, or a plain token count
+```
+
+Run `/usage` inside Claude Code once, pick a number that matches what it shows,
+and the panel tracks your burn against it from then on. Unset, the tallies show
+without the budget fraction. Second, **local models are free** — anything
+without a `claude-` model name (Ollama via LiteLLM writes transcripts too) is
+flagged `(local)` in the breakdown and excluded from the cloud totals and the
+budget math.
+
+The first `u` scans a week of transcripts and can pause for a moment; after
+that only appended bytes are read, so keeping the panel open costs almost
+nothing. Day boundaries are UTC, because transcript timestamps are.
+
+## Gateway and batch runs
+
+`g` opens the GATEWAY panel: whether the LiteLLM proxy answers on
+`127.0.0.1:4000`, plus one row per batch-extraction run under the batch
+directory (`ROOST_BATCH_DIR`, default `~/litellm-server/batch`):
+
+```
+GATEWAY
+  litellm up (127.0.0.1:4000)   last request 42s ago   3 req/min
+  jobs queue: inbox 0  running 1  done 12  failed 0
+  BATCH RUN              MODEL           DONE/TOTAL  FAIL  RATE   ETA    LAST
+  results-laneB-derived  gemma4-32k      121/300     2     64/hr  2h48m  35s ago
+  results-laneA-derived  qwen-coder-16k  5/5         0     -      done   3d ago
+```
+
+The proxy itself is asked nothing beyond "are you up" — a DB-less LiteLLM
+keeps no request history (every activity endpoint 400s), so progress is
+derived from the batch pipeline's own output files: one JSON per finished
+item means done/total, failure count, write rate, and ETA all fall out of a
+directory listing. Runs whose `extract.py` wrote a `_run.json` breadcrumb show
+their model and worklist; older runs still appear, just with less detail.
+Green rows are actively writing; the last-request/req-per-min figures are a
+best-effort read of `proxy.log`'s tail and disappear rather than guess when
+the log doesn't parse. The `jobs queue` line counts the file-based job queue's
+dirs (`JOBS_ROOT`, default `~/jobs`) if present.
+
+## Remote hosts
+
+`r` opens the REMOTE panel — other machines' roost, over ssh:
+
+```
+REMOTE
+  HOST    WORKERS  WORKING  RESIDENT MODELS  BATCH                      JOBS              AGE
+  hyrule  8        2        -                -                          in 0 run 1 fail 0  12s
+```
+
+Hosts come from `ROOST_REMOTES` (comma-separated ssh aliases, default
+`hyrule`) — from the environment only, never from file contents. Each host is
+fetched with `ssh <host> roost --json` on a background thread and cached: an
+unreachable host (a closed laptop lid) keeps its last good row with the AGE
+column saying how old it is, instead of hanging the display. Only the very
+first fetch per host blocks, which is what makes `roost --remote -1` useful.
+`ROOST_REMOTE_CMD` overrides the remote command if roost lives somewhere the
+non-login ssh PATH can't see.
 
 ## What it logs
 
