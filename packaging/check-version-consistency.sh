@@ -45,26 +45,34 @@ report() { # <artifact> <found> <want>
 man_version=$(sed -n '1s/.*"roost \([^"]*\)".*/\1/p' roost.1)
 report "roost.1 .TH header" "$man_version" "$VERSION"
 
-# --- Homebrew formula: the tag and filename in the source URL -----------------
-# The formula also carries an explicit `version`, since a releases/download/
-# URL doesn't let Homebrew infer it reliably the way the old archive/refs/tags/
-# URL did -- that explicit line is what `brew install` actually reads.
-rb_url_tag=$(sed -n 's#.*url "https://github.com/[^"]*/releases/download/v\([^/]*\)/.*".*#\1#p' \
-             packaging/roost.rb)
-report "roost.rb url tag" "$rb_url_tag" "$VERSION"
-
-rb_url_file=$(sed -n 's#.*url ".*/roost_top-\([^"]*\)\.tar\.gz".*#\1#p' \
-              packaging/roost.rb)
-report "roost.rb url filename" "$rb_url_file" "$VERSION"
-
+# --- Homebrew formula ---------------------------------------------------------
+# The version appears in the formula EXACTLY ONCE, on the marked `version`
+# line; the url interpolates it. The old shape embedded it twice on the url
+# line and release-please rewrote only the first occurrence -- v0.6.0 failed
+# this very gate on .../download/v0.6.0/roost_top-0.5.0.tar.gz. So the url
+# check is structural now: assert the interpolation is present, so a literal
+# version can never sneak back into a line release-please half-updates.
 rb_version=$(sed -n 's/^\s*version "\([^"]*\)".*/\1/p' packaging/roost.rb)
 report "roost.rb version" "$rb_version" "$VERSION"
 
-# The refresh-checksum comment above it should point at the same tag, or the
-# next person recomputes the wrong tarball's hash and "fixes" it wrongly.
-rb_hint=$(sed -n 's#.*curl -sL https://github.com/[^ ]*/releases/download/v\([0-9][^/]*\)/.*\.tar\.gz.*#\1#p' \
-          packaging/roost.rb | head -1)
-report "roost.rb curl comment" "$rb_hint" "$VERSION"
+if grep -qE '^\s*url ".*download/v#\{version\}/roost_top-#\{version\}\.tar\.gz"' \
+     packaging/roost.rb; then
+  printf '  ok    %-22s interpolates #{version}\n' "roost.rb url"
+else
+  echo "  DRIFT roost.rb url          must interpolate #{version} for BOTH the tag and the filename" >&2
+  fail=1
+fi
+
+# No other version literal may appear anywhere in the formula -- one copy, on
+# the marked line, is the whole design.
+# (python@3.x interpreter pins are not release versions; exclude them.)
+rb_literals=$(grep -oE '\b[0-9]+\.[0-9]+(\.[0-9]+)?\b' packaging/roost.rb | grep -vE '^3\.[0-9]+$' | sort -u)
+if [ "$rb_literals" = "$VERSION" ]; then
+  printf '  ok    %-22s single version literal\n' "roost.rb literals"
+else
+  echo "  DRIFT roost.rb literals      found: $(echo $rb_literals | tr '\n' ' ') want only: $VERSION" >&2
+  fail=1
+fi
 
 # --- pyproject: version must be sourced from roost.py, not restated -----------
 # A literal `version = "..."` here would be a third copy to drift.
