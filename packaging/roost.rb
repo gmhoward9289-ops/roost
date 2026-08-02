@@ -1,8 +1,10 @@
 # Homebrew formula for roost.
 #
-# This is the master copy; it is consumed by copying it to Formula/roost.rb in
-# the tap repo (gmhoward9289-ops/homebrew-tap), which is what `brew install`
-# reads. It lives here so the formula is versioned alongside the code it builds.
+# This is the master copy; the homebrew-tap job in release.yml copies it to
+# Formula/roost.rb in the tap repo (gmhoward9289-ops/homebrew-tap) on every
+# tagged release, computing a fresh sha256 for that tag's tarball as it goes --
+# so the url/sha256 below are last-release documentation, not what ships. It
+# lives here so the formula is versioned alongside the code it builds.
 #
 # homebrew-core is not an option yet -- it requires notability thresholds
 # (stars/forks/watchers) that this project has not met.
