@@ -580,7 +580,9 @@ def collect_subagents(live_sids):
 
         rows.append({
             "agent_id": agent_id,
-            "agent_type": meta.get("type") or "",
+            # Sanitised like task text: it comes out of a transcript, and a
+            # crafted agentType could otherwise carry escapes into the TUI.
+            "agent_type": ascii_safe(meta.get("type") or ""),
             "parent_sid": parent_sid,
             "task": label,
             "model": model,
@@ -764,7 +766,8 @@ def _tally_lines(lines, counts):
             continue
         # Raw model name kept: the "claude-" prefix is what later separates
         # cloud burn (counts against the plan) from local models (free).
-        model = msg.get("model") or "?"
+        # Sanitised: it is transcript text headed for the TUI.
+        model = ascii_safe(msg.get("model") or "?") or "?"
         tok = (usage.get("input_tokens") or 0) + (usage.get("output_tokens") or 0)
         key = (day, model)
         counts[key] = counts.get(key, 0) + tok
@@ -1256,10 +1259,13 @@ HELP_SCREENS = (
      "ollama / litellm / openwebui: up or down, plus what's resident in Ollama's VRAM right now."),
     ("WORKERS", None,
      "every live Claude Code session: model, context window used, idle time, current task. "
-     "QUIET collapses idle sessions to one line; raise the cursor to expand it."),
+     "FLOW is a sparkline of recent token throughput -- '.' is a quiet sample, the ramp is "
+     "activity; history starts when roost starts. QUIET collapses idle sessions to one line; "
+     "raise the cursor to expand it."),
     ("SUBAGENTS", "s",
      "work a session farmed out. Invisible in any pid-based view, since a subagent shares its "
-     "parent's process rather than running as one of its own."),
+     "parent's process rather than running as one of its own. AGENT shows the agent's type once "
+     "it finishes (hex id while running); CTX is tokens over the inferred window."),
     ("ADVICE", "a",
      "concrete actions, ranked by how many tokens each would save -- which sessions are "
      "expensive to resume, near their context limit, or just idle clutter."),
@@ -1269,9 +1275,9 @@ HELP_SCREENS = (
     ("USAGE", "u",
      "tokens per day per model over the last week, tallied from the transcripts on disk. "
      "An estimate of burn, not the real Anthropic meter; set ROOST_WEEKLY_BUDGET to see "
-     "it as a share of your plan. First open scans a week of transcripts and can pause "
-     "for a moment; after that it reads only what was appended. History via FLOW starts "
-     "when roost starts."),
+     "it as a share of your plan. Local (non claude-*) models are flagged and excluded "
+     "from the budget math. First open scans a week of transcripts and can pause for a "
+     "moment; after that it reads only what was appended."),
 )
 
 
