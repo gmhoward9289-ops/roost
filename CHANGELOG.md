@@ -15,6 +15,27 @@ deliberately no `Unreleased` heading: unreleased work lives in the open release
 PR, and a hand-maintained section would sort below each new generated one and
 drift out of date.
 
+## [0.6.0](https://github.com/gmhoward9289-ops/roost/compare/v0.5.0...v0.6.0) (2026-08-02)
+
+
+### Added
+
+* add winget packaging (Windows exe build + winget-pkgs PR) ([#24](https://github.com/gmhoward9289-ops/roost/issues/24)) ([fa7a740](https://github.com/gmhoward9289-ops/roost/commit/fa7a7405b82f0905caa5cf1a5d0c7045fd03938d))
+* agent types, absolute CTX, FLOW sparkline, and a USAGE panel ([#26](https://github.com/gmhoward9289-ops/roost/issues/26)) ([391269c](https://github.com/gmhoward9289-ops/roost/commit/391269c7505d36ed01d12a16fc8946bfa626c746))
+* GATEWAY and REMOTE panels, model-name window resolution ([#36](https://github.com/gmhoward9289-ops/roost/issues/36)) ([84ba4cd](https://github.com/gmhoward9289-ops/roost/commit/84ba4cdbda947754cc08933074640c2339141ecc))
+* total the fleet, and show what each session is adding ([#37](https://github.com/gmhoward9289-ops/roost/issues/37)) ([9c286f7](https://github.com/gmhoward9289-ops/roost/commit/9c286f78c456f8fdd4a03830431b292c92108642))
+
+
+### Fixed
+
+* restore the terminal fully on exit and stop the cache leaks ([#29](https://github.com/gmhoward9289-ops/roost/issues/29)) ([8e2b0db](https://github.com/gmhoward9289-ops/roost/commit/8e2b0db0616a03d30a8e5cb64214b781b1215b09))
+* stop the render loop blocking on infra socket probes ([#33](https://github.com/gmhoward9289-ops/roost/issues/33)) ([8fb25c0](https://github.com/gmhoward9289-ops/roost/commit/8fb25c01e44414a59104cec26e4b87cc3127f97d))
+
+
+### Documentation
+
+* repo structure, changelog catch-up, contributing/security, comment fixes ([#32](https://github.com/gmhoward9289-ops/roost/issues/32)) ([8ffdca6](https://github.com/gmhoward9289-ops/roost/commit/8ffdca6a8562d5157d9993eebb6e1a6fe7255c56))
+
 ## [0.5.0](https://github.com/gmhoward9289-ops/roost/compare/v0.4...v0.5.0) (2026-08-02)
 
 ### Added

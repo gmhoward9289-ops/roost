@@ -21,15 +21,15 @@
 # formula to the tap repo, so no manual step is needed. This line is kept in
 # the same shape release-please/check-version-consistency.sh expect, as a
 # record of what that job effectively runs:
-#   curl -sL https://github.com/gmhoward9289-ops/roost/releases/download/v0.5.0/roost_top-0.5.0.tar.gz | shasum -a 256   # x-release-please-version
+#   curl -sL https://github.com/gmhoward9289-ops/roost/releases/download/v0.6.0/roost_top-0.5.0.tar.gz | shasum -a 256   # x-release-please-version
 class Roost < Formula
   include Language::Python::Shebang
 
   desc "top for Claude Code: live sessions, context use, and their subagents"
   homepage "https://github.com/gmhoward9289-ops/roost"
-  url "https://github.com/gmhoward9289-ops/roost/releases/download/v0.5.0/roost_top-0.5.0.tar.gz" # x-release-please-version
+  url "https://github.com/gmhoward9289-ops/roost/releases/download/v0.6.0/roost_top-0.5.0.tar.gz" # x-release-please-version
   sha256 "87f1c68bc6d1b3c383ebec53e8e4a8d9ad197fd54b1a29abe70e2942dd625dda"
-  version "0.5.0" # x-release-please-version
+  version "0.6.0" # x-release-please-version
   license "MIT"
 
   depends_on "python@3.13"
