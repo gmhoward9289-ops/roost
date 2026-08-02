@@ -1,6 +1,8 @@
 # roost
 
 [![ci](https://github.com/gmhoward9289-ops/roost/actions/workflows/ci.yml/badge.svg)](https://github.com/gmhoward9289-ops/roost/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/roost-top)](https://www.npmjs.com/package/roost-top)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 `top` for Claude Code. Every live session, the model it is on, how much context
 it has burned — and, unlike anything else, **the subagents it spawned**.
@@ -8,6 +10,10 @@ it has burned — and, unlike anything else, **the subagents it spawned**.
 One file, no dependencies, Python 3.9+. Runs on macOS, Linux and Windows.
 
 ![roost watching a fleet: buckets, subagents, the advice panel, and a cancelled stop](demo/roost-demo.gif)
+
+The short ambient loop below is the same program, idling:
+
+![roost's ambient loop, sessions ticking quietly](demo/roost-loop.gif)
 
 ```
   WORKER    MODEL    CTX  IDLE    TASK
@@ -56,10 +62,11 @@ sudo apt install roost
 ```
 
 Or, without adding a repo — grab `roost_<version>_all.deb` from the
-[latest release](https://github.com/gmhoward9289-ops/roost/releases/latest):
+[latest release](https://github.com/gmhoward9289-ops/roost/releases/latest)
+and install that file directly, e.g.:
 
 ```bash
-sudo apt install ./roost_0.4_all.deb
+sudo apt install ./roost_<version>_all.deb
 ```
 
 Both resolve `python3` exactly as a normal repo install would. The repo is
@@ -264,6 +271,26 @@ are real asks, not decoration: Linux field reports, a canary test for the
 undocumented on-disk format, adapters for other agent CLIs (gated on demand —
 comment if you would use one), and config seams for the window tiers and the
 ADVICE thresholds.
+
+## Repo structure
+
+- `roost.py` — the entire program. One file, stdlib only.
+- `bin/roost.js` — the npm wrapper; locates a Python interpreter and runs
+  `roost.py` under it.
+- `packaging/` — the Homebrew formula (`roost.rb`), the `.deb` build
+  (`build-deb.sh`), the version-consistency check that CI runs on every PR
+  (`check-version-consistency.sh`), and the apt signing key (`apt/`).
+- `tests/` — the unittest suite `ci.yml` runs on Linux, macOS and Windows.
+- `demo/` — the vhs tapes and GIFs in this README, plus the fleet stager that
+  produces the staged data they record against.
+- `.github/workflows/` — `ci.yml` (tests, packaging checks, semgrep),
+  `release.yml` (publishes a tagged release to PyPI, npm and the Homebrew
+  tap), `release-please.yml` (maintains the release PR), and
+  `pr-title-lint.yml` (enforces conventional commit titles on PRs).
+
+## Release notes
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
