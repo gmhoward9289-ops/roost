@@ -46,6 +46,28 @@ is about to stop working,
 bills its whole context on the next turn, and
 .B QUIET
 collapses to a single line until a cursor is raised.
+.PP
+The
+.B TREND
+column is how much context the session has added over its last few turns, read
+back out of the transcript rather than accumulated while roost runs \(em so it
+is populated on the first frame and under
+.BR \-\-once .
+It is an amount rather than a shape or an arrow because context inside a
+session only ever rises: it falls solely on
+.BR /compact ,
+so a sparkline of context would draw the same ramp on every row. A session
+creeping up 2k a turn and one adding 22k look identical in
+.B CTX
+and differ here. It is not a second reading of
+.BR FLOW ,
+which sparks throughput sampled while roost runs and starts empty; this is an
+amount already in the transcript when roost opens it.
+.PP
+The last line totals the fleet: sessions, context held across all of them,
+context added over the same window, and how many are near their limit. Context
+held is what a sweep would reclaim. Percentages are deliberately not totalled,
+being fractions of different windows.
 .SH OPTIONS
 .TP
 .BR \-w ", " \-\-watch " " [\fISECS\fR]
@@ -219,6 +241,14 @@ single call, and scoring that against 200k yields a nonsense reading.
 .PP
 Context itself is an estimate \(em the last assistant turn's input, cache-read
 and cache-creation tokens summed over that window.
+.PP
+.B TREND
+on an idle session describes when it was last working, not now. Read it beside
+.BR IDLE :
+a large figure on a session idle an hour says it grew fast an hour ago. It also
+spans however many turns are left in the transcript tail, so a young session
+shows a shorter span than an old one and a session with one turn shows
+.BR \- .
 .PP
 The ADVICE panel's thresholds are tuned to one person's usage.
 .SH FILES

@@ -88,6 +88,13 @@ REFRESH_SECONDS = 1.0
 # Only the tail of a transcript matters and they grow to hundreds of MB.
 TAIL_BYTES = 262144
 
+# How many past context readings the TREND column spans. Turns, not seconds:
+# context only moves when a turn completes, so a time-based window would be
+# empty on a session that has been thinking for a minute and misleading on one
+# taking a turn a second. Kept small -- it is read out of the transcript tail,
+# and a long window would need a longer tail to fill.
+HISTORY_TURNS = 8
+
 # A subagent whose parent has exited is still worth seeing for a while -- usually
 # it is the run that just finished. Older than this and it is history.
 AGENT_RECENT_SECS = 3600
@@ -540,9 +547,17 @@ def read_tail(path, nbytes=TAIL_BYTES):
 
 
 def scan_transcript(path):
-    """Model and context from the newest assistant turn that carries usage."""
+    """Model and context from the newest assistant turn that carries usage.
+
+    Also the last HISTORY_TURNS context totals, oldest first, out of the same
+    backward walk. History read from the transcript rather than accumulated
+    across frames is populated on the very first frame and survives a restart,
+    so it works under --once and --json too -- a ring buffer kept in memory
+    would give neither, and at a 1s refresh would sample the same turn dozens
+    of times over.
+    """
     out = {"model": None, "ctx_tokens": None, "last_write": None,
-           "title": None, "prompt": None}
+           "title": None, "prompt": None, "ctx_history": []}
     if not path:
         return out
     _SEEN_PATHS.add(path)
@@ -578,19 +593,29 @@ def scan_transcript(path):
         if out["prompt"] is None and d.get("lastPrompt"):
             out["prompt"] = " ".join(str(d["lastPrompt"]).split())
 
-        if out["model"] is None:
-            msg = d.get("message") or {}
-            usage = msg.get("usage") or {}
-            if usage:
+        msg = d.get("message") or {}
+        usage = msg.get("usage") or {}
+        if usage:
+            total = (
+                (usage.get("input_tokens") or 0)
+                + (usage.get("cache_read_input_tokens") or 0)
+                + (usage.get("cache_creation_input_tokens") or 0)
+            )
+            if out["model"] is None:
                 out["model"] = msg.get("model")
-                out["ctx_tokens"] = (
-                    (usage.get("input_tokens") or 0)
-                    + (usage.get("cache_read_input_tokens") or 0)
-                    + (usage.get("cache_creation_input_tokens") or 0)
-                )
+                out["ctx_tokens"] = total
+            # A turn that used tools writes several assistant records carrying
+            # the same context total. Only a change is a new data point, or a
+            # tool-heavy turn would fill the whole window with one turn's value.
+            if len(out["ctx_history"]) < HISTORY_TURNS and (
+                    not out["ctx_history"] or out["ctx_history"][-1] != total):
+                out["ctx_history"].append(total)
 
-        if out["model"] and out["title"] and out["prompt"]:
+        if (out["model"] and out["title"] and out["prompt"]
+                and len(out["ctx_history"]) >= HISTORY_TURNS):
             break
+
+    out["ctx_history"].reverse()  # collected newest-first, reported oldest-first
 
     if out["last_write"] is not None:
         _SCAN_CACHE[path] = (out["last_write"], dict(out))
@@ -804,6 +829,9 @@ def collect_workers():
             "model": info["model"] or "-",
             "ctx_tokens": info["ctx_tokens"],
             "ctx_pct": pct,
+            # Oldest first, at most HISTORY_TURNS long. Emitted by --json too:
+            # the series is more use to a script than the rendered delta is.
+            "ctx_history": info["ctx_history"],
             "window": win_label,
             # The title Claude Code gave the session; the last prompt is the
             # fallback for sessions too young to have been named yet.
@@ -1509,6 +1537,24 @@ def advise(workers):
     return lines
 
 
+def growth(history):
+    """Context added across the retained turns -- the TREND cell.
+
+    A signed total, not a shape. Context inside a session only ever rises: it
+    falls solely on /compact. So a sparkline *of context* draws the same
+    monotonic ramp for every row and a rise/fall arrow points up on every row,
+    while the amount separates a session creeping by 2k a window from one
+    adding 21k. FLOW next door is a sparkline of throughput, not of context --
+    a different series, which is why it is worth a shape and this is not.
+    """
+    if not history or len(history) < 2:
+        return "-"
+    d = history[-1] - history[0]
+    if d == 0:
+        return "="
+    return ("+" if d > 0 else "-") + compact(abs(d))
+
+
 def dur(secs):
     if secs is None:
         return "-"
@@ -1626,6 +1672,11 @@ def render(workers, sel=None):
         ("CONTEXT", lambda r: bar(r["ctx_pct"])),
         ("CTX", lambda r: "-" if r["ctx_pct"] is None else "%.0f%%" % r["ctx_pct"]),
         ("TOKENS", lambda r: "-" if not r["ctx_tokens"] else compact(r["ctx_tokens"])),
+        # TREND and FLOW are not the same reading twice. TREND is an amount of
+        # context added, read back out of the transcript -- so it is populated
+        # on the first frame and survives --once and --json. FLOW is a shape
+        # sampled while roost runs and starts empty. How much, versus when.
+        ("TREND", lambda r: growth(r.get("ctx_history"))),
         ("FLOW", lambda r: r.get("flow") or " " * SPARK_LEN),
         ("IDLE", lambda r: dur(r["idle_secs"])),
     ]
@@ -1673,12 +1724,30 @@ def render(workers, sel=None):
         lines.append("")
         lines.append(c("QUIET (%d)  " % len(quiet), BOLD, DIM) + c(names, DIM))
 
+    # Totals, because the per-row numbers do not add up in your head. The one
+    # that matters is context held across the fleet: it is what a sweep would
+    # reclaim, and until now it was only answerable after the fact, from the
+    # stop log. Percentages are deliberately not totalled -- they are fractions
+    # of different windows, so their sum means nothing.
+    held = sum(r["ctx_tokens"] or 0 for r in workers)
+    added = sum(h[-1] - h[0] for h in
+                (r.get("ctx_history") or [] for r in workers) if len(h) >= 2)
+    near = sum(1 for r in workers if (r["ctx_pct"] or 0) >= NEAR_LIMIT_PCT)
+
     models = sorted(set(r["model"] for r in workers if r["model"] and r["model"] != "-"))
-    summary = "%d worker(s)" % len(workers)
+    summary = "%d worker(s)  |  %s held" % (len(workers), compact(held))
+    if added:
+        summary += "  |  %s last %d turns" % (compact(added), HISTORY_TURNS)
+    if near:
+        summary += "  |  " + c("%d near limit" % near, YELLOW)
     if models:
         summary += "  |  " + ", ".join(m.replace("claude-", "") for m in models)
     lines.append("")
-    lines.append(c(summary, BOLD))
+    # Re-arm BOLD after the inner colour's RESET, for the reason highlight()
+    # spells out: a RESET clears the line's bold along with the colour, so a
+    # naive wrap would leave everything after "near limit" unbolded. A no-op
+    # when COLOR is off, since then there are no escapes to replace.
+    lines.append(c(summary.replace(RESET, RESET + BOLD), BOLD))
     return lines
 
 
@@ -1760,6 +1829,11 @@ def style_cell(header, text, row):
         if pct >= 50:
             return c(text, YELLOW)
         return c(text, GREEN)
+    if header == "TREND":
+        # Dim, not coloured by size. Growth is normal -- every working session
+        # grows, and colouring it would put warning colour on healthy rows and
+        # compete with CTX, which is the column that actually says "act on me".
+        return c(text, DIM)
     if header == "MODEL":
         for family, code in MODEL_COLORS.items():
             if family in (row["model"] or ""):
@@ -1879,7 +1953,9 @@ HELP_SCREENS = (
      "ollama / litellm / openwebui: up or down, plus what's resident in Ollama's VRAM right now."),
     ("WORKERS", None,
      "every live Claude Code session: model, context window used, idle time, current task. "
-     "FLOW is a sparkline of recent token throughput -- '.' is a quiet sample, the ramp is "
+     "TREND is how much context the session added over its last few turns, read out of the "
+     "transcript, so it is filled in on the first frame. FLOW is a sparkline of recent token "
+     "throughput -- '.' is a quiet sample, the ramp is "
      "activity; history starts when roost starts. QUIET collapses idle sessions to one line; "
      "raise the cursor to expand it."),
     ("SUBAGENTS", "s",
