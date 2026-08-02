@@ -846,5 +846,25 @@ class TestAdviceNamesTheTask(unittest.TestCase):
                                              idle_secs=60)]))
         self.assertIn("nothing to act on", out)
 
+class TestUsageCacheEviction(unittest.TestCase):
+    """A deleted transcript's cache entry lived forever and its tokens were
+    still summed into the USAGE panel -- wrong numbers plus a slow leak."""
+
+    def setUp(self):
+        roost._USAGE_CACHE.clear()
+
+    def tearDown(self):
+        roost._USAGE_CACHE.clear()
+
+    def test_deleted_transcript_is_evicted_and_uncounted(self):
+        roost._USAGE_CACHE["gone.jsonl"] = {
+            "mtime": time.time(), "size": 10,
+            "counts": {("2026-08-01", "claude-opus-5"): 1234}}
+        days = roost.collect_usage()
+        self.assertNotIn("gone.jsonl", roost._USAGE_CACHE)
+        for byday in days.values():
+            self.assertNotIn(1234, byday.values())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

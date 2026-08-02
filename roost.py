@@ -786,11 +786,17 @@ def collect_usage():
     paths.update(glob.glob(
         str(PROJECTS_DIR / "*" / "*" / "subagents" / "agent-*.jsonl")))
 
+    # A deleted transcript never reappears in the glob, so its entry would sit
+    # in the cache forever -- still counted into the panel, and a slow leak.
+    for path in [p for p in _USAGE_CACHE if p not in paths]:
+        del _USAGE_CACHE[path]
+
     for path in paths:
         try:
             mtime = os.path.getmtime(path)
             size = os.path.getsize(path)
         except OSError:
+            _USAGE_CACHE.pop(path, None)  # deleted between glob and stat
             continue
         if mtime < cutoff:
             _USAGE_CACHE.pop(path, None)
