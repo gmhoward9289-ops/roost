@@ -80,6 +80,8 @@ PROJECTS_DIR = HOME / ".claude" / "projects"
 # task, or on hyrule, which has no browser control at all.
 USAGE_CACHE = HOME / "claude-usage" / "usage.json"
 USAGE_STALE_SECS = 4 * 2 * 3600  # 4x the scrape task's 2h cadence
+CREDITS_CACHE = HOME / "claude-usage" / "credits.json"  # written hourly by check-staleness.ps1
+USAGE_HISTORY = HOME / "claude-usage" / "history.jsonl"  # one row per distinct scrape, same writer
 
 # ---- config ----------------------------------------------------------------
 # Seconds between automatic repaints. Override per-run with `-w N`; space forces
@@ -932,7 +934,50 @@ def collect_usage_caps():
         return None
     last_success = data.get("last_success_epoch")
     data["age_secs"] = (time.time() - last_success) if last_success else None
+    try:
+        # utf-8-sig: the writer is PowerShell 5.1 Out-File, which prepends a BOM.
+        with open(CREDITS_CACHE, "r", encoding="utf-8-sig") as fh:
+            data["openrouter_credits"] = json.load(fh)
+    except (OSError, ValueError):
+        pass  # credits are an optional extra on the caps line, never load-bearing
+    data["burn"] = _burn_rates()
     return data
+
+
+def _burn_rates(window_hours=48):
+    """Trailing burn rate in pct/hour per weekly cap, from history.jsonl.
+
+    The runway view ("~2.1d left") needs this; the even-burn pace delta does
+    not. Rows after the most recent RESET (a pct drop) are the only valid
+    sample -- mixing across a reset would average in a cliff. Returns {} until
+    there are >=3 post-reset points spanning >=6h, so a fresh install or a
+    just-reset week quietly falls back to the pace display.
+    """
+    try:
+        with open(USAGE_HISTORY, "r", encoding="utf-8-sig") as fh:
+            rows = [json.loads(ln) for ln in fh if ln.strip()]
+    except (OSError, ValueError):
+        return {}
+    cutoff = time.time() - window_hours * 3600
+    rows = [r for r in rows if r.get("epoch", 0) >= cutoff]
+    out = {}
+    for key in ("weekly", "fable"):
+        pts = [(r["epoch"], r[key]) for r in rows
+               if isinstance(r.get(key), (int, float))]
+        # Drop everything before the most recent reset (pct decrease).
+        for i in range(len(pts) - 1, 0, -1):
+            if pts[i][1] < pts[i - 1][1]:
+                pts = pts[i:]
+                break
+        if len(pts) < 3:
+            continue
+        span_h = (pts[-1][0] - pts[0][0]) / 3600.0
+        if span_h < 6:
+            continue
+        rate = (pts[-1][1] - pts[0][1]) / span_h
+        if rate > 0:
+            out[key] = rate
+    return out
 
 
 def _iso_to_epoch(ts):
@@ -1795,21 +1840,62 @@ def render_usage_caps(usage):
     age = usage.get("age_secs")
     stale = age is not None and age > USAGE_STALE_SECS
 
-    def cell(key, tag):
+    burn = usage.get("burn") or {}
+
+    def cell(key, tag, window_hours=None, burn_key=None):
         c_ = caps.get(key) or {}
         if not c_.get("visible"):
             return None
         pct = c_.get("pct")
         if pct is None:
             return None
-        return "%s: %s" % (tag, c(str(pct) + "%", *_pct_color(pct)))
+        txt = "%s: %s" % (tag, c(str(pct) + "%", *_pct_color(pct)))
+        resets = c_.get("resets_epoch")
+        # Runway governor (preferred): will the cap run dry BEFORE its reset at
+        # the trailing burn rate? That's the only question that matters -- it
+        # legalizes front-loaded build weekends that even-burn pacing would
+        # flag, and catches slow-motion overruns that look calm day-to-day.
+        rate = burn.get(burn_key) if burn_key else None
+        if rate and resets:
+            runway_h = (100.0 - pct) / rate
+            reset_h = max(0.0, (resets - time.time()) / 3600.0)
+            if runway_h < reset_h:
+                style = (BOLD, RED)
+            elif runway_h < reset_h * 1.5:
+                style = (YELLOW,)
+            else:
+                style = (DIM,)
+            txt += c("~%.1fd left" % (runway_h / 24.0), *style)
+            return txt
+        # Fallback while history is thin: even-burn pace delta.
+        if window_hours and resets:
+            frac = 1.0 - (resets - time.time()) / (window_hours * 3600.0)
+            if 0.0 <= frac <= 1.0:
+                delta = pct - 100.0 * frac
+                if delta > 1:
+                    style = (BOLD, RED) if delta >= 20 else (YELLOW,)
+                    txt += c("(+%d)" % delta, *style)
+        return txt
 
     parts = [p for p in (
-        cell("five_hour", "5h"),
-        cell("weekly_all_models", "Weekly"),
-        cell("weekly_sonnet", "Sonnet"),
-        cell("fable5_max", "Fable5"),
+        cell("five_hour", "5h", 5),
+        cell("weekly_all_models", "Weekly", 168, "weekly"),
+        cell("weekly_sonnet", "Sonnet", 168),
+        cell("fable5_max", "Fable5", 168, "fable"),
     ) if p]
+
+    credits = usage.get("openrouter_credits") or {}
+    if credits.get("remaining") is not None:
+        rem = credits["remaining"]
+        # $10 is a full tank; yellow under half, red under $1 -- absolute dollars,
+        # not percent, since the balance only refills by an explicit purchase.
+        style = (BOLD, RED) if rem < 1 else (YELLOW,) if rem < 5 else (GREEN,)
+        parts.append("OR$: " + c("%.2f" % rem, *style))
+    spend = (usage.get("spend") or {}).get("gemini") or {}
+    if spend.get("spent_usd") is not None and spend.get("cap_usd"):
+        pct = 100.0 * spend["spent_usd"] / spend["cap_usd"]
+        parts.append("Gem$: " + c("%.2f/%.0f" % (spend["spent_usd"], spend["cap_usd"]),
+                                   *_pct_color(pct)))
 
     if not parts:
         return [label + c("cache present but no caps parsed", DIM), ""]
