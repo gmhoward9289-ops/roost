@@ -34,7 +34,13 @@ Three sources, all local and all read-only:
 
 WORKERS is what each session *is*; INFRA is what it is running against. hyrule has
 no local inference stack, so its INFRA panel reads "not running" -- that is
-accurate there, not a failure.
+accurate there, not a failure. Same story for anyone without a local gateway at
+all (pure openrouter or the Anthropic API, no litellm): INFRA just reads DOWN,
+harmless. If your ports differ from the 11434/4000/8080 defaults, override with
+ROOST_OLLAMA_PORT / ROOST_LITELLM_PORT / ROOST_OPENWEBUI_PORT (or the matching
+--ollama-port / --litellm-port / --openwebui-port flags, which win per-run).
+roost writes nothing to disk on your behalf besides its own run log
+(~/.claude/logs/roost.jsonl, off with --no-log) -- no config file, ever.
 
 Context is an estimate: the last assistant turn's input + cache_read +
 cache_creation, over the model's window. It tracks what Claude Code shows without
@@ -131,6 +137,17 @@ JOBS_DIR_ENV = "JOBS_ROOT"
 # ~2x the slower lane's per-item time (~110s for gemma; see the batch README).
 BATCH_ACTIVE_SECS = 240
 PROXY_LOG_TAIL = 65536
+
+# INFRA panel ports: env var first (so it persists across runs without a flag
+# every time), CLI flag overrides per-run. Someone with no local gateway at all
+# (pure openrouter/anthropic API, no litellm) just leaves these at the default
+# -- the port probe reads DOWN, same as hyrule reads its stack as not running.
+OLLAMA_PORT_ENV = "ROOST_OLLAMA_PORT"
+LITELLM_PORT_ENV = "ROOST_LITELLM_PORT"
+OPENWEBUI_PORT_ENV = "ROOST_OPENWEBUI_PORT"
+OLLAMA_PORT = int(os.environ.get(OLLAMA_PORT_ENV, 11434))
+LITELLM_PORT = int(os.environ.get(LITELLM_PORT_ENV, 4000))
+OPENWEBUI_PORT = int(os.environ.get(OPENWEBUI_PORT_ENV, 8080))
 
 # REMOTE panel: ssh aliases come from the environment only, never from file
 # contents -- anything writable over the network must not choose ssh targets.
@@ -300,11 +317,15 @@ def auto_compact_enabled(cwd):
     return True
 
 
-SERVICES = (
-    ("ollama", 11434, "/api/ps"),
-    ("litellm", 4000, "/health/liveliness"),
-    ("openwebui", 8080, "/health"),
-)
+def _services():
+    # A function, not a constant tuple, because the ports can change after
+    # import: main() applies CLI flags over the env-var defaults above before
+    # the first collect_infra() call.
+    return (
+        ("ollama", OLLAMA_PORT, "/api/ps"),
+        ("litellm", LITELLM_PORT, "/health/liveliness"),
+        ("openwebui", OPENWEBUI_PORT, "/health"),
+    )
 
 
 RESET = "\033[0m"
@@ -853,7 +874,7 @@ def collect_workers():
 
 def collect_infra():
     out = []
-    for name, port, path in SERVICES:
+    for name, port, path in _services():
         if not port_open(port):
             out.append({"name": name, "port": port, "up": False, "detail": "not running"})
             continue
@@ -1000,10 +1021,10 @@ def collect_local_models():
     fuller picture: everything `ollama list` knows about, with residency and a
     VRAM figure layered on top for whichever of those happen to be loaded.
     """
-    if not port_open(11434):
+    if not port_open(OLLAMA_PORT):
         return []
-    tags = http_json(11434, "/api/tags") or {}
-    ps = http_json(11434, "/api/ps") or {}
+    tags = http_json(OLLAMA_PORT, "/api/tags") or {}
+    ps = http_json(OLLAMA_PORT, "/api/ps") or {}
     resident = {m.get("name"): m for m in (ps.get("models") or [])}
     out = []
     for m in tags.get("models") or []:
@@ -1073,7 +1094,7 @@ def collect_gateway():
     pins the worklist and model; without it the run still shows, just with less.
     """
     now = time.time()
-    out = {"litellm_up": port_open(4000), "runs": [], "jobs": None,
+    out = {"litellm_up": port_open(LITELLM_PORT), "runs": [], "jobs": None,
            "last_req_secs": None, "req_per_min": None}
 
     root = _batch_root()
@@ -1164,7 +1185,7 @@ def render_gateway(gw):
     files carry the progress story."""
     lines = ["", c("GATEWAY", BOLD)]
     mark = c("up", GREEN) if gw["litellm_up"] else c("DOWN", BOLD, RED)
-    head = "  litellm %s (127.0.0.1:4000)" % mark
+    head = "  litellm %s (127.0.0.1:%d)" % (mark, LITELLM_PORT)
     if gw["last_req_secs"] is not None:
         head += "   last request %s ago" % dur(gw["last_req_secs"])
     if gw["req_per_min"] is not None:
@@ -2351,6 +2372,7 @@ def paint(lines, vt):
 
 
 def main():
+    global LOGGING, OLLAMA_PORT, LITELLM_PORT, OPENWEBUI_PORT
     ap = argparse.ArgumentParser(description="Live Claude workers and local infra on one screen.")
     ap.add_argument("-w", "--watch", nargs="?", const=REFRESH_SECONDS, type=float,
                     metavar="SECS",
@@ -2381,6 +2403,15 @@ def main():
                          "EXPERIMENTAL tag (default off; toggle live with 'i')")
     ap.add_argument("--no-log", action="store_true",
                     help="do not record stopped sessions to %s" % LOG_PATH)
+    ap.add_argument("--ollama-port", type=int, metavar="PORT",
+                    help="ollama port for the INFRA panel (default %d, or %s)"
+                         % (OLLAMA_PORT, OLLAMA_PORT_ENV))
+    ap.add_argument("--litellm-port", type=int, metavar="PORT",
+                    help="litellm port for the INFRA/GATEWAY panels (default %d, or %s)"
+                         % (LITELLM_PORT, LITELLM_PORT_ENV))
+    ap.add_argument("--openwebui-port", type=int, metavar="PORT",
+                    help="open-webui port for the INFRA panel (default %d, or %s)"
+                         % (OPENWEBUI_PORT, OPENWEBUI_PORT_ENV))
     ap.epilog = (
         "keys while running:  space = refresh now   a = advice panel   "
         "s = subagents panel   m = local models panel   u = usage panel   "
@@ -2391,8 +2422,13 @@ def main():
         "x = stop the session (confirms)   y = copy its sessionId   esc = deselect")
     args = ap.parse_args()
 
-    global LOGGING
     LOGGING = not args.no_log
+    if args.ollama_port is not None:
+        OLLAMA_PORT = args.ollama_port
+    if args.litellm_port is not None:
+        LITELLM_PORT = args.litellm_port
+    if args.openwebui_port is not None:
+        OPENWEBUI_PORT = args.openwebui_port
 
     if args.json:
         print(json.dumps({
