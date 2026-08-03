@@ -27,6 +27,17 @@ ports.
 127.0.0.1 ports \(em ollama, litellm, openwebui.
 .RE
 .PP
+Without a local gateway at all (pure openrouter or the Anthropic API, no
+litellm) the INFRA panel simply reads everything DOWN \(em harmless, the same
+as it reads on a machine with no local inference stack at all. If your ports
+differ from the 11434/4000/8080 defaults, see
+.B \-\-ollama\-port ,
+.B \-\-litellm\-port ,
+and
+.B \-\-openwebui\-port
+below, or their environment-variable equivalents under
+.B ENVIRONMENT .
+.PP
 The worker table's
 .B FLOW
 column is an ASCII sparkline of each session's recent token throughput,
@@ -118,6 +129,18 @@ is set in the environment or when output is not a terminal.
 Do not record stopped sessions. See
 .B LOGGING
 below.
+.TP
+.BI \-\-ollama\-port " PORT"
+Ollama port for the INFRA panel. Default 11434, or
+.BR ROOST_OLLAMA_PORT .
+.TP
+.BI \-\-litellm\-port " PORT"
+Litellm port for the INFRA and GATEWAY panels. Default 4000, or
+.BR ROOST_LITELLM_PORT .
+.TP
+.BI \-\-openwebui\-port " PORT"
+Open-webui port for the INFRA panel. Default 8080, or
+.BR ROOST_OPENWEBUI_PORT .
 .TP
 .B \-\-version
 Print the version and exit.
@@ -230,6 +253,22 @@ exits 0 unless it could not parse its arguments.
 If set to any value, colour output is disabled. See
 .UR https://no-color.org
 .UE .
+.TP
+.B ROOST_OLLAMA_PORT
+Ollama port for the INFRA panel, default 11434. A CLI flag of the same shape
+(see
+.B OPTIONS )
+overrides this per-run.
+.TP
+.B ROOST_LITELLM_PORT
+Litellm port for the INFRA and GATEWAY panels, default 4000.
+.TP
+.B ROOST_OPENWEBUI_PORT
+Open-webui port for the INFRA panel, default 8080.
+.PP
+None of these are read from a config file \(em roost has none, and never
+writes one. Env vars persist across runs by living in your shell profile; a
+CLI flag overrides for one run only.
 .SH CAVEATS
 roost reads an undocumented on-disk format that can change without warning.
 Treat breakage as expected rather than exceptional.
