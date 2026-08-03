@@ -15,6 +15,13 @@ deliberately no `Unreleased` heading: unreleased work lives in the open release
 PR, and a hand-maintained section would sort below each new generated one and
 drift out of date.
 
+## [0.6.1](https://github.com/gmhoward9289-ops/roost/compare/v0.6.0...v0.6.1) (2026-08-02)
+
+
+### Fixed
+
+* state the formula version exactly once so release-please cannot half-update it ([#39](https://github.com/gmhoward9289-ops/roost/issues/39)) ([877096c](https://github.com/gmhoward9289-ops/roost/commit/877096cb93fc62751592c4d8c7505e56a2d1ee31))
+
 ## [0.6.0](https://github.com/gmhoward9289-ops/roost/compare/v0.5.0...v0.6.0) (2026-08-02)
 
 
