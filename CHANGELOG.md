@@ -15,6 +15,14 @@ deliberately no `Unreleased` heading: unreleased work lives in the open release
 PR, and a hand-maintained section would sort below each new generated one and
 drift out of date.
 
+## [0.7.0](https://github.com/gmhoward9289-ops/roost/compare/v0.6.1...v0.7.0) (2026-08-04)
+
+
+### Added
+
+* lay the group labels and HELP panel out in rows ([#41](https://github.com/gmhoward9289-ops/roost/issues/41)) ([bb5b18b](https://github.com/gmhoward9289-ops/roost/commit/bb5b18bbb61c30d776908907f4721791a144056b))
+* make INFRA panel ports configurable ([#47](https://github.com/gmhoward9289-ops/roost/issues/47)) ([49cbfca](https://github.com/gmhoward9289-ops/roost/commit/49cbfca022238770fe5813ca71485427231967fb))
+
 ## [0.6.1](https://github.com/gmhoward9289-ops/roost/compare/v0.6.0...v0.6.1) (2026-08-02)
 
 
