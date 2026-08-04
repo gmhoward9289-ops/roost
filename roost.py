@@ -25,12 +25,15 @@ was pressed, never on an index re-resolved afterwards -- rows reorder between
 frames as sessions go quiet, and an index that outlived its frame would
 eventually hit the wrong one.
 
-Three sources, all local and all read-only:
+Sources, all local and all read-only:
 
-  ~/.claude/sessions/<pid>.json    live workers: pid, sessionId, launch cwd, name
-  ~/.claude/projects/*/<sid>.jsonl the transcript -- model in use, and the usage
-                                   block that gives context actually consumed
+  ~/.claude/sessions/<pid>.json    Claude Code workers: pid, sessionId, cwd, name
+  ~/.claude/projects/*/<sid>.jsonl Claude transcripts -- model, usage, task text
+  ~/.cursor/projects/*/agent-transcripts/*/*.jsonl
+                                   Cursor composers (no pid; freshness from mtime)
   127.0.0.1 ports                  ollama / litellm / openwebui
+
+Backends default to both Claude Code and Cursor (ROOST_BACKENDS=claude,cursor).
 
 WORKERS is what each session *is*; INFRA is what it is running against. hyrule has
 no local inference stack, so its INFRA panel reads "not running" -- that is
@@ -78,6 +81,11 @@ __version__ = "0.7.0"
 HOME = Path.home()
 SESSIONS_DIR = HOME / ".claude" / "sessions"
 PROJECTS_DIR = HOME / ".claude" / "projects"
+CURSOR_HOME_ENV = "CURSOR_AGENT_HOME"
+CURSOR_HOME = Path(os.environ.get(CURSOR_HOME_ENV, str(HOME / ".cursor")))
+CURSOR_PROJECTS_DIR = CURSOR_HOME / "projects"
+BACKENDS_ENV = "ROOST_BACKENDS"
+CURSOR_MAX_IDLE_ENV = "ROOST_CURSOR_MAX_IDLE_SECS"
 
 # The real Anthropic meter -- session/weekly/Fable caps -- has no local source;
 # this cache is written by the "claude-usage-scrape" scheduled task (a Claude
@@ -164,6 +172,9 @@ REMOTE_TIMEOUT_SECS = 15
 # as the hook logs next to it, so the same one-liners read all of them.
 LOG_PATH = HOME / ".claude" / "logs" / "roost.jsonl"
 LOG_MAX_LINES = 5000
+
+# Cursor composers have no pid; show any transcript touched within this window.
+CURSOR_MAX_IDLE_SECS = int(os.environ.get(CURSOR_MAX_IDLE_ENV, "86400"))
 # -----------------------------------------------------------------------------
 
 # Set in main(); --no-log turns it off.
@@ -798,7 +809,163 @@ def collect_subagents(live_sids):
     return rows
 
 
-def collect_workers():
+def _backends():
+    raw = os.environ.get(BACKENDS_ENV, "claude,cursor")
+    return {b.strip().lower() for b in raw.split(",") if b.strip()}
+
+
+def cursor_project_slug(path):
+    """Cursor's ~/.cursor/projects/<slug> encoding for an absolute path."""
+    p = Path(path).resolve()
+    parts = []
+    if p.drive:
+        parts.append(p.drive.rstrip(":").lower())
+    parts.extend(p.parts[1:] if p.drive else p.parts)
+    return "-".join(parts)
+
+
+def _cursor_task_from_text(text):
+    if not text:
+        return ""
+    m = re.search(r"<user_query>\s*(.*?)\s*</user_query>", text, re.DOTALL)
+    if m:
+        return " ".join(m.group(1).split())
+    return " ".join(str(text).split())
+
+
+def scan_cursor_transcript(path):
+    """Model and context from Cursor agent-transcript JSONL."""
+    out = {"model": None, "ctx_tokens": None, "last_write": None,
+           "title": None, "prompt": None, "ctx_history": []}
+    if not path:
+        return out
+    _SEEN_PATHS.add(path)
+    try:
+        out["last_write"] = os.path.getmtime(path)
+    except OSError:
+        pass
+
+    cached = _SCAN_CACHE.get(path)
+    if cached is not None and cached[0] == out["last_write"]:
+        return dict(cached[1])
+
+    for line in reversed(read_tail(path)):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        role = d.get("role")
+        msg = d.get("message") or {}
+        if role == "user" and out["prompt"] is None:
+            content = msg.get("content")
+            text = ""
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text = part.get("text") or ""
+                        break
+            elif isinstance(content, str):
+                text = content
+            out["prompt"] = _cursor_task_from_text(text)
+
+        if role != "assistant":
+            continue
+        usage = msg.get("usage") or d.get("usage") or {}
+        if not usage:
+            continue
+        ctx = (
+            (usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+            + (usage.get("cache_read_input_tokens") or 0)
+            + (usage.get("cache_creation_input_tokens") or 0)
+        )
+        if out["model"] is None:
+            out["model"] = msg.get("model") or d.get("model")
+            out["ctx_tokens"] = ctx
+        if len(out["ctx_history"]) < HISTORY_TURNS and (
+                not out["ctx_history"] or out["ctx_history"][-1] != ctx):
+            out["ctx_history"].append(ctx)
+        if out["model"] and out["prompt"] and len(out["ctx_history"]) >= HISTORY_TURNS:
+            break
+
+    out["ctx_history"].reverse()
+    if out["last_write"] is not None:
+        _SCAN_CACHE[path] = (out["last_write"], dict(out))
+    return out
+
+
+def collect_cursor_workers():
+    rows = []
+    if "cursor" not in _backends() or not CURSOR_PROJECTS_DIR.is_dir():
+        return rows
+    now = time.time()
+    pattern = str(CURSOR_PROJECTS_DIR / "*" / "agent-transcripts" / "*" / "*")
+    for path_str in glob.glob(pattern):
+        path = Path(path_str)
+        if path.suffix not in (".jsonl", ".txt"):
+            continue
+        info = scan_cursor_transcript(str(path))
+        last = info["last_write"]
+        if last is None:
+            continue
+        idle = now - last
+        if idle > CURSOR_MAX_IDLE_SECS:
+            continue
+        composer_id = path.parent.name
+        slug = path.parent.parent.parent.parent.name
+        sid = composer_id
+        pct = None
+        win_label = "-"
+        if info["ctx_tokens"]:
+            window, win_label = window_for(info["ctx_tokens"], info["model"])
+            pct = 100.0 * info["ctx_tokens"] / float(window)
+
+        flow = " " * SPARK_LEN
+        st = _SPARK.setdefault(
+            sid, {"prev": None, "t": 0.0, "hist": deque(maxlen=SPARK_LEN)})
+        tok = info["ctx_tokens"]
+        if tok is not None and now - st["t"] >= SPARK_MIN_STEP:
+            if st["prev"] is not None:
+                st["hist"].append(max(0, tok - st["prev"]))
+            st["prev"] = tok
+            st["t"] = now
+        flow = spark(st["hist"])
+
+        short = composer_id[:8] if len(composer_id) >= 8 else composer_id
+        project = slug.rsplit("-", 1)[-1] if slug else "-"
+        rows.append({
+            "source": "cursor",
+            "name": "cursor/" + short,
+            "pid": None,
+            "session_id": sid,
+            "cwd": "",
+            "project": project,
+            "cursor_slug": slug,
+            "model": info["model"] or "-",
+            "ctx_tokens": info["ctx_tokens"],
+            "ctx_pct": pct,
+            "ctx_history": info["ctx_history"],
+            "window": win_label,
+            "task": ascii_safe(info["title"] or info["prompt"] or ""),
+            "task_src": "title" if info["title"] else ("prompt" if info["prompt"] else "-"),
+            "idle_secs": idle,
+            "age_secs": None,
+            "flow": flow,
+            "auto_compact": True,
+        })
+    return rows
+
+
+def _worker_key(w):
+    src = w.get("source") or "claude"
+    if w.get("pid") is not None:
+        return (src, "pid", w["pid"])
+    return (src, "sid", w.get("session_id"))
+
+
+def collect_claude_workers():
     rows = []
     if not SESSIONS_DIR.is_dir():
         return rows
@@ -845,6 +1012,7 @@ def collect_workers():
         if cwd not in ac_cache:
             ac_cache[cwd] = auto_compact_enabled(cwd)
         rows.append({
+            "source": "claude",
             "name": s.get("name") or "-",
             "pid": pid,
             "session_id": sid,
@@ -869,6 +1037,14 @@ def collect_workers():
             "flow": flow,
             "auto_compact": ac_cache[cwd],
         })
+    return rows
+
+
+def collect_workers():
+    rows = []
+    if "claude" in _backends():
+        rows.extend(collect_claude_workers())
+    rows.extend(collect_cursor_workers())
     return rows
 
 
@@ -1730,10 +1906,14 @@ def render(workers, sel=None):
     """Table for `workers`. `sel` is an index into arrange()'s shown rows."""
     lines = []
     if not workers:
-        lines.append("no live Claude Code sessions")
+        lines.append("no live agent sessions")
         return lines
 
-    cols = [
+    mixed = any(w.get("source") not in (None, "claude") for w in workers)
+    cols = []
+    if mixed:
+        cols.append(("SRC", lambda r: (r.get("source") or "claude")[:6]))
+    cols.extend([
         ("WORKER", lambda r: r["name"]),
         ("MODEL", lambda r: (r["model"] or "-").replace("claude-", "")),
         ("CONTEXT", lambda r: bar(r["ctx_pct"])),
@@ -1746,7 +1926,7 @@ def render(workers, sel=None):
         ("TREND", lambda r: growth(r.get("ctx_history"))),
         ("FLOW", lambda r: r.get("flow") or " " * SPARK_LEN),
         ("IDLE", lambda r: dur(r["idle_secs"])),
-    ]
+    ])
 
     shown, quiet = arrange(workers, expand_quiet=sel is not None)
 
@@ -2533,7 +2713,7 @@ def main():
                 # on pid rather than on the row dict is what makes that detectable:
                 # every frame rebuilds the dicts, so identity and equality both
                 # fail on rows that are in fact the same session.
-                if pending and not any(r["pid"] == pending["pid"] for r in rows):
+                if pending and not any(_worker_key(r) == _worker_key(pending) for r in rows):
                     pending, note = None, c("that session exited on its own", DIM)
 
                 # The status line lives in the header, above the table, and the
@@ -2544,8 +2724,12 @@ def main():
                 # precisely when there was most to act on, and the next keypress
                 # cancelled a prompt that had never been seen.
                 if pending:
-                    status = c("stop %s (pid %d)?   y = yes, any other key = no" % (
-                        pending["name"], pending["pid"]), BOLD, RED)
+                    if pending.get("pid") is not None:
+                        status = c("stop %s (pid %d)?   y = yes, any other key = no" % (
+                            pending["name"], pending["pid"]), BOLD, RED)
+                    else:
+                        status = c("stop %s?   y = yes, any other key = no" % (
+                            pending["name"],), BOLD, RED)
                 else:
                     status = note or ""
                 title = (c("roost", BOLD) + "  " + c(socket.gethostname(), CYAN)
@@ -2579,11 +2763,14 @@ def main():
                     # that a reflexive quit cannot be read as consent.
                     if pending is not None:
                         if key in ("y", "Y"):
-                            err = terminate(pending["pid"])
-                            log_action("stop", pending, ok=err is None, detail=err or "")
-                            note = c("stopped %s (pid %d)" % (
-                                pending["name"], pending["pid"]), GREEN) if err is None \
-                                else c(err, BOLD, RED)
+                            if pending.get("source") == "cursor" or pending.get("pid") is None:
+                                note = c("cursor composers cannot be stopped from roost", YELLOW)
+                            else:
+                                err = terminate(pending["pid"])
+                                log_action("stop", pending, ok=err is None, detail=err or "")
+                                note = c("stopped %s (pid %d)" % (
+                                    pending["name"], pending["pid"]), GREEN) if err is None \
+                                    else c(err, BOLD, RED)
                         else:
                             note = c("cancelled", DIM)
                         pending = None
@@ -2656,11 +2843,18 @@ def main():
                         elif sel is None or not rows:
                             note = c("select a row first -- j/k or the arrow keys", YELLOW)
                         elif key in ("x", "X"):
-                            # Captured from the frame on screen, not re-resolved later.
-                            pending = rows[sel]
+                            w = rows[sel]
+                            if w.get("source") == "cursor":
+                                note = c("cursor composers cannot be stopped from roost", YELLOW)
+                            else:
+                                pending = w
                         else:
                             w = rows[sel]
-                            note = c("copied %s -- claude --resume <paste>" % w["name"], GREEN) \
+                            if w.get("source") == "cursor":
+                                msg = "copied composer %s" % w["session_id"]
+                            else:
+                                msg = "copied %s -- claude --resume <paste>" % w["name"]
+                            note = c(msg, GREEN) \
                                 if to_clipboard(w["session_id"]) \
                                 else c("no clipboard helper (%s not found)" % CLIP_CMD[0], YELLOW)
                         break

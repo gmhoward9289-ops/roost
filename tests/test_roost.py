@@ -1,4 +1,4 @@
-﻿"""Tests for roost.
+"""Tests for roost.
 
 Written against stdlib unittest so `python -m unittest` works with nothing
 installed; pytest collects them unchanged in CI.
@@ -12,9 +12,11 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -28,7 +30,7 @@ spec.loader.exec_module(roost)
 def worker(**kw):
     """A worker row with sane defaults; override only what a test cares about."""
     base = {
-        "name": "demo-a1", "pid": 1234, "session_id": "sid-1",
+        "name": "demo-a1", "pid": 1234, "session_id": "sid-1", "source": "claude",
         "cwd": "/tmp/demo", "project": "demo", "model": "claude-opus-5",
         "ctx_tokens": 50000, "ctx_pct": 25.0, "window": "200k",
         "idle_secs": 120.0, "age_secs": 600.0, "task": "a task", "task_src": "title",
@@ -875,7 +877,7 @@ class TestInfraLine(unittest.TestCase):
         self.assertIn("DOWN", out)
 
     def test_no_sessions_still_renders(self):
-        self.assertIn("no live Claude Code sessions", "\n".join(roost.render([])))
+        self.assertIn("no live agent sessions", "\n".join(roost.render([])))
 
     def test_no_model_resident_is_shown_not_swallowed(self):
         """Installed-but-unloaded used to collapse the whole detail away, leaving
@@ -1196,6 +1198,754 @@ class TestInfraCached(unittest.TestCase):
                                 "background worker never refreshed the snapshot")
         finally:
             roost.INFRA_REFRESH_SECONDS = old
+
+
+class TestCompactAndBar(unittest.TestCase):
+    """Both are width-constrained formatters: every column downstream is laid
+    out against what they return, so a stray digit shifts the whole table."""
+
+    def test_compact_switches_units_at_the_thresholds(self):
+        self.assertEqual(roost.compact(999), "999")
+        self.assertEqual(roost.compact(1000), "1k")
+        self.assertEqual(roost.compact(484030), "484k")
+        self.assertEqual(roost.compact(999999), "999k")
+        self.assertEqual(roost.compact(1000000), "1.0M")
+        self.assertEqual(roost.compact(1250000), "1.2M")
+
+    def test_compact_of_nothing_is_a_dash_not_a_zero(self):
+        # A session with no transcript has no token count; printing "0" would
+        # claim it is empty rather than unknown.
+        self.assertEqual(roost.compact(None), "-")
+
+    def test_bar_is_always_the_same_width(self):
+        for pct in (None, 0, 1.0, 49.9, 50.0, 99.9, 100.0, 240.0):
+            self.assertEqual(len(roost.bar(pct)), roost.BAR_WIDTH + 2)
+
+    def test_bar_never_overflows_on_a_bad_percentage(self):
+        # The 242% reading that WINDOW_TIERS fixed could still arrive from a
+        # tier that has not shipped yet; the bar has to clamp, not wrap.
+        self.assertEqual(roost.bar(240.0), "[" + "#" * roost.BAR_WIDTH + "]")
+
+    def test_bar_is_empty_when_the_context_is_unknown(self):
+        self.assertEqual(roost.bar(None), "[" + " " * roost.BAR_WIDTH + "]")
+
+    def test_bar_stays_ascii(self):
+        for ch in roost.bar(55.0):
+            self.assertLess(ord(ch), 127)
+
+
+class TestBurnRates(unittest.TestCase):
+    """The runway figure ("~2.1d left") is the one number that can tell someone
+    to stop working, so its sample has to be honest: rows from before a weekly
+    reset average a cliff into the rate and understate the burn badly."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self._history = roost.USAGE_HISTORY
+        roost.USAGE_HISTORY = Path(self.td.name) / "history.jsonl"
+
+    def tearDown(self):
+        roost.USAGE_HISTORY = self._history
+        self.td.cleanup()
+
+    def write(self, rows):
+        roost.USAGE_HISTORY.write_text(
+            "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    def at(self, hours_ago, **caps):
+        row = {"epoch": time.time() - hours_ago * 3600}
+        row.update(caps)
+        return row
+
+    def test_rate_is_percent_per_hour_across_the_span(self):
+        self.write([self.at(8, weekly=10), self.at(4, weekly=14),
+                    self.at(0, weekly=18)])
+        self.assertAlmostEqual(roost._burn_rates()["weekly"], 1.0, places=6)
+
+    def test_rows_before_a_reset_are_dropped(self):
+        # 90% -> 5% is a reset, not a -85 point/hour burn. Only the three rows
+        # after it are a valid sample.
+        self.write([self.at(20, weekly=80), self.at(16, weekly=90),
+                    self.at(12, weekly=5), self.at(8, weekly=10),
+                    self.at(4, weekly=15)])
+        self.assertAlmostEqual(roost._burn_rates()["weekly"], 1.25, places=6)
+
+    def test_two_points_are_not_a_trend(self):
+        self.write([self.at(8, weekly=10), self.at(0, weekly=30)])
+        self.assertEqual(roost._burn_rates(), {})
+
+    def test_a_span_under_six_hours_is_not_a_trend(self):
+        self.write([self.at(4, weekly=10), self.at(2, weekly=14),
+                    self.at(0, weekly=18)])
+        self.assertEqual(roost._burn_rates(), {})
+
+    def test_rows_outside_the_window_are_ignored(self):
+        self.write([self.at(100, weekly=1), self.at(90, weekly=2),
+                    self.at(80, weekly=3)])
+        self.assertEqual(roost._burn_rates(), {})
+
+    def test_a_flat_week_reports_no_rate_rather_than_zero(self):
+        # A zero rate would divide into an infinite runway; the caps panel
+        # falls back to even-burn pacing instead.
+        self.write([self.at(8, weekly=20), self.at(4, weekly=20),
+                    self.at(0, weekly=20)])
+        self.assertNotIn("weekly", roost._burn_rates())
+
+    def test_each_cap_is_tracked_independently(self):
+        self.write([self.at(8, weekly=10, fable=40),
+                    self.at(4, weekly=14, fable=40),
+                    self.at(0, weekly=18, fable=48)])
+        rates = roost._burn_rates()
+        self.assertAlmostEqual(rates["weekly"], 1.0, places=6)
+        self.assertAlmostEqual(rates["fable"], 1.0, places=6)
+
+    def test_no_history_file_is_not_fatal(self):
+        self.assertEqual(roost._burn_rates(), {})
+
+    def test_a_malformed_row_is_not_fatal(self):
+        roost.USAGE_HISTORY.write_text("{not json\n", encoding="utf-8")
+        self.assertEqual(roost._burn_rates(), {})
+
+
+class TestIsoToEpoch(unittest.TestCase):
+    """Ollama's expires_at is the only RFC3339 roost parses. A format surprise
+    has to drop the unload timer, never the LOCAL MODELS panel."""
+
+    def test_offsets_resolve_to_the_same_instant(self):
+        self.assertEqual(roost._iso_to_epoch("2026-08-01T15:04:05-07:00"),
+                         roost._iso_to_epoch("2026-08-01T22:04:05+00:00"))
+
+    def test_fractional_seconds_are_accepted(self):
+        self.assertIsNotNone(roost._iso_to_epoch("2026-08-01T15:04:05.123456-07:00"))
+
+    def test_garbage_drops_the_timer_not_the_panel(self):
+        for bad in (None, "", "soon", "2026-13-45T99:99:99"):
+            self.assertIsNone(roost._iso_to_epoch(bad))
+
+
+class TestProxyLogActivity(unittest.TestCase):
+    """LiteLLM's log format is LiteLLM's to change. Anything unparseable has to
+    cost the two activity numbers and nothing else."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.log = Path(self.td.name) / "proxy.log"
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def write(self, lines):
+        self.log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def stamp(self, secs_ago):
+        return time.strftime("%Y-%m-%d %H:%M:%S",
+                             time.localtime(time.time() - secs_ago))
+
+    def test_a_recent_request_is_dated_and_counted(self):
+        self.write(["INFO %s POST /chat/completions 200" % self.stamp(10)])
+        act = roost._proxy_log_activity(self.log)
+        self.assertLess(act["last_req_secs"], 60)
+        self.assertEqual(act["req_per_min"], 1)
+
+    def test_only_the_last_minute_counts_toward_the_rate(self):
+        self.write(["INFO %s POST /chat/completions 200" % self.stamp(10),
+                    "INFO %s POST /chat/completions 200" % self.stamp(600)])
+        act = roost._proxy_log_activity(self.log)
+        self.assertEqual(act["req_per_min"], 1)
+
+    def test_an_idle_gateway_reports_the_age_with_a_zero_rate(self):
+        self.write(["INFO %s POST /chat/completions 200" % self.stamp(7200)])
+        act = roost._proxy_log_activity(self.log)
+        self.assertGreater(act["last_req_secs"], 3600)
+        self.assertEqual(act["req_per_min"], 0)
+
+    def test_lines_that_are_not_requests_are_ignored(self):
+        self.write(["INFO %s server started" % self.stamp(5),
+                    "INFO %s health probe ok" % self.stamp(5)])
+        self.assertEqual(roost._proxy_log_activity(self.log),
+                         {"last_req_secs": None, "req_per_min": None})
+
+    def test_an_undated_request_line_is_ignored(self):
+        self.write(["POST /chat/completions 200"])
+        self.assertIsNone(roost._proxy_log_activity(self.log)["last_req_secs"])
+
+    def test_a_missing_log_is_not_fatal(self):
+        self.assertEqual(
+            roost._proxy_log_activity(Path(self.td.name) / "nope.log"),
+            {"last_req_secs": None, "req_per_min": None})
+
+
+class TestGatewayCollect(unittest.TestCase):
+    """A DB-less LiteLLM answers nothing about its own history, so every number
+    on the GATEWAY panel is derived from a directory listing. That makes the
+    filesystem rules -- what counts as a run, what counts as done -- the whole
+    correctness surface."""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.root = Path(self.td.name) / "batch"
+        self.root.mkdir()
+        self.jobs = Path(self.td.name) / "jobs"
+        self._env = {k: os.environ.get(k)
+                     for k in (roost.BATCH_DIR_ENV, roost.JOBS_DIR_ENV)}
+        os.environ[roost.BATCH_DIR_ENV] = str(self.root)
+        os.environ[roost.JOBS_DIR_ENV] = str(self.jobs)
+        self._port_open = roost.port_open
+        roost.port_open = lambda port, timeout=0.35: True
+
+    def tearDown(self):
+        roost.port_open = self._port_open
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.td.cleanup()
+
+    def run_dir(self, name, outputs=0, meta=None, failures=0, age_secs=0):
+        d = self.root / name
+        d.mkdir()
+        for i in range(outputs):
+            p = d / ("item-%03d.json" % i)
+            p.write_text("{}", encoding="utf-8")
+            when = time.time() - age_secs
+            os.utime(p, (when, when))
+        if meta is not None:
+            (d / "_run.json").write_text(json.dumps(meta), encoding="utf-8")
+        if failures:
+            (d / "_failures.jsonl").write_text(
+                "\n".join('{"id":%d}' % i for i in range(failures)) + "\n\n",
+                encoding="utf-8")
+        return d
+
+    def named(self, gw, name):
+        for r in gw["runs"]:
+            if r["name"] == name:
+                return r
+        self.fail("no run named %r in %r" % (name, [r["name"] for r in gw["runs"]]))
+
+    def test_a_dir_of_loose_json_is_not_a_batch_run(self):
+        # schemas/ sits beside the runs and is full of .json; counting it as a
+        # run would put a permanent phantom row on the panel.
+        self.run_dir("schemas", outputs=3)
+        self.assertEqual(roost.collect_gateway()["runs"], [])
+
+    def test_the_results_naming_convention_identifies_a_run(self):
+        self.run_dir("results-laneA", outputs=2)
+        self.assertEqual(self.named(roost.collect_gateway(), "results-laneA")["done"], 2)
+
+    def test_a_run_json_identifies_a_run_whatever_it_is_called(self):
+        self.run_dir("laneB", outputs=1,
+                     meta={"model": "gemma4-32k", "total": 4,
+                           "worklist": "/srv/lists/laneB.txt"})
+        r = self.named(roost.collect_gateway(), "laneB")
+        self.assertEqual((r["model"], r["total"], r["worklist"]),
+                         ("gemma4-32k", 4, "laneB.txt"))
+
+    def test_underscore_files_are_bookkeeping_not_output(self):
+        # _run.json and _failures.jsonl live in the same dir as the results;
+        # counting them as done inflates every progress figure by two.
+        self.run_dir("results-laneC", outputs=3, failures=2, meta={"total": 10})
+        r = self.named(roost.collect_gateway(), "results-laneC")
+        self.assertEqual((r["done"], r["failed"]), (3, 2))
+
+    def test_blank_lines_in_the_failure_log_are_not_failures(self):
+        self.run_dir("results-laneD", outputs=1, failures=2)
+        self.assertEqual(self.named(roost.collect_gateway(), "results-laneD")["failed"], 2)
+
+    def test_an_empty_results_dir_has_nothing_to_say_yet(self):
+        self.run_dir("results-unstarted")
+        self.assertEqual(roost.collect_gateway()["runs"], [])
+
+    def test_rate_and_eta_come_from_the_spacing_of_the_writes(self):
+        d = self.run_dir("results-paced", outputs=3)
+        for i, ago in enumerate((7200, 3600, 0)):
+            p = d / ("item-%03d.json" % i)
+            os.utime(p, (time.time() - ago, time.time() - ago))
+        (d / "_run.json").write_text(json.dumps({"total": 5}), encoding="utf-8")
+        r = self.named(roost.collect_gateway(), "results-paced")
+        self.assertAlmostEqual(r["rate_hr"], 1.0, places=6)
+        self.assertAlmostEqual(r["eta_secs"], 7200.0, places=3)
+
+    def test_a_finished_run_has_no_eta(self):
+        self.run_dir("results-finished", outputs=2, age_secs=3600,
+                     meta={"total": 2})
+        self.assertIsNone(self.named(roost.collect_gateway(),
+                                     "results-finished")["eta_secs"])
+
+    def test_a_single_output_is_not_enough_to_time_a_rate(self):
+        self.run_dir("results-one", outputs=1, meta={"total": 9})
+        r = self.named(roost.collect_gateway(), "results-one")
+        self.assertIsNone(r["rate_hr"])
+        self.assertIsNone(r["eta_secs"])
+
+    def test_a_stale_run_is_not_active_and_sorts_below_a_live_one(self):
+        self.run_dir("results-cold", outputs=2,
+                     age_secs=roost.BATCH_ACTIVE_SECS + 600)
+        self.run_dir("results-hot", outputs=2)
+        gw = roost.collect_gateway()
+        self.assertEqual([r["name"] for r in gw["runs"]],
+                         ["results-hot", "results-cold"])
+        self.assertTrue(gw["runs"][0]["active"])
+        self.assertFalse(gw["runs"][1]["active"])
+
+    def test_the_jobs_queue_counts_files_in_flight_and_dirs_at_rest(self):
+        for state in ("inbox", "running", "done", "failed"):
+            (self.jobs / state).mkdir(parents=True)
+        for i in range(2):
+            (self.jobs / "inbox" / ("j%d.json" % i)).write_text("{}", encoding="utf-8")
+        (self.jobs / "inbox" / "notes.txt").write_text("x", encoding="utf-8")
+        (self.jobs / "running" / "j9.json").write_text("{}", encoding="utf-8")
+        for i in range(3):
+            (self.jobs / "done" / ("j%d" % i)).mkdir()
+        self.assertEqual(roost.collect_gateway()["jobs"],
+                         {"inbox": 2, "running": 1, "done": 3, "failed": 0})
+
+    def test_no_jobs_dir_is_absent_rather_than_zero(self):
+        # Nobody without the job queue installed should see a row of zeroes
+        # implying they have an idle one.
+        self.assertIsNone(roost.collect_gateway()["jobs"])
+
+    def test_a_missing_batch_root_is_not_fatal(self):
+        os.environ[roost.BATCH_DIR_ENV] = str(Path(self.td.name) / "nowhere")
+        gw = roost.collect_gateway()
+        self.assertEqual(gw["runs"], [])
+        self.assertIsNone(gw["last_req_secs"])
+
+    def test_the_proxy_log_is_read_from_beside_the_batch_root(self):
+        (self.root.parent / "proxy.log").write_text(
+            "INFO %s POST /chat/completions 200\n" % time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 5)),
+            encoding="utf-8")
+        self.assertIsNotNone(roost.collect_gateway()["last_req_secs"])
+
+    def test_a_down_gateway_still_reports_its_runs(self):
+        roost.port_open = lambda port, timeout=0.35: False
+        self.run_dir("results-laneE", outputs=1)
+        gw = roost.collect_gateway()
+        self.assertFalse(gw["litellm_up"])
+        self.assertEqual(len(gw["runs"]), 1)
+
+
+class TestRenderGateway(unittest.TestCase):
+    def setUp(self):
+        self._color = roost.COLOR
+        roost.COLOR = False
+
+    def tearDown(self):
+        roost.COLOR = self._color
+
+    def gw(self, **kw):
+        base = {"litellm_up": True, "runs": [], "jobs": None,
+                "last_req_secs": None, "req_per_min": None}
+        base.update(kw)
+        return base
+
+    def batch(self, **kw):
+        base = {"name": "results-laneA", "model": "gemma4-32k",
+                "worklist": "laneA.txt", "done": 121, "total": 300,
+                "failed": 2, "rate_hr": 64.0, "eta_secs": 10080.0,
+                "last_write_secs": 35.0, "active": True}
+        base.update(kw)
+        return base
+
+    def test_a_down_gateway_says_so(self):
+        self.assertIn("DOWN", "\n".join(roost.render_gateway(
+            self.gw(litellm_up=False))))
+
+    def test_no_runs_is_stated_not_left_blank(self):
+        self.assertIn("no batch runs found",
+                      "\n".join(roost.render_gateway(self.gw())))
+
+    def test_a_run_shows_its_progress(self):
+        out = "\n".join(roost.render_gateway(self.gw(runs=[self.batch()])))
+        self.assertIn("121/300", out)
+        self.assertIn("64/hr", out)
+        self.assertIn("1 run(s), 1 active", out)
+
+    def test_an_unknown_total_reads_as_a_question_mark_not_a_zero(self):
+        out = "\n".join(roost.render_gateway(
+            self.gw(runs=[self.batch(total=None, eta_secs=None)])))
+        self.assertIn("121/?", out)
+
+    def test_a_complete_run_reads_done_rather_than_dash(self):
+        out = "\n".join(roost.render_gateway(self.gw(runs=[
+            self.batch(done=298, total=300, failed=2, eta_secs=None)])))
+        self.assertIn("done", out)
+
+    def test_the_jobs_line_appears_only_with_a_queue(self):
+        out = "\n".join(roost.render_gateway(self.gw(
+            jobs={"inbox": 0, "running": 1, "done": 12, "failed": 0})))
+        self.assertIn("jobs queue: inbox 0  running 1  done 12  failed 0", out)
+        self.assertNotIn("jobs queue", "\n".join(roost.render_gateway(self.gw())))
+
+    def test_activity_figures_are_dropped_rather_than_guessed(self):
+        out = "\n".join(roost.render_gateway(self.gw()))
+        self.assertNotIn("req/min", out)
+        self.assertNotIn("last request", out)
+
+    def test_every_line_stays_ascii(self):
+        for line in roost.render_gateway(self.gw(runs=[self.batch()])):
+            for ch in line:
+                self.assertLess(ord(ch), 127)
+
+
+class TestRemoteHosts(unittest.TestCase):
+    """A remote host is a laptop with a lid. The invariant that matters is that
+    a host which has already failed once never blocks the render loop again --
+    it keeps its last good row and an age saying how old that row is."""
+
+    def setUp(self):
+        self._color = roost.COLOR
+        roost.COLOR = False
+        self._env = os.environ.get(roost.REMOTES_ENV)
+        self._fetch = roost._fetch_remote
+        self.release = threading.Event()
+        roost._REMOTE.clear()
+
+    def tearDown(self):
+        self.release.set()
+        roost._fetch_remote = self._fetch
+        roost._REMOTE.clear()
+        roost.COLOR = self._color
+        if self._env is None:
+            os.environ.pop(roost.REMOTES_ENV, None)
+        else:
+            os.environ[roost.REMOTES_ENV] = self._env
+
+    def test_hosts_are_read_from_the_environment_only(self):
+        os.environ[roost.REMOTES_ENV] = " alpha , beta ,, gamma "
+        roost._fetch_remote = lambda host: None
+        self.assertEqual([r["host"] for r in roost.collect_remote()],
+                         ["alpha", "beta", "gamma"])
+
+    def test_a_host_that_already_failed_never_blocks_again(self):
+        os.environ[roost.REMOTES_ENV] = "closed-lid"
+        roost._REMOTE["closed-lid"] = {"err": "timeout after 15s", "thread": None}
+        roost._fetch_remote = lambda host: self.release.wait(30)
+        t0 = time.perf_counter()
+        rows = roost.collect_remote()
+        elapsed = time.perf_counter() - t0
+        self.assertLess(elapsed, 1.0,
+                        "collect_remote blocked on a known-bad host (%.2fs)"
+                        % elapsed)
+        self.assertEqual(rows[0]["err"], "timeout after 15s")
+
+    def test_the_first_attempt_is_allowed_to_block(self):
+        # Without this, `roost --remote -1` would print an empty panel every
+        # time, since one frame is all it gets.
+        os.environ[roost.REMOTES_ENV] = "first"
+
+        def fetch(host):
+            roost._REMOTE[host] = {"data": {"workers": []}, "t": time.time(),
+                                   "err": None, "thread": None}
+
+        roost._fetch_remote = fetch
+        self.assertIsNotNone(roost.collect_remote()[0]["data"])
+
+    def test_a_fresh_cache_is_not_refetched(self):
+        os.environ[roost.REMOTES_ENV] = "warm"
+        roost._REMOTE["warm"] = {"data": {"workers": []}, "t": time.time(),
+                                 "err": None, "thread": None}
+        calls = []
+        roost._fetch_remote = lambda host: calls.append(host)
+        rows = roost.collect_remote()
+        self.assertEqual(calls, [])
+        self.assertLess(rows[0]["age_secs"], roost.REMOTE_REFRESH_SECS)
+
+    def test_a_stale_cache_is_refetched_without_losing_the_old_row(self):
+        os.environ[roost.REMOTES_ENV] = "stale"
+        old = {"workers": [{"idle_secs": 1}]}
+        roost._REMOTE["stale"] = {
+            "data": old, "t": time.time() - 10 * roost.REMOTE_REFRESH_SECS,
+            "err": None, "thread": None}
+        roost._fetch_remote = lambda host: self.release.wait(30)
+        row = roost.collect_remote()[0]
+        self.assertIs(row["data"], old)
+        self.assertGreater(row["age_secs"], roost.REMOTE_REFRESH_SECS)
+
+
+class TestFetchRemote(unittest.TestCase):
+    """`ssh host roost --json` is the whole transport. A failure has to degrade
+    to an error string on a row, never an exception out of a render thread."""
+
+    class FakeSubprocess(object):
+        TimeoutExpired = subprocess.TimeoutExpired
+
+        def __init__(self, result=None, raises=None):
+            self.result, self.raises, self.calls = result, raises, []
+
+        def run(self, cmd, **kw):
+            self.calls.append((cmd, kw))
+            if self.raises is not None:
+                raise self.raises
+            return self.result
+
+    class FakeCompleted(object):
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+    def setUp(self):
+        self._subprocess = roost.subprocess
+        self._cmd_env = os.environ.get(roost.REMOTE_CMD_ENV)
+        roost._REMOTE.clear()
+
+    def tearDown(self):
+        roost.subprocess = self._subprocess
+        roost._REMOTE.clear()
+        if self._cmd_env is None:
+            os.environ.pop(roost.REMOTE_CMD_ENV, None)
+        else:
+            os.environ[roost.REMOTE_CMD_ENV] = self._cmd_env
+
+    def test_a_good_fetch_stores_the_payload_and_clears_the_error(self):
+        roost._REMOTE["h"] = {"err": "old failure", "thread": object()}
+        roost.subprocess = self.FakeSubprocess(
+            self.FakeCompleted(stdout=json.dumps({"workers": []})))
+        roost._fetch_remote("h")
+        st = roost._REMOTE["h"]
+        self.assertEqual(st["data"], {"workers": []})
+        self.assertIsNone(st["err"])
+        self.assertIsNone(st["thread"])
+
+    def test_a_failed_fetch_keeps_the_last_good_data(self):
+        # The closed-lid case: the row must not blank out, it must go stale.
+        good = {"workers": [{"idle_secs": 2}]}
+        roost._REMOTE["h"] = {"data": good, "t": 1000.0, "err": None,
+                              "thread": object()}
+        roost.subprocess = self.FakeSubprocess(
+            self.FakeCompleted(returncode=255, stderr="ssh: connect: timed out\n"))
+        roost._fetch_remote("h")
+        st = roost._REMOTE["h"]
+        self.assertIs(st["data"], good)
+        self.assertEqual(st["t"], 1000.0)
+        self.assertIn("timed out", st["err"])
+
+    def test_a_timeout_becomes_an_error_string(self):
+        roost.subprocess = self.FakeSubprocess(
+            raises=subprocess.TimeoutExpired(cmd="ssh", timeout=15))
+        roost._fetch_remote("h")
+        self.assertIn("timeout", roost._REMOTE["h"]["err"])
+
+    def test_unparseable_output_is_an_error_not_a_crash(self):
+        roost.subprocess = self.FakeSubprocess(
+            self.FakeCompleted(stdout="ssh banner, then not json"))
+        roost._fetch_remote("h")
+        self.assertIsNotNone(roost._REMOTE["h"]["err"])
+        self.assertIsNone(roost._REMOTE["h"].get("data"))
+
+    def test_ssh_is_never_allowed_to_prompt(self):
+        # An interactive password prompt on a background thread hangs the fetch
+        # forever with nothing on screen to explain it.
+        roost.subprocess = self.FakeSubprocess(
+            self.FakeCompleted(stdout=json.dumps({})))
+        roost._fetch_remote("h")
+        cmd, kw = roost.subprocess.calls[0]
+        self.assertIn("BatchMode=yes", cmd)
+        self.assertEqual(kw["timeout"], roost.REMOTE_TIMEOUT_SECS)
+
+    def test_the_remote_command_is_overridable(self):
+        os.environ[roost.REMOTE_CMD_ENV] = "/opt/roost/roost --json"
+        roost.subprocess = self.FakeSubprocess(
+            self.FakeCompleted(stdout=json.dumps({})))
+        roost._fetch_remote("h")
+        self.assertEqual(roost.subprocess.calls[0][0][-1],
+                         "/opt/roost/roost --json")
+
+
+class TestRenderRemote(unittest.TestCase):
+    def setUp(self):
+        self._color = roost.COLOR
+        roost.COLOR = False
+
+    def tearDown(self):
+        roost.COLOR = self._color
+
+    def row(self, **kw):
+        base = {"host": "hyrule", "data": None, "age_secs": None, "err": None,
+                "fetching": False}
+        base.update(kw)
+        return base
+
+    def payload(self, **kw):
+        base = {
+            "workers": [{"idle_secs": 5}, {"idle_secs": 9000},
+                        {"idle_secs": None}],
+            "local_models": [{"name": "qwen-coder-16k", "resident": True},
+                             {"name": "gemma4-32k", "resident": False}],
+            "gateway": {"runs": [{"name": "results-laneA", "done": 3,
+                                  "total": 9, "active": True}],
+                        "jobs": {"inbox": 0, "running": 1, "done": 12,
+                                 "failed": 0}},
+        }
+        base.update(kw)
+        return base
+
+    def test_no_hosts_names_the_variable_that_sets_them(self):
+        self.assertIn(roost.REMOTES_ENV, "\n".join(roost.render_remote([])))
+
+    def test_a_host_summarises_its_fleet(self):
+        out = "\n".join(roost.render_remote(
+            [self.row(data=self.payload(), age_secs=12.0)]))
+        self.assertIn("hyrule", out)
+        self.assertIn("qwen-coder-16k", out)
+        self.assertIn("results-laneA 3/9", out)
+        self.assertIn("in 0 run 1 fail 0", out)
+
+    def test_working_counts_only_the_sessions_moving_right_now(self):
+        rows = roost.render_remote(
+            [self.row(data=self.payload(), age_secs=12.0)])
+        body = rows[-1].split()
+        self.assertEqual((body[1], body[2]), ("3", "1"))
+
+    def test_an_idle_worker_with_no_timestamp_is_not_counted_as_working(self):
+        out = roost.render_remote([self.row(
+            data=self.payload(workers=[{"idle_secs": None}]),
+            age_secs=1.0)])[-1].split()
+        self.assertEqual((out[1], out[2]), ("1", "0"))
+
+    def test_a_host_still_being_fetched_says_so(self):
+        self.assertIn("fetching...", "\n".join(
+            roost.render_remote([self.row(fetching=True)])))
+
+    def test_an_unreachable_host_shows_its_error(self):
+        self.assertIn("timeout after 15s", "\n".join(
+            roost.render_remote([self.row(err="timeout after 15s")])))
+
+    def test_an_old_row_is_marked_stale_rather_than_shown_as_current(self):
+        out = "\n".join(roost.render_remote([self.row(
+            data=self.payload(), age_secs=4 * roost.REMOTE_REFRESH_SECS)]))
+        self.assertIn("(stale)", out)
+
+    def test_a_recent_row_is_not_marked_stale(self):
+        out = "\n".join(roost.render_remote(
+            [self.row(data=self.payload(), age_secs=5.0)]))
+        self.assertNotIn("(stale)", out)
+
+    def test_a_host_with_nothing_running_renders_dashes_not_blanks(self):
+        out = "\n".join(roost.render_remote([self.row(
+            data={"workers": []}, age_secs=1.0)]))
+        self.assertIn("hyrule", out)
+        self.assertIn("-", out)
+
+
+class TestJsonContract(unittest.TestCase):
+    """`--json` is not only a pipe for humans: the REMOTE panel renders other
+    machines' roost from exactly this payload. Dropping a key here breaks that
+    panel silently, on the other machine, with no error anywhere."""
+
+    PATCHED = ("collect_workers", "collect_infra", "collect_usage_caps",
+               "collect_local_models", "collect_gateway")
+
+    def setUp(self):
+        self._orig = {n: getattr(roost, n) for n in self.PATCHED}
+        self._argv, self._stdout = sys.argv, sys.stdout
+        self._color = roost.COLOR
+        roost.COLOR = False
+        roost.collect_workers = lambda: [worker(idle_secs=5),
+                                         worker(name="demo-b2", idle_secs=9000)]
+        roost.collect_infra = lambda: [{"name": "ollama", "port": 11434,
+                                        "up": True, "detail": ""}]
+        roost.collect_usage_caps = lambda: None
+        roost.collect_local_models = lambda: [
+            {"name": "qwen-coder-16k", "disk_gb": 9.2, "resident": True,
+             "vram_gb": 9.2, "expires_secs": 300.0}]
+        roost.collect_gateway = lambda: {
+            "litellm_up": True, "runs": [], "jobs": None,
+            "last_req_secs": None, "req_per_min": None}
+
+    def tearDown(self):
+        for n, fn in self._orig.items():
+            setattr(roost, n, fn)
+        sys.argv, sys.stdout = self._argv, self._stdout
+        roost.COLOR = self._color
+
+    def emit(self):
+        sys.argv = ["roost", "--json"]
+        sys.stdout = io.StringIO()
+        try:
+            roost.main()
+            return json.loads(sys.stdout.getvalue())
+        finally:
+            sys.stdout = self._stdout
+
+    def test_the_payload_carries_every_section(self):
+        self.assertEqual(set(self.emit()),
+                         {"workers", "infra", "usage_caps", "local_models",
+                          "gateway"})
+
+    def test_the_payload_renders_as_a_remote_row(self):
+        out = "\n".join(roost.render_remote(
+            [{"host": "hyrule", "data": self.emit(), "age_secs": 3.0,
+              "err": None, "fetching": False}]))
+        self.assertIn("qwen-coder-16k", out)
+
+    def test_worker_rows_carry_the_idle_field_remote_counts_on(self):
+        for w in self.emit()["workers"]:
+            self.assertIn("idle_secs", w)
+
+    def test_json_exits_before_touching_the_terminal(self):
+        # --json is for pipes; enabling VT or arming the key reader here would
+        # corrupt the output and leave a non-tty in cbreak.
+        self.emit()  # must not raise on a StringIO stdout
+
+
+class TestCursorAdapter(unittest.TestCase):
+    """Cursor composers land through agent-transcript JSONL, not pid files."""
+
+    FIXTURE = Path(__file__).parent / "fixtures" / "cursor" / "sample.jsonl"
+
+    def test_cursor_project_slug_matches_cursor_layout(self):
+        self.assertEqual(
+            roost.cursor_project_slug(r"C:\Users\gmhow\dev\roost"),
+            "c-Users-gmhow-dev-roost")
+
+    def test_scan_cursor_transcript_reads_model_usage_and_task(self):
+        info = roost.scan_cursor_transcript(str(self.FIXTURE))
+        self.assertEqual(info["model"], "composer-2.5")
+        self.assertEqual(info["ctx_tokens"], 23000)  # input + cache_read on newest turn
+        self.assertEqual(info["prompt"], "Add cursor support to roost")
+        self.assertEqual(len(info["ctx_history"]), 2)
+
+    def test_collect_cursor_workers_respects_backends_and_idle_window(self):
+        td = tempfile.TemporaryDirectory()
+        root = Path(td.name) / "projects" / "c-demo-roost" / "agent-transcripts"
+        comp = root / "abc12345-aaaa-bbbb-cccc-ddddeeeeffff"
+        comp.mkdir(parents=True)
+        dest = comp / "abc12345-aaaa-bbbb-cccc-ddddeeeeffff.jsonl"
+        shutil.copy(self.FIXTURE, dest)
+        old_home = roost.CURSOR_HOME
+        old_backends = os.environ.get(roost.BACKENDS_ENV)
+        old_idle = roost.CURSOR_MAX_IDLE_SECS
+        try:
+            roost.CURSOR_HOME = Path(td.name)
+            roost.CURSOR_PROJECTS_DIR = roost.CURSOR_HOME / "projects"
+            roost.CURSOR_MAX_IDLE_SECS = 86400
+            os.environ[roost.BACKENDS_ENV] = "cursor"
+            rows = roost.collect_cursor_workers()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["source"], "cursor")
+            self.assertEqual(rows[0]["session_id"], "abc12345-aaaa-bbbb-cccc-ddddeeeeffff")
+            self.assertEqual(rows[0]["name"], "cursor/abc12345")
+            self.assertIsNone(rows[0]["pid"])
+        finally:
+            roost.CURSOR_HOME = old_home
+            roost.CURSOR_PROJECTS_DIR = old_home / "projects"
+            roost.CURSOR_MAX_IDLE_SECS = old_idle
+            if old_backends is None:
+                os.environ.pop(roost.BACKENDS_ENV, None)
+            else:
+                os.environ[roost.BACKENDS_ENV] = old_backends
+            td.cleanup()
+
+    def test_mixed_fleet_shows_src_column(self):
+        out = "\n".join(roost.render([
+            worker(source="claude", idle_secs=5, ctx_pct=85.0),
+            worker(source="cursor", name="cursor/abc", pid=None,
+                   model="composer-2.5", idle_secs=5, ctx_pct=85.0),
+        ]))
+        self.assertIn("SRC", out)
+        self.assertIn("cursor", out)
 
 
 if __name__ == "__main__":
