@@ -281,6 +281,17 @@ class TestBuckets(unittest.TestCase):
         w = worker(ctx_tokens=None, ctx_pct=None, idle_secs=None)
         self.assertEqual(roost.bucket(w)[1], "STARTING")
 
+    def test_fresh_unknown_stays_starting(self):
+        w = worker(ctx_tokens=None, ctx_pct=None, idle_secs=5)
+        self.assertEqual(roost.bucket(w)[1], "STARTING")
+
+    def test_idle_unknown_collapses_to_quiet(self):
+        # Cursor composers often never grow usage; idle empties must not flood
+        # STARTING or the ranked board disappears under a 60-row table.
+        w = worker(ctx_tokens=None, ctx_pct=None, idle_secs=9000,
+                   source="cursor", name="cursor/abcd1234")
+        self.assertEqual(roost.bucket(w)[1], "QUIET")
+
     def test_quiet_is_the_default(self):
         self.assertEqual(roost.bucket(worker(idle_secs=9000, ctx_tokens=1000))[1], "QUIET")
 
@@ -290,6 +301,20 @@ class TestBuckets(unittest.TestCase):
         out = "\n".join(roost.render(rows))
         self.assertIn("QUIET (5)", out)
         self.assertNotIn("WORKING NOW", out)
+
+    def test_idle_empty_cursor_composers_collapse_to_quiet_line(self):
+        roost.COLOR = False
+        hot = worker(name="hot", ctx_tokens=200000, ctx_pct=85.0, idle_secs=10)
+        empties = [worker(name="cursor/%d" % i, source="cursor",
+                          ctx_tokens=None, ctx_pct=None, idle_secs=3600)
+                   for i in range(40)]
+        out = "\n".join(roost.render([hot] + empties))
+        self.assertIn("NEAR LIMIT", out)
+        self.assertIn("QUIET (40)", out)
+        # Only the hot row is a full table line -- empties collapse, so the
+        # frame stays a ranked board instead of 40 STARTING ghosts.
+        self.assertNotIn("STARTING", out)
+        self.assertLess(len(out.splitlines()), 15)
 
 
 class TestTranscriptScan(unittest.TestCase):
@@ -769,6 +794,7 @@ class TestPaintOverflow(unittest.TestCase):
     def test_overflow_is_announced_not_swallowed(self):
         out = self._paint(40)
         self.assertIn("more line(s) below", out[-1])
+        self.assertIn("taller window", out[-1])
 
     def test_the_count_accounts_for_the_notice_itself(self):
         """The notice occupies a row, so the line it displaces must be counted."""
@@ -1017,6 +1043,18 @@ class TestRenderHelp(unittest.TestCase):
         """The 'h' toggle wires through frame() the same way a/s/m do."""
         lines, _, _ = roost.frame(view="help")
         self.assertIn(roost.c("HELP", roost.BOLD), lines)
+
+    def test_open_panel_paints_above_the_worker_table(self):
+        # Regression: panels used to append below a long board and vanish under
+        # paint's "taller window" clip -- s/m looked like no-ops.
+        roost.collect_workers = lambda: [
+            worker(name="w1", idle_secs=5, ctx_tokens=1000),
+            worker(name="w2", idle_secs=5, ctx_tokens=1000),
+        ]
+        roost.collect_local_models = lambda: []
+        lines, _, _ = roost.frame(view="models")
+        text = "\n".join(lines)
+        self.assertLess(text.find("LOCAL MODELS"), text.find("w1"))
 
 
 

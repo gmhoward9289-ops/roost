@@ -2295,7 +2295,13 @@ def bucket(w):
     tok = w["ctx_tokens"] or 0
     idle = w["idle_secs"]
     if w["ctx_tokens"] is None:
-        # No transcript yet -- genuinely unknown, not idle and not working.
+        # No usage yet. A brand-new unknown stays STARTING; once it has been
+        # idle for a minute it is noise -- Cursor composers often never grow a
+        # usage block at all, and without this they flood STARTING forever
+        # (never reaching QUIET collapse), burying the ranked board and every
+        # panel that paints below it.
+        if idle is not None and idle >= 60:
+            return 4, "QUIET"
         return 3, "STARTING"
     if pct >= NEAR_LIMIT_PCT:
         return 0, "NEAR LIMIT"
@@ -2749,7 +2755,10 @@ def frame(view=None, sel=None):
         sel = min(sel, len(rows) - 1) if rows else None
     # Infra leads because it is a constant: one quiet line you skim past, which
     # is exactly the weight it deserves until something turns red.
-    lines = render_infra(infra_cached()) + render(workers, sel)
+    lines = render_infra(infra_cached())
+    # Panels paint *above* the worker table. Below it they disappeared under
+    # "taller window" truncation whenever the board was long -- pressing s/m/a
+    # looked like a no-op even though the view toggled.
     if view == "agents":
         live_sids = set(w["session_id"] for w in workers if w.get("session_id"))
         lines.extend(render_subagents(collect_subagents(live_sids)))
@@ -2766,6 +2775,7 @@ def frame(view=None, sel=None):
     elif view == "advice":
         lines.append("")
         lines.extend(advise(workers))
+    lines.extend(render(workers, sel))
     prune_caches()
     return lines, rows, sel
 
@@ -2954,8 +2964,8 @@ def paint(lines, vt):
     if len(body) > rows - 1:
         hidden = len(body) - (rows - 2)
         body = body[: rows - 2] + [clip_ansi(
-            c("... %d more line(s) below -- taller window, or s/a/m/u/g/r/h to close a panel"
-              % hidden, DIM), cols - 1)]
+            c("... %d more line(s) below -- taller window, or close a panel "
+              "(s/a/m/u/g/r/h)" % hidden, DIM), cols - 1)]
 
     # Version, bottom-right. Stamped onto whatever the last visible line turns
     # out to be -- including the overflow notice above -- so it cannot itself be
