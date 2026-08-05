@@ -1894,6 +1894,8 @@ class TestCursorAdapter(unittest.TestCase):
     """Cursor composers land through agent-transcript JSONL, not pid files."""
 
     FIXTURE = Path(__file__).parent / "fixtures" / "cursor" / "sample.jsonl"
+    TASK_ONLY = Path(__file__).parent / "fixtures" / "cursor" / "task_only.jsonl"
+    HEADERS_DB = Path(__file__).parent / "fixtures" / "cursor" / "headers.sqlite"
 
     def test_cursor_project_slug_matches_cursor_layout(self):
         self.assertEqual(
@@ -1907,6 +1909,60 @@ class TestCursorAdapter(unittest.TestCase):
         self.assertEqual(info["prompt"], "Add cursor support to roost")
         self.assertEqual(len(info["ctx_history"]), 2)
 
+    def test_scan_falls_back_to_task_tool_use_model_when_usage_absent(self):
+        # Live COOPER transcripts carry no usage blocks; the model string lives
+        # on Task tool_use inputs. Without this fallback every row shows "-".
+        info = roost.scan_cursor_transcript(str(self.TASK_ONLY))
+        self.assertEqual(info["model"], "claude-fable-5-thinking-high")
+        self.assertIsNone(info["ctx_tokens"])
+        self.assertEqual(info["prompt"], "Only Task models, no usage")
+
+    def test_composer_headers_skip_drafts_and_subagents(self):
+        rows = roost.read_cursor_composer_headers(self.HEADERS_DB)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["composer_id"],
+                         "abc12345-aaaa-bbbb-cccc-ddddeeeeffff")
+        self.assertEqual(rows[0]["name"], "Add cursor support to roost")
+        self.assertAlmostEqual(rows[0]["ctx_pct"], 42.5)
+
+    def test_collect_cursor_workers_prefer_headers_for_ctx_pct(self):
+        td = tempfile.TemporaryDirectory()
+        root = Path(td.name) / "projects" / "c-demo-roost" / "agent-transcripts"
+        cid = "abc12345-aaaa-bbbb-cccc-ddddeeeeffff"
+        comp = root / cid
+        comp.mkdir(parents=True)
+        shutil.copy(self.FIXTURE, comp / (cid + ".jsonl"))
+        old_home = roost.CURSOR_HOME
+        old_projects = roost.CURSOR_PROJECTS_DIR
+        old_backends = os.environ.get(roost.BACKENDS_ENV)
+        old_idle = roost.CURSOR_MAX_IDLE_SECS
+        old_db = os.environ.get(roost.CURSOR_STATE_DB_ENV)
+        try:
+            roost.CURSOR_HOME = Path(td.name)
+            roost.CURSOR_PROJECTS_DIR = roost.CURSOR_HOME / "projects"
+            roost.CURSOR_MAX_IDLE_SECS = 86400
+            os.environ[roost.BACKENDS_ENV] = "cursor"
+            os.environ[roost.CURSOR_STATE_DB_ENV] = str(self.HEADERS_DB)
+            rows = roost.collect_cursor_workers()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["source"], "cursor")
+            self.assertAlmostEqual(rows[0]["ctx_pct"], 42.5)
+            self.assertEqual(rows[0]["task"], "Add cursor support to roost")
+            self.assertIsNone(rows[0]["pid"])
+        finally:
+            roost.CURSOR_HOME = old_home
+            roost.CURSOR_PROJECTS_DIR = old_projects
+            roost.CURSOR_MAX_IDLE_SECS = old_idle
+            if old_backends is None:
+                os.environ.pop(roost.BACKENDS_ENV, None)
+            else:
+                os.environ[roost.BACKENDS_ENV] = old_backends
+            if old_db is None:
+                os.environ.pop(roost.CURSOR_STATE_DB_ENV, None)
+            else:
+                os.environ[roost.CURSOR_STATE_DB_ENV] = old_db
+            td.cleanup()
+
     def test_collect_cursor_workers_respects_backends_and_idle_window(self):
         td = tempfile.TemporaryDirectory()
         root = Path(td.name) / "projects" / "c-demo-roost" / "agent-transcripts"
@@ -1917,11 +1973,15 @@ class TestCursorAdapter(unittest.TestCase):
         old_home = roost.CURSOR_HOME
         old_backends = os.environ.get(roost.BACKENDS_ENV)
         old_idle = roost.CURSOR_MAX_IDLE_SECS
+        old_db = os.environ.get(roost.CURSOR_STATE_DB_ENV)
         try:
             roost.CURSOR_HOME = Path(td.name)
             roost.CURSOR_PROJECTS_DIR = roost.CURSOR_HOME / "projects"
             roost.CURSOR_MAX_IDLE_SECS = 86400
             os.environ[roost.BACKENDS_ENV] = "cursor"
+            # Force transcript-only path: point at a missing DB.
+            os.environ[roost.CURSOR_STATE_DB_ENV] = str(
+                Path(td.name) / "missing.vscdb")
             rows = roost.collect_cursor_workers()
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["source"], "cursor")
@@ -1936,7 +1996,17 @@ class TestCursorAdapter(unittest.TestCase):
                 os.environ.pop(roost.BACKENDS_ENV, None)
             else:
                 os.environ[roost.BACKENDS_ENV] = old_backends
+            if old_db is None:
+                os.environ.pop(roost.CURSOR_STATE_DB_ENV, None)
+            else:
+                os.environ[roost.CURSOR_STATE_DB_ENV] = old_db
             td.cleanup()
+
+    def test_composer_window_known_for_cursor_models(self):
+        self.assertEqual(roost.window_for(1000, "composer-2.5-fast"),
+                         (200000, "200k"))
+        self.assertEqual(roost.window_for(1000, "gpt-5.6-terra-medium"),
+                         (200000, "200k"))
 
     def test_mixed_fleet_shows_src_column(self):
         out = "\n".join(roost.render([

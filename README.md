@@ -365,10 +365,13 @@ Set `ROOST_BACKENDS=claude` for Claude-only. Cursor rows show in the `SRC`
 column when both are present. Cursor composers are read-only in interactive
 mode — `x` cannot stop them (there is no pid), and `y` copies the composer id.
 
-Cursor transcripts are supplementary on disk; roost reads the JSONL tails only.
-Composers older than `ROOST_CURSOR_MAX_IDLE_SECS` (default 24h) drop off the
-board. See epic [#48](https://github.com/gmhoward9289-ops/roost/issues/48) and
-`python scripts/cursor_recon.py` for the full storage map.
+Cursor transcripts are supplementary on disk; roost prefers the
+`composerHeaders` table in Cursor's `state.vscdb` for name and context %,
+and falls back to JSONL tails when the DB is missing. Composers older than
+`ROOST_CURSOR_MAX_IDLE_SECS` (default 24h) drop off the board. See
+`docs/cursor-on-disk.md` and epic
+[#48](https://github.com/gmhoward9289-ops/roost/issues/48).
+`python scripts/cursor_recon.py` inventories the live layout.
 
 **Context** is the last assistant turn's `input_tokens + cache_read_input_tokens
 + cache_creation_input_tokens`. Cross-checked against an independent tool on the

@@ -59,6 +59,7 @@ import os
 import shutil
 import signal
 import socket
+import sqlite3
 import re
 import subprocess
 import sys
@@ -173,9 +174,27 @@ REMOTE_TIMEOUT_SECS = 15
 LOG_PATH = HOME / ".claude" / "logs" / "roost.jsonl"
 LOG_MAX_LINES = 5000
 
-# Cursor composers have no pid; show any transcript touched within this window.
+# Cursor composers have no pid; show any transcript / header touched within this
+# window. composerHeaders.lastUpdatedAt is the preferred freshness signal.
 CURSOR_MAX_IDLE_SECS = int(os.environ.get(CURSOR_MAX_IDLE_ENV, "86400"))
+
+# Cursor's global SQLite (composer index + bubble content). Overridable for
+# fixtures; default follows the OS app-support layout, not CURSOR_AGENT_HOME.
+CURSOR_STATE_DB_ENV = "ROOST_CURSOR_STATE_DB"
 # -----------------------------------------------------------------------------
+
+
+def cursor_state_db():
+    """Path to Cursor's global state.vscdb, or None if unset and unknown."""
+    override = os.environ.get(CURSOR_STATE_DB_ENV)
+    if override:
+        return Path(override)
+    if sys.platform == "win32":
+        return HOME / "AppData" / "Roaming" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+    if sys.platform == "darwin":
+        return (HOME / "Library" / "Application Support" / "Cursor" / "User"
+                / "globalStorage" / "state.vscdb")
+    return HOME / ".config" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
 
 # Set in main(); --no-log turns it off.
 LOGGING = True
@@ -235,6 +254,14 @@ MODEL_WINDOWS = {
     "claude-sonnet-4-5-20250929": 200000,
     "claude-opus-4-5-20251101": 200000,
     "claude-opus-4-1-20250805": 200000,
+    # Cursor agent models (seen in Task tool_use and composer modelConfig).
+    # Window sizes are Cursor's published defaults; override with ROOST_WINDOW_TIERS
+    # once that seam lands (#8). Prefix match covers -fast / -thinking suffixes.
+    "composer-2.5": 200000,
+    "composer-2": 200000,
+    "gpt-5.6": 200000,
+    "gpt-5": 200000,
+    "cursor-grok-4.5": 200000,
 }
 
 WINDOW_TIERS = ((200000, "200k"), (1000000, "1M"))
@@ -833,8 +860,29 @@ def _cursor_task_from_text(text):
     return " ".join(str(text).split())
 
 
+def _cursor_model_from_content(content):
+    """Newest Task tool_use model, if any. Parent transcripts rarely carry
+    message.model; the model string lives on spawned Task calls instead."""
+    if not isinstance(content, list):
+        return None
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "tool_use":
+            continue
+        if part.get("name") != "Task":
+            continue
+        inp = part.get("input")
+        if isinstance(inp, dict) and inp.get("model"):
+            return str(inp["model"])
+    return None
+
+
 def scan_cursor_transcript(path):
-    """Model and context from Cursor agent-transcript JSONL."""
+    """Task text, optional usage, and a best-effort model from Cursor JSONL.
+
+    Live COOPER transcripts (71 files measured) carry *no* usage blocks and no
+    message.model -- those live in state.vscdb. This scan still matters for the
+    user_query task text and as a fallback when the SQLite index is missing.
+    """
     out = {"model": None, "ctx_tokens": None, "last_write": None,
            "title": None, "prompt": None, "ctx_history": []}
     if not path:
@@ -859,8 +907,9 @@ def scan_cursor_transcript(path):
             continue
         role = d.get("role")
         msg = d.get("message") or {}
+        content = msg.get("content")
+
         if role == "user" and out["prompt"] is None:
-            content = msg.get("content")
             text = ""
             if isinstance(content, list):
                 for part in content:
@@ -873,16 +922,24 @@ def scan_cursor_transcript(path):
 
         if role != "assistant":
             continue
+
+        if out["model"] is None:
+            out["model"] = (msg.get("model") or d.get("model")
+                            or _cursor_model_from_content(content))
+
         usage = msg.get("usage") or d.get("usage") or {}
         if not usage:
+            if out["model"] and out["prompt"]:
+                # No usage in the file at all is the common case; stop once we
+                # have a task and whatever model the Task tools named.
+                pass
             continue
         ctx = (
             (usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
             + (usage.get("cache_read_input_tokens") or 0)
             + (usage.get("cache_creation_input_tokens") or 0)
         )
-        if out["model"] is None:
-            out["model"] = msg.get("model") or d.get("model")
+        if out["ctx_tokens"] is None:
             out["ctx_tokens"] = ctx
         if len(out["ctx_history"]) < HISTORY_TURNS and (
                 not out["ctx_history"] or out["ctx_history"][-1] != ctx):
@@ -896,15 +953,190 @@ def scan_cursor_transcript(path):
     return out
 
 
-def collect_cursor_workers():
+def _cursor_ms_to_epoch(ms):
+    """composerHeaders timestamps are ms since epoch; tolerate seconds too."""
+    if not isinstance(ms, (int, float)) or ms <= 0:
+        return None
+    return ms / 1000.0 if ms > 1e12 else float(ms)
+
+
+def read_cursor_composer_headers(db_path=None):
+    """Non-archived parent composers from state.vscdb's composerHeaders table.
+
+    Returns a list of dicts with composer_id, name, subtitle, ctx_pct,
+    last_write, workspace_id. Empty on any error -- missing DB is normal on a
+    machine that has never run Cursor.
+    """
+    path = Path(db_path) if db_path else cursor_state_db()
+    if path is None or not path.is_file():
+        return []
     rows = []
-    if "cursor" not in _backends() or not CURSOR_PROJECTS_DIR.is_dir():
+    try:
+        # URI mode=ro so we never write; Cursor keeps this file open while
+        # running and a write-mode open can fail or corrupt.
+        uri = "file:%s?mode=ro" % path.resolve().as_posix()
+        con = sqlite3.connect(uri, uri=True, timeout=0.5)
+        try:
+            cur = con.execute(
+                "SELECT composerId, workspaceId, lastUpdatedAt, createdAt, "
+                "isSubagent, value FROM composerHeaders "
+                "WHERE COALESCE(isArchived, 0) = 0")
+            for cid, ws, lu, created, is_sub, val in cur:
+                if is_sub:
+                    continue
+                try:
+                    h = json.loads(val) if val else {}
+                except ValueError:
+                    h = {}
+                if not isinstance(h, dict):
+                    h = {}
+                # Draft empty-state composers are noise on the board.
+                if h.get("isDraft") or cid == "empty-state-draft":
+                    continue
+                if h.get("unifiedMode") == "chat" and h.get("isEphemeral"):
+                    continue
+                pct = h.get("contextUsagePercent")
+                if isinstance(pct, (int, float)):
+                    pct = float(pct)
+                else:
+                    pct = None
+                last = _cursor_ms_to_epoch(h.get("lastUpdatedAt") or lu
+                                          or h.get("createdAt") or created)
+                name = (h.get("name") or "").strip() or None
+                subtitle = (h.get("subtitle") or "").strip() or None
+                rows.append({
+                    "composer_id": cid,
+                    "workspace_id": ws or (h.get("workspaceIdentifier") or {}).get("id"),
+                    "name": name,
+                    "subtitle": subtitle,
+                    "ctx_pct": pct,
+                    "last_write": last,
+                    "mode": h.get("unifiedMode") or "",
+                })
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError, ValueError):
+        return []
+    return rows
+
+
+def _cursor_transcript_for(composer_id):
+    if not composer_id or not CURSOR_PROJECTS_DIR.is_dir():
+        return None, ""
+    pattern = str(CURSOR_PROJECTS_DIR / "*" / "agent-transcripts"
+                  / composer_id / "*")
+    hits = sorted(glob.glob(pattern))
+    for path_str in hits:
+        path = Path(path_str)
+        if path.suffix in (".jsonl", ".txt"):
+            slug = path.parent.parent.parent.name
+            return str(path), slug
+    return None, ""
+
+
+def _cursor_worker_row(composer_id, name=None, task=None, task_src="-",
+                       model="-", ctx_tokens=None, ctx_pct=None, window="-",
+                       ctx_history=None, idle_secs=None, age_secs=None,
+                       slug="", flow=None):
+    short = composer_id[:8] if len(composer_id) >= 8 else composer_id
+    project = slug.rsplit("-", 1)[-1] if slug else "-"
+    return {
+        "source": "cursor",
+        "name": name or ("cursor/" + short),
+        "pid": None,
+        "session_id": composer_id,
+        "cwd": "",
+        "project": project,
+        "cursor_slug": slug,
+        "model": model or "-",
+        "ctx_tokens": ctx_tokens,
+        "ctx_pct": ctx_pct,
+        "ctx_history": ctx_history or [],
+        "window": window,
+        "task": ascii_safe(task or ""),
+        "task_src": task_src,
+        "idle_secs": idle_secs,
+        "age_secs": age_secs,
+        "flow": flow if flow is not None else (" " * SPARK_LEN),
+        "auto_compact": True,
+    }
+
+
+def collect_cursor_workers():
+    """Cursor composers: prefer composerHeaders (name + CTX%), fall back to
+    agent-transcript JSONL when the SQLite index is absent."""
+    rows = []
+    if "cursor" not in _backends():
         return rows
     now = time.time()
+    seen = set()
+
+    for h in read_cursor_composer_headers():
+        cid = h["composer_id"]
+        last = h["last_write"]
+        if last is None:
+            continue
+        idle = now - last
+        if idle > CURSOR_MAX_IDLE_SECS:
+            continue
+        seen.add(cid)
+        tpath, slug = _cursor_transcript_for(cid)
+        info = scan_cursor_transcript(tpath) if tpath else {
+            "model": None, "ctx_tokens": None, "prompt": None,
+            "title": None, "ctx_history": []}
+        # Headers already store Cursor's own context %; trust that over any
+        # transcript inference (transcripts on COOPER carry no usage at all).
+        pct = h["ctx_pct"]
+        win_label = "-"
+        tok = info.get("ctx_tokens")
+        model = info.get("model") or "-"
+        if pct is not None and tok is None:
+            # Reverse the % against the known Cursor default window so TOKENS
+            # is an estimate, marked by the window label without a tilde only
+            # when we also know the model family.
+            window, win_label = window_for(1, model if model != "-" else "composer-2.5")
+            tok = int(round(pct / 100.0 * window))
+            win_label = _window_label(window)
+        elif tok is not None:
+            window, win_label = window_for(tok, model if model != "-" else None)
+            if pct is None:
+                pct = 100.0 * tok / float(window)
+
+        flow = " " * SPARK_LEN
+        st = _SPARK.setdefault(
+            cid, {"prev": None, "t": 0.0, "hist": deque(maxlen=SPARK_LEN)})
+        if tok is not None and now - st["t"] >= SPARK_MIN_STEP:
+            if st["prev"] is not None:
+                st["hist"].append(max(0, tok - st["prev"]))
+            st["prev"] = tok
+            st["t"] = now
+        flow = spark(st["hist"])
+
+        title = h["name"]
+        prompt = info.get("prompt") or h["subtitle"]
+        task = title or prompt or ""
+        task_src = "title" if title else ("prompt" if prompt else "-")
+        short = cid[:8] if len(cid) >= 8 else cid
+        display = ("cursor/" + short) if not title else ("cursor/" + short)
+        # Keep the WORKER column short and stable; the full composer name is
+        # the TASK text -- same split Claude Code uses (name vs customTitle).
+        rows.append(_cursor_worker_row(
+            cid, name=display, task=task, task_src=task_src, model=model,
+            ctx_tokens=tok, ctx_pct=pct, window=win_label,
+            ctx_history=info.get("ctx_history") or [], idle_secs=idle,
+            slug=slug, flow=flow))
+
+    # Transcript-only fallback: composers with JSONL but no header row (older
+    # Cursor builds, or state.vscdb unavailable).
+    if not CURSOR_PROJECTS_DIR.is_dir():
+        return rows
     pattern = str(CURSOR_PROJECTS_DIR / "*" / "agent-transcripts" / "*" / "*")
     for path_str in glob.glob(pattern):
         path = Path(path_str)
         if path.suffix not in (".jsonl", ".txt"):
+            continue
+        composer_id = path.parent.name
+        if composer_id in seen:
             continue
         info = scan_cursor_transcript(str(path))
         last = info["last_write"]
@@ -913,18 +1145,16 @@ def collect_cursor_workers():
         idle = now - last
         if idle > CURSOR_MAX_IDLE_SECS:
             continue
-        composer_id = path.parent.name
-        slug = path.parent.parent.parent.parent.name
-        sid = composer_id
+        seen.add(composer_id)
+        slug = path.parent.parent.parent.name
         pct = None
         win_label = "-"
         if info["ctx_tokens"]:
             window, win_label = window_for(info["ctx_tokens"], info["model"])
             pct = 100.0 * info["ctx_tokens"] / float(window)
-
         flow = " " * SPARK_LEN
         st = _SPARK.setdefault(
-            sid, {"prev": None, "t": 0.0, "hist": deque(maxlen=SPARK_LEN)})
+            composer_id, {"prev": None, "t": 0.0, "hist": deque(maxlen=SPARK_LEN)})
         tok = info["ctx_tokens"]
         if tok is not None and now - st["t"] >= SPARK_MIN_STEP:
             if st["prev"] is not None:
@@ -932,29 +1162,15 @@ def collect_cursor_workers():
             st["prev"] = tok
             st["t"] = now
         flow = spark(st["hist"])
-
         short = composer_id[:8] if len(composer_id) >= 8 else composer_id
-        project = slug.rsplit("-", 1)[-1] if slug else "-"
-        rows.append({
-            "source": "cursor",
-            "name": "cursor/" + short,
-            "pid": None,
-            "session_id": sid,
-            "cwd": "",
-            "project": project,
-            "cursor_slug": slug,
-            "model": info["model"] or "-",
-            "ctx_tokens": info["ctx_tokens"],
-            "ctx_pct": pct,
-            "ctx_history": info["ctx_history"],
-            "window": win_label,
-            "task": ascii_safe(info["title"] or info["prompt"] or ""),
-            "task_src": "title" if info["title"] else ("prompt" if info["prompt"] else "-"),
-            "idle_secs": idle,
-            "age_secs": None,
-            "flow": flow,
-            "auto_compact": True,
-        })
+        rows.append(_cursor_worker_row(
+            composer_id, name="cursor/" + short,
+            task=info["title"] or info["prompt"] or "",
+            task_src=("title" if info["title"] else
+                      ("prompt" if info["prompt"] else "-")),
+            model=info["model"] or "-", ctx_tokens=info["ctx_tokens"],
+            ctx_pct=pct, window=win_label, ctx_history=info["ctx_history"],
+            idle_secs=idle, slug=slug, flow=flow))
     return rows
 
 

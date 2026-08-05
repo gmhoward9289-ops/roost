@@ -1,0 +1,2 @@
+{"role":"user","message":{"content":[{"type":"text","text":"<user_query>\nOnly Task models, no usage\n</user_query>"}]}}
+{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Task","input":{"description":"Scout","model":"claude-fable-5-thinking-high","subagent_type":"generalPurpose","prompt":"go"}}]}}
