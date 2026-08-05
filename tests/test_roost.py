@@ -2004,9 +2004,11 @@ class TestCursorAdapter(unittest.TestCase):
 
     def test_composer_window_known_for_cursor_models(self):
         self.assertEqual(roost.window_for(1000, "composer-2.5-fast"),
-                         (200000, "200k"))
+                         (256000, "256k"))
         self.assertEqual(roost.window_for(1000, "gpt-5.6-terra-medium"),
-                         (200000, "200k"))
+                         (256000, "256k"))
+        self.assertEqual(roost.window_for(1000, "grok-4.5"),
+                         (256000, "256k"))
 
     def test_mixed_fleet_shows_src_column(self):
         out = "\n".join(roost.render([

@@ -254,17 +254,18 @@ MODEL_WINDOWS = {
     "claude-sonnet-4-5-20250929": 200000,
     "claude-opus-4-5-20251101": 200000,
     "claude-opus-4-1-20250805": 200000,
-    # Cursor agent models (seen in Task tool_use and composer modelConfig).
-    # Window sizes are Cursor's published defaults; override with ROOST_WINDOW_TIERS
-    # once that seam lands (#8). Prefix match covers -fast / -thinking suffixes.
-    "composer-2.5": 200000,
-    "composer-2": 200000,
-    "gpt-5.6": 200000,
-    "gpt-5": 200000,
-    "cursor-grok-4.5": 200000,
+    # Cursor agent models (Task tool_use / modelConfig). Windows measured from
+    # composerData.promptTokenBreakdown.maxTokens on COOPER (= 256000), not
+    # Anthropic docs. Prefix match covers -fast / -thinking / -medium suffixes.
+    "composer-2.5": 256000,
+    "composer-2": 256000,
+    "gpt-5.6": 256000,
+    "gpt-5": 256000,
+    "cursor-grok-4.5": 256000,
+    "grok-4.5": 256000,
 }
 
-WINDOW_TIERS = ((200000, "200k"), (1000000, "1M"))
+WINDOW_TIERS = ((200000, "200k"), (256000, "256k"), (1000000, "1M"))
 
 
 def model_window(model):
@@ -282,7 +283,11 @@ def model_window(model):
 
 
 def _window_label(size):
-    return "1M" if size >= 1000000 else "%dk" % (size // 1000)
+    if size >= 1000000:
+        return "1M"
+    if size % 1000 == 0:
+        return "%dk" % (size // 1000)
+    return str(size)
 
 
 def window_for(tokens, model=None):

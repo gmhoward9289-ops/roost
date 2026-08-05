@@ -14,7 +14,7 @@ Re-run `python scripts/cursor_recon.py` after a Cursor upgrade.
 | --- | --- |
 | `%APPDATA%/Cursor/User/globalStorage/state.vscdb` → `composerHeaders` | live list, name, `contextUsagePercent`, idle (`lastUpdatedAt`), subagent flag |
 | `~/.cursor/projects/<slug>/agent-transcripts/<id>/<id>.jsonl` | task text (`<user_query>`), Task tool_use model names |
-| `cursorDiskKV` `composerData:{id}` | richer fields (`contextTokensUsed`, `modelConfig`) — heavier; skip in v1 |
+| `cursorDiskKV` `composerData:{id}` | `promptTokenBreakdown.maxTokens` (=256k measured); richer modelConfig — optional next |
 | `~/.cursor/chats/**/store.db` | **absent on COOPER** (0 files) — do not require |
 | `ai-tracking/ai-code-tracking.db` | titles/models possible; empty `conversation_summaries` when probed |
 
