@@ -13,6 +13,7 @@ import io
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -2009,6 +2010,145 @@ class TestCursorAdapter(unittest.TestCase):
                          (256000, "256k"))
         self.assertEqual(roost.window_for(1000, "grok-4.5"),
                          (256000, "256k"))
+
+    def test_folder_uri_to_path_decodes_windows_file_uri(self):
+        got = roost.cursor_folder_uri_to_path(
+            "file:///c%3A/Users/gmhow/dev/roost")
+        self.assertEqual(Path(got).resolve(),
+                         Path(r"C:\Users\gmhow\dev\roost").resolve())
+        self.assertIsNone(
+            roost.cursor_folder_uri_to_path(
+                "vscode-remote://background-composer/workspace"))
+
+    def test_workspace_folders_map_id_to_cwd(self):
+        td = tempfile.TemporaryDirectory()
+        root = Path(td.name)
+        d = root / "wsid123"
+        d.mkdir()
+        (d / "workspace.json").write_text(json.dumps({
+            "folder": "file:///c%3A/Users/gmhow/dev/roost",
+        }), encoding="utf-8")
+        got = roost.read_cursor_workspace_folders(root)
+        self.assertEqual(Path(got["wsid123"]).resolve(),
+                         Path(r"C:\Users\gmhow\dev\roost").resolve())
+        td.cleanup()
+
+    def test_collect_cursor_workers_sets_cwd_from_workspace_storage(self):
+        td = tempfile.TemporaryDirectory()
+        db = Path(td.name) / "state.vscdb"
+        # Rebuild a tiny headers DB with a workspaceId.
+        con = sqlite3.connect(str(db))
+        con.execute(
+            "CREATE TABLE composerHeaders ("
+            "composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER, "
+            "lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER, "
+            "recency INTEGER, checkpointAt INTEGER, value TEXT)")
+        now_ms = int(time.time() * 1000)
+        val = json.dumps({
+            "type": "head", "composerId": "cwd-comp-1",
+            "name": "Cwd mapping", "contextUsagePercent": 10.0,
+            "lastUpdatedAt": now_ms, "unifiedMode": "agent",
+        })
+        con.execute(
+            "INSERT INTO composerHeaders VALUES (?,?,?,?,?,?,?,?,?)",
+            ("cwd-comp-1", "ws-cwd", now_ms, now_ms, 0, 0, now_ms, None, val))
+        con.commit()
+        con.close()
+        ws = Path(td.name) / "workspaceStorage" / "ws-cwd"
+        ws.mkdir(parents=True)
+        (ws / "workspace.json").write_text(json.dumps({
+            "folder": "file:///c%3A/Users/gmhow/dev/heron-ops",
+        }), encoding="utf-8")
+        old_backends = os.environ.get(roost.BACKENDS_ENV)
+        old_db = os.environ.get(roost.CURSOR_STATE_DB_ENV)
+        old_ws = os.environ.get(roost.CURSOR_WORKSPACE_STORAGE_ENV)
+        old_idle = roost.CURSOR_MAX_IDLE_SECS
+        old_home = roost.CURSOR_HOME
+        old_projects = roost.CURSOR_PROJECTS_DIR
+        try:
+            # Empty projects dir so live COOPER transcripts are not merged in.
+            empty = Path(td.name) / "empty-projects"
+            empty.mkdir()
+            roost.CURSOR_HOME = Path(td.name)
+            roost.CURSOR_PROJECTS_DIR = empty
+            os.environ[roost.BACKENDS_ENV] = "cursor"
+            os.environ[roost.CURSOR_STATE_DB_ENV] = str(db)
+            os.environ[roost.CURSOR_WORKSPACE_STORAGE_ENV] = str(
+                Path(td.name) / "workspaceStorage")
+            roost.CURSOR_MAX_IDLE_SECS = 86400
+            rows = roost.collect_cursor_workers()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(Path(rows[0]["cwd"]).resolve(),
+                             Path(r"C:\Users\gmhow\dev\heron-ops").resolve())
+            self.assertEqual(rows[0]["project"], "heron-ops")
+        finally:
+            roost.CURSOR_MAX_IDLE_SECS = old_idle
+            roost.CURSOR_HOME = old_home
+            roost.CURSOR_PROJECTS_DIR = old_projects
+            for key, old in ((roost.BACKENDS_ENV, old_backends),
+                             (roost.CURSOR_STATE_DB_ENV, old_db),
+                             (roost.CURSOR_WORKSPACE_STORAGE_ENV, old_ws)):
+                if old is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = old
+            td.cleanup()
+
+    def test_collect_cursor_subagents_joins_parent(self):
+        td = tempfile.TemporaryDirectory()
+        db = Path(td.name) / "state.vscdb"
+        con = sqlite3.connect(str(db))
+        con.execute(
+            "CREATE TABLE composerHeaders ("
+            "composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER, "
+            "lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER, "
+            "recency INTEGER, checkpointAt INTEGER, value TEXT)")
+        now_ms = int(time.time() * 1000)
+        parent = "parent-aaaa-bbbb-cccc-ddddeeeeffff"
+        child = "child-aaaa-bbbb-cccc-ddddeeeeffff"
+        pval = json.dumps({
+            "type": "head", "composerId": parent, "name": "Parent",
+            "contextUsagePercent": 40.0, "lastUpdatedAt": now_ms,
+            "unifiedMode": "agent",
+        })
+        cval = json.dumps({
+            "type": "head", "composerId": child, "name": "Scout loaders",
+            "contextUsagePercent": 22.0, "lastUpdatedAt": now_ms,
+            "unifiedMode": "agent",
+            "subagentInfo": {
+                "subagentTypeName": "explore",
+                "parentComposerId": parent,
+            },
+        })
+        con.execute(
+            "INSERT INTO composerHeaders VALUES (?,?,?,?,?,?,?,?,?)",
+            (parent, "ws", now_ms, now_ms, 0, 0, now_ms, None, pval))
+        con.execute(
+            "INSERT INTO composerHeaders VALUES (?,?,?,?,?,?,?,?,?)",
+            (child, "ws", now_ms, now_ms, 0, 1, now_ms, None, cval))
+        con.commit()
+        con.close()
+        old_backends = os.environ.get(roost.BACKENDS_ENV)
+        try:
+            os.environ[roost.BACKENDS_ENV] = "cursor"
+            agents = roost.collect_cursor_subagents(
+                {parent}, db_path=db)
+            self.assertEqual(len(agents), 1)
+            self.assertEqual(agents[0]["source"], "cursor")
+            self.assertEqual(agents[0]["agent_type"], "explore")
+            self.assertEqual(agents[0]["parent_sid"], parent)
+            self.assertEqual(agents[0]["task"], "Scout loaders")
+            self.assertTrue(agents[0]["parent_live"])
+            # Parent not live → drop unless recent orphan; here parent missing.
+            orphan = roost.collect_cursor_subagents(set(), db_path=db)
+            self.assertEqual(len(orphan), 1)  # still within AGENT_RECENT_SECS
+            self.assertEqual(orphan[0]["state"], "orphan")
+        finally:
+            if old_backends is None:
+                os.environ.pop(roost.BACKENDS_ENV, None)
+            else:
+                os.environ[roost.BACKENDS_ENV] = old_backends
+            td.cleanup()
 
     def test_mixed_fleet_shows_src_column(self):
         out = "\n".join(roost.render([

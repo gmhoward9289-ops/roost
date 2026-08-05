@@ -69,6 +69,7 @@ import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 # release-please rewrites the line below on a release PR. The marker is on
 # its own line rather than trailing the assignment because release.yml,
@@ -181,6 +182,7 @@ CURSOR_MAX_IDLE_SECS = int(os.environ.get(CURSOR_MAX_IDLE_ENV, "86400"))
 # Cursor's global SQLite (composer index + bubble content). Overridable for
 # fixtures; default follows the OS app-support layout, not CURSOR_AGENT_HOME.
 CURSOR_STATE_DB_ENV = "ROOST_CURSOR_STATE_DB"
+CURSOR_WORKSPACE_STORAGE_ENV = "ROOST_CURSOR_WORKSPACE_STORAGE"
 # -----------------------------------------------------------------------------
 
 
@@ -195,6 +197,67 @@ def cursor_state_db():
         return (HOME / "Library" / "Application Support" / "Cursor" / "User"
                 / "globalStorage" / "state.vscdb")
     return HOME / ".config" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+
+
+def cursor_workspace_storage():
+    """Per-window workspaceStorage root (holds workspace.json → folder URI)."""
+    override = os.environ.get(CURSOR_WORKSPACE_STORAGE_ENV)
+    if override:
+        return Path(override)
+    if sys.platform == "win32":
+        return HOME / "AppData" / "Roaming" / "Cursor" / "User" / "workspaceStorage"
+    if sys.platform == "darwin":
+        return (HOME / "Library" / "Application Support" / "Cursor" / "User"
+                / "workspaceStorage")
+    return HOME / ".config" / "Cursor" / "User" / "workspaceStorage"
+
+
+def cursor_folder_uri_to_path(uri):
+    """Decode a workspace.json folder URI to a local path, or None.
+
+    Accepts file:///… only; vscode-remote:// and other schemes are skipped.
+    """
+    if not uri or not isinstance(uri, str):
+        return None
+    if not uri.startswith("file:"):
+        return None
+    try:
+        parsed = urlparse(uri)
+        path = unquote(parsed.path or "")
+    except ValueError:
+        return None
+    if not path:
+        return None
+    # Windows: file:///c%3A/Users/... → /c:/Users/... → c:/Users/...
+    if sys.platform == "win32" and path.startswith("/") and len(path) >= 3 and path[2] == ":":
+        path = path[1:]
+    return str(Path(path))
+
+
+def read_cursor_workspace_folders(storage_dir=None):
+    """workspaceId → absolute cwd from workspaceStorage/*/workspace.json."""
+    root = Path(storage_dir) if storage_dir else cursor_workspace_storage()
+    out = {}
+    if not root.is_dir():
+        return out
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return out
+    for d in entries:
+        wj = d / "workspace.json"
+        if not wj.is_file():
+            continue
+        try:
+            data = json.loads(wj.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        cwd = cursor_folder_uri_to_path(data.get("folder"))
+        if cwd:
+            out[d.name] = cwd
+    return out
 
 # Set in main(); --no-log turns it off.
 LOGGING = True
@@ -774,7 +837,7 @@ def agent_first_prompt(path, agent_id):
     return label
 
 
-def collect_subagents(live_sids):
+def collect_claude_subagents(live_sids):
     """Subagents run inside their parent process, so they have no pid of their
     own -- but each gets its own transcript at
 
@@ -823,6 +886,7 @@ def collect_subagents(live_sids):
             state = "idle"
 
         rows.append({
+            "source": "claude",
             "agent_id": agent_id,
             # Sanitised like task text: it comes out of a transcript, and a
             # crafted agentType could otherwise carry escapes into the TUI.
@@ -837,6 +901,112 @@ def collect_subagents(live_sids):
             "state": state,
             "parent_live": parent_live,
         })
+    return rows
+
+
+def collect_cursor_subagents(live_sids, db_path=None):
+    """Cursor Task/subagent composers from composerHeaders (isSubagent=1).
+
+    Same row shape as Claude subagents so render_subagents() is shared. Parent
+    liveness uses the parent composerId against live_sids (Cursor worker
+    session_ids are composer UUIDs).
+    """
+    if "cursor" not in _backends():
+        return []
+    path = Path(db_path) if db_path else cursor_state_db()
+    if path is None or not path.is_file():
+        return []
+    rows = []
+    now = time.time()
+    try:
+        uri = "file:%s?mode=ro" % path.resolve().as_posix()
+        con = sqlite3.connect(uri, uri=True, timeout=0.5)
+        try:
+            cur = con.execute(
+                "SELECT composerId, lastUpdatedAt, createdAt, value "
+                "FROM composerHeaders "
+                "WHERE COALESCE(isSubagent, 0) = 1 "
+                "AND COALESCE(isArchived, 0) = 0")
+            for cid, lu, created, val in cur:
+                try:
+                    h = json.loads(val) if val else {}
+                except ValueError:
+                    h = {}
+                if not isinstance(h, dict):
+                    h = {}
+                info = h.get("subagentInfo") if isinstance(h.get("subagentInfo"), dict) else {}
+                parent = (info.get("parentComposerId")
+                          or info.get("rootParentConversationId")
+                          or info.get("forkedFromComposerId")
+                          or "")
+                last = _cursor_ms_to_epoch(h.get("lastUpdatedAt") or lu
+                                          or h.get("createdAt") or created)
+                age = (now - last) if last is not None else None
+                parent_live = bool(parent) and parent in live_sids
+                # Keep recently-touched orphans (parent closed) for a while,
+                # matching Claude's AGENT_RECENT_SECS behaviour.
+                if not parent_live and (age is None or age > AGENT_RECENT_SECS):
+                    continue
+                if age is not None and age > CURSOR_MAX_IDLE_SECS:
+                    continue
+                _SEEN_AGENTS.add(cid)
+                pct = h.get("contextUsagePercent")
+                if isinstance(pct, (int, float)):
+                    pct = float(pct)
+                else:
+                    pct = None
+                agent_type = ascii_safe(
+                    info.get("subagentTypeName") or info.get("subagentType") or "")
+                task = ascii_safe(
+                    (h.get("name") or h.get("subtitle") or "").strip() or "-")
+                tpath, _slug = _cursor_transcript_for(cid)
+                tinfo = scan_cursor_transcript(tpath) if tpath else {}
+                model = tinfo.get("model") or "-"
+                tok = tinfo.get("ctx_tokens")
+                win_label = "-"
+                if pct is not None and tok is None:
+                    window, win_label = window_for(
+                        1, model if model != "-" else "composer-2.5")
+                    tok = int(round(pct / 100.0 * window))
+                    win_label = _window_label(window)
+                elif tok is not None:
+                    window, win_label = window_for(
+                        tok, model if model != "-" else None)
+                    if pct is None:
+                        pct = 100.0 * tok / float(window)
+                if not parent_live:
+                    state = "orphan"
+                elif age is not None and age <= AGENT_ACTIVE_SECS:
+                    state = "working"
+                else:
+                    state = "idle"
+                rows.append({
+                    "source": "cursor",
+                    "agent_id": cid,
+                    "agent_type": str(agent_type),
+                    "parent_sid": parent,
+                    "task": task,
+                    "model": model,
+                    "ctx_tokens": tok,
+                    "ctx_pct": pct,
+                    "window": win_label,
+                    "idle_secs": age,
+                    "state": state,
+                    "parent_live": parent_live,
+                })
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError, ValueError):
+        return []
+    return rows
+
+
+def collect_subagents(live_sids):
+    """Claude sidechains plus Cursor Task composers, same row shape."""
+    rows = []
+    if "claude" in _backends():
+        rows.extend(collect_claude_subagents(live_sids))
+    rows.extend(collect_cursor_subagents(live_sids))
     rows.sort(key=lambda r: (r["state"] != "working", r["idle_secs"] or 1e9))
     return rows
 
@@ -1042,15 +1212,18 @@ def _cursor_transcript_for(composer_id):
 def _cursor_worker_row(composer_id, name=None, task=None, task_src="-",
                        model="-", ctx_tokens=None, ctx_pct=None, window="-",
                        ctx_history=None, idle_secs=None, age_secs=None,
-                       slug="", flow=None):
+                       slug="", flow=None, cwd=""):
     short = composer_id[:8] if len(composer_id) >= 8 else composer_id
-    project = slug.rsplit("-", 1)[-1] if slug else "-"
+    if cwd:
+        project = Path(cwd).name or "-"
+    else:
+        project = slug.rsplit("-", 1)[-1] if slug else "-"
     return {
         "source": "cursor",
         "name": name or ("cursor/" + short),
         "pid": None,
         "session_id": composer_id,
-        "cwd": "",
+        "cwd": cwd or "",
         "project": project,
         "cursor_slug": slug,
         "model": model or "-",
@@ -1075,6 +1248,7 @@ def collect_cursor_workers():
         return rows
     now = time.time()
     seen = set()
+    folders = read_cursor_workspace_folders()
 
     for h in read_cursor_composer_headers():
         cid = h["composer_id"]
@@ -1122,14 +1296,17 @@ def collect_cursor_workers():
         task = title or prompt or ""
         task_src = "title" if title else ("prompt" if prompt else "-")
         short = cid[:8] if len(cid) >= 8 else cid
-        display = ("cursor/" + short) if not title else ("cursor/" + short)
+        display = "cursor/" + short
+        cwd = folders.get(h.get("workspace_id") or "") or ""
+        if not slug and cwd:
+            slug = cursor_project_slug(cwd)
         # Keep the WORKER column short and stable; the full composer name is
         # the TASK text -- same split Claude Code uses (name vs customTitle).
         rows.append(_cursor_worker_row(
             cid, name=display, task=task, task_src=task_src, model=model,
             ctx_tokens=tok, ctx_pct=pct, window=win_label,
             ctx_history=info.get("ctx_history") or [], idle_secs=idle,
-            slug=slug, flow=flow))
+            slug=slug, flow=flow, cwd=cwd))
 
     # Transcript-only fallback: composers with JSONL but no header row (older
     # Cursor builds, or state.vscdb unavailable).

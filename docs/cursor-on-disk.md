@@ -48,7 +48,8 @@ into `-` (e.g. `C:\Users\gmhow\dev\roost` → `c-Users-gmhow-dev-roost`).
 | `ctx_tokens` | reverse from pct × known window when headers present; transcript usage if ever present |
 | `idle_secs` | now − `lastUpdatedAt` (ms) |
 | `pid` | **always None** — composers are not OS processes |
-| subagents | `composerHeaders.isSubagent=1` rows (not yet on the SUBAGENTS panel) |
+| `cwd` / `project` | `workspaceStorage/<workspaceId>/workspace.json` `folder` URI |
+| subagents | `composerHeaders.isSubagent=1` + `subagentInfo.parentComposerId` on the SUBAGENTS panel |
 
 ## Freshness
 
