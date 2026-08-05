@@ -433,9 +433,19 @@ class TestSubagentDiscovery(unittest.TestCase):
         roost._SCAN_CACHE.clear()
         roost._AGENT_META.clear()
         roost._AGENT_LABEL.clear()
+        # collect_subagents also merges Cursor Task composers from the host's
+        # real state.vscdb when ROOST_BACKENDS includes cursor (the default).
+        # These cases are Claude-only; pin the env so live COOPER sessions
+        # cannot inflate the row count.
+        self._backends = os.environ.get(roost.BACKENDS_ENV)
+        os.environ[roost.BACKENDS_ENV] = "claude"
 
     def tearDown(self):
         roost.PROJECTS_DIR = self._orig
+        if self._backends is None:
+            os.environ.pop(roost.BACKENDS_ENV, None)
+        else:
+            os.environ[roost.BACKENDS_ENV] = self._backends
 
     def test_finds_subagent_of_a_live_parent(self):
         rows = roost.collect_subagents({self.parent_sid})
@@ -496,9 +506,15 @@ class TestSubagentTypeAndCtx(unittest.TestCase):
         roost._AGENT_LABEL.clear()
         roost._HARVEST_POS.clear()
         roost.COLOR = False
+        self._backends = os.environ.get(roost.BACKENDS_ENV)
+        os.environ[roost.BACKENDS_ENV] = "claude"
 
     def tearDown(self):
         roost.PROJECTS_DIR = self._orig
+        if self._backends is None:
+            os.environ.pop(roost.BACKENDS_ENV, None)
+        else:
+            os.environ[roost.BACKENDS_ENV] = self._backends
 
     def test_later_result_fills_the_type_the_early_record_lacked(self):
         rows = roost.collect_subagents({self.parent_sid})

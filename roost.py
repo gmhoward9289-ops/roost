@@ -1033,9 +1033,11 @@ def collect_cursor_subagents(live_sids, db_path=None):
 def collect_subagents(live_sids):
     """Claude sidechains plus Cursor Task composers, same row shape."""
     rows = []
-    if "claude" in _backends():
+    backends = _backends()
+    if "claude" in backends:
         rows.extend(collect_claude_subagents(live_sids))
-    rows.extend(collect_cursor_subagents(live_sids))
+    if "cursor" in backends:
+        rows.extend(collect_cursor_subagents(live_sids))
     rows.sort(key=lambda r: (r["state"] != "working", r["idle_secs"] or 1e9))
     return rows
 
