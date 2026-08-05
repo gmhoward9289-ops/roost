@@ -1534,7 +1534,8 @@ class TestGatewayCollect(unittest.TestCase):
         (d / "_run.json").write_text(json.dumps({"total": 5}), encoding="utf-8")
         r = self.named(roost.collect_gateway(), "results-paced")
         self.assertAlmostEqual(r["rate_hr"], 1.0, places=6)
-        self.assertAlmostEqual(r["eta_secs"], 7200.0, places=3)
+        # Windows Py3.9 utime/time float noise can be ~2ms; ETA is in seconds.
+        self.assertAlmostEqual(r["eta_secs"], 7200.0, delta=1.0)
 
     def test_a_finished_run_has_no_eta(self):
         self.run_dir("results-finished", outputs=2, age_secs=3600,
