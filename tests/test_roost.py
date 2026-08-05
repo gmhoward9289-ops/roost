@@ -1065,6 +1065,20 @@ class TestAdviceNamesTheTask(unittest.TestCase):
                                              idle_secs=60)]))
         self.assertIn("nothing to act on", out)
 
+    def test_cursor_worker_without_pid_does_not_crash_advice(self):
+        # Pressing 'a' on a Cursor-only (or mixed) board used to TypeError on
+        # "%d" % None -- Cursor composers have no process id.
+        roost.COLOR = False
+        out = "\n".join(roost.advise([worker(
+            name="cursor/f4c5eef0", pid=None, source="cursor",
+            ctx_tokens=226000, ctx_pct=89.0, idle_secs=60,
+            task="Frontend performance check")]))
+        self.assertIn("NEAR LIMIT", out)
+        self.assertIn("cursor/f4c5eef0", out)
+        self.assertNotIn("(pid", out)
+        self.assertIn("Frontend performance check", out)
+
+
 class TestUsageCacheEviction(unittest.TestCase):
     """A deleted transcript's cache entry lived forever and its tokens were
     still summed into the USAGE panel -- wrong numbers plus a slow leak."""

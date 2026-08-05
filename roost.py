@@ -2147,7 +2147,11 @@ def advise(workers):
         tok = r["ctx_tokens"] or 0
         idle_h = (r["idle_secs"] or 0) / 3600.0
         pct = r["ctx_pct"] or 0
-        tag = "%s (pid %d)" % (r["name"], r["pid"])
+        # Cursor composers have no pid; the worker name already carries a short
+        # composer id (cursor/<8hex>). Formatting pid with %d used to crash the
+        # whole TUI the moment ADVICE opened on a mixed fleet.
+        pid = r.get("pid")
+        tag = ("%s (pid %d)" % (r["name"], pid)) if pid is not None else r["name"]
         # The pid alone does not tell you what you would be closing. The task is
         # what makes the call obvious -- "audit the build scripts" is easy to
         # abandon, "migrate the database" is not.
