@@ -1,0 +1,4 @@
+{"role":"user","message":{"content":[{"type":"text","text":"<user_query>\nAdd cursor support to roost\n</user_query>"}]}}
+{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Task","input":{"description":"Explore transcript shapes","model":"composer-2.5-fast","subagent_type":"explore","prompt":"map fields"}}]}}
+{"role":"assistant","message":{"model":"composer-2.5","usage":{"input_tokens":12000,"output_tokens":800,"cache_read_input_tokens":4000},"content":[{"type":"text","text":"On it."}]}}
+{"role":"assistant","message":{"model":"composer-2.5","usage":{"input_tokens":18000,"output_tokens":1200,"cache_read_input_tokens":5000},"content":[{"type":"text","text":"Done."}]}}

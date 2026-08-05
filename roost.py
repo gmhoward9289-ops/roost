@@ -25,12 +25,15 @@ was pressed, never on an index re-resolved afterwards -- rows reorder between
 frames as sessions go quiet, and an index that outlived its frame would
 eventually hit the wrong one.
 
-Three sources, all local and all read-only:
+Sources, all local and all read-only:
 
-  ~/.claude/sessions/<pid>.json    live workers: pid, sessionId, launch cwd, name
-  ~/.claude/projects/*/<sid>.jsonl the transcript -- model in use, and the usage
-                                   block that gives context actually consumed
+  ~/.claude/sessions/<pid>.json    Claude Code workers: pid, sessionId, cwd, name
+  ~/.claude/projects/*/<sid>.jsonl Claude transcripts -- model, usage, task text
+  ~/.cursor/projects/*/agent-transcripts/*/*.jsonl
+                                   Cursor composers (no pid; freshness from mtime)
   127.0.0.1 ports                  ollama / litellm / openwebui
+
+Backends default to both Claude Code and Cursor (ROOST_BACKENDS=claude,cursor).
 
 WORKERS is what each session *is*; INFRA is what it is running against. hyrule has
 no local inference stack, so its INFRA panel reads "not running" -- that is
@@ -56,6 +59,7 @@ import os
 import shutil
 import signal
 import socket
+import sqlite3
 import re
 import subprocess
 import sys
@@ -64,7 +68,8 @@ import threading
 import time
 from collections import deque
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from urllib.parse import unquote, urlparse
 
 # release-please rewrites the line below on a release PR. The marker is on
 # its own line rather than trailing the assignment because release.yml,
@@ -78,6 +83,11 @@ __version__ = "0.7.0"
 HOME = Path.home()
 SESSIONS_DIR = HOME / ".claude" / "sessions"
 PROJECTS_DIR = HOME / ".claude" / "projects"
+CURSOR_HOME_ENV = "CURSOR_AGENT_HOME"
+CURSOR_HOME = Path(os.environ.get(CURSOR_HOME_ENV, str(HOME / ".cursor")))
+CURSOR_PROJECTS_DIR = CURSOR_HOME / "projects"
+BACKENDS_ENV = "ROOST_BACKENDS"
+CURSOR_MAX_IDLE_ENV = "ROOST_CURSOR_MAX_IDLE_SECS"
 
 # The real Anthropic meter -- session/weekly/Fable caps -- has no local source;
 # this cache is written by the "claude-usage-scrape" scheduled task (a Claude
@@ -164,7 +174,119 @@ REMOTE_TIMEOUT_SECS = 15
 # as the hook logs next to it, so the same one-liners read all of them.
 LOG_PATH = HOME / ".claude" / "logs" / "roost.jsonl"
 LOG_MAX_LINES = 5000
+
+# Cursor composers have no pid; show any transcript / header touched within this
+# window. composerHeaders.lastUpdatedAt is the preferred freshness signal.
+CURSOR_MAX_IDLE_SECS = int(os.environ.get(CURSOR_MAX_IDLE_ENV, "86400"))
+
+# Cursor's global SQLite (composer index + bubble content). Overridable for
+# fixtures; default follows the OS app-support layout, not CURSOR_AGENT_HOME.
+CURSOR_STATE_DB_ENV = "ROOST_CURSOR_STATE_DB"
+CURSOR_WORKSPACE_STORAGE_ENV = "ROOST_CURSOR_WORKSPACE_STORAGE"
 # -----------------------------------------------------------------------------
+
+
+def cursor_state_db():
+    """Path to Cursor's global state.vscdb, or None if unset and unknown."""
+    override = os.environ.get(CURSOR_STATE_DB_ENV)
+    if override:
+        return Path(override)
+    if sys.platform == "win32":
+        return HOME / "AppData" / "Roaming" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+    if sys.platform == "darwin":
+        return (HOME / "Library" / "Application Support" / "Cursor" / "User"
+                / "globalStorage" / "state.vscdb")
+    return HOME / ".config" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+
+
+def cursor_workspace_storage():
+    """Per-window workspaceStorage root (holds workspace.json → folder URI)."""
+    override = os.environ.get(CURSOR_WORKSPACE_STORAGE_ENV)
+    if override:
+        return Path(override)
+    if sys.platform == "win32":
+        return HOME / "AppData" / "Roaming" / "Cursor" / "User" / "workspaceStorage"
+    if sys.platform == "darwin":
+        return (HOME / "Library" / "Application Support" / "Cursor" / "User"
+                / "workspaceStorage")
+    return HOME / ".config" / "Cursor" / "User" / "workspaceStorage"
+
+
+def cursor_folder_uri_to_path(uri):
+    """Decode a workspace.json folder URI to a local path, or None.
+
+    Accepts file:///… only; vscode-remote:// and other schemes are skipped.
+    Windows drive URIs (file:///c%3A/Users/...) decode to a PureWindowsPath
+    string on every host -- Path.resolve() on POSIX would otherwise treat
+    'C:\\Users\\...' as relative to the runner cwd.
+    """
+    if not uri or not isinstance(uri, str):
+        return None
+    if not uri.startswith("file:"):
+        return None
+    try:
+        parsed = urlparse(uri)
+        path = unquote(parsed.path or "")
+    except ValueError:
+        return None
+    if not path:
+        return None
+    # Windows: file:///c%3A/Users/... → /c:/Users/... → c:\Users\...
+    if path.startswith("/") and len(path) >= 3 and path[2] == ":":
+        return str(PureWindowsPath(path[1:]))
+    return str(Path(path))
+
+
+def _cursor_path_parts(path):
+    """Path parts for Cursor's project-slug encoding.
+
+    Windows-style absolute paths (drive letter / backslashes) use
+    PureWindowsPath even on POSIX, because workspace.json on a Windows Cursor
+    install stores those strings and CI must slug them the same way COOPER does.
+    """
+    s = str(path)
+    if re.match(r"^[A-Za-z]:[\\/]", s) or ("\\" in s and ":" in s[:3]):
+        p = PureWindowsPath(s)
+        return [p.drive.rstrip(":").lower()] + [x for x in p.parts[1:] if x]
+    p = Path(s).resolve()
+    if p.drive:
+        return [p.drive.rstrip(":").lower()] + [x for x in p.parts[1:] if x]
+    return [x for x in p.parts if x and x != "/"]
+
+
+def _cursor_path_basename(path):
+    s = str(path or "")
+    if not s:
+        return "-"
+    if re.match(r"^[A-Za-z]:[\\/]", s) or ("\\" in s and ":" in s[:3]):
+        return PureWindowsPath(s).name or "-"
+    return Path(s).name or "-"
+
+
+def read_cursor_workspace_folders(storage_dir=None):
+    """workspaceId → absolute cwd from workspaceStorage/*/workspace.json."""
+    root = Path(storage_dir) if storage_dir else cursor_workspace_storage()
+    out = {}
+    if not root.is_dir():
+        return out
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return out
+    for d in entries:
+        wj = d / "workspace.json"
+        if not wj.is_file():
+            continue
+        try:
+            data = json.loads(wj.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        cwd = cursor_folder_uri_to_path(data.get("folder"))
+        if cwd:
+            out[d.name] = cwd
+    return out
 
 # Set in main(); --no-log turns it off.
 LOGGING = True
@@ -224,9 +346,18 @@ MODEL_WINDOWS = {
     "claude-sonnet-4-5-20250929": 200000,
     "claude-opus-4-5-20251101": 200000,
     "claude-opus-4-1-20250805": 200000,
+    # Cursor agent models (Task tool_use / modelConfig). Windows measured from
+    # composerData.promptTokenBreakdown.maxTokens on COOPER (= 256000), not
+    # Anthropic docs. Prefix match covers -fast / -thinking / -medium suffixes.
+    "composer-2.5": 256000,
+    "composer-2": 256000,
+    "gpt-5.6": 256000,
+    "gpt-5": 256000,
+    "cursor-grok-4.5": 256000,
+    "grok-4.5": 256000,
 }
 
-WINDOW_TIERS = ((200000, "200k"), (1000000, "1M"))
+WINDOW_TIERS = ((200000, "200k"), (256000, "256k"), (1000000, "1M"))
 
 
 def model_window(model):
@@ -244,7 +375,11 @@ def model_window(model):
 
 
 def _window_label(size):
-    return "1M" if size >= 1000000 else "%dk" % (size // 1000)
+    if size >= 1000000:
+        return "1M"
+    if size % 1000 == 0:
+        return "%dk" % (size // 1000)
+    return str(size)
 
 
 def window_for(tokens, model=None):
@@ -731,7 +866,7 @@ def agent_first_prompt(path, agent_id):
     return label
 
 
-def collect_subagents(live_sids):
+def collect_claude_subagents(live_sids):
     """Subagents run inside their parent process, so they have no pid of their
     own -- but each gets its own transcript at
 
@@ -780,6 +915,7 @@ def collect_subagents(live_sids):
             state = "idle"
 
         rows.append({
+            "source": "claude",
             "agent_id": agent_id,
             # Sanitised like task text: it comes out of a transcript, and a
             # crafted agentType could otherwise carry escapes into the TUI.
@@ -794,11 +930,466 @@ def collect_subagents(live_sids):
             "state": state,
             "parent_live": parent_live,
         })
+    return rows
+
+
+def collect_cursor_subagents(live_sids, db_path=None):
+    """Cursor Task/subagent composers from composerHeaders (isSubagent=1).
+
+    Same row shape as Claude subagents so render_subagents() is shared. Parent
+    liveness uses the parent composerId against live_sids (Cursor worker
+    session_ids are composer UUIDs).
+    """
+    if "cursor" not in _backends():
+        return []
+    path = Path(db_path) if db_path else cursor_state_db()
+    if path is None or not path.is_file():
+        return []
+    rows = []
+    now = time.time()
+    try:
+        uri = "file:%s?mode=ro" % path.resolve().as_posix()
+        con = sqlite3.connect(uri, uri=True, timeout=0.5)
+        try:
+            cur = con.execute(
+                "SELECT composerId, lastUpdatedAt, createdAt, value "
+                "FROM composerHeaders "
+                "WHERE COALESCE(isSubagent, 0) = 1 "
+                "AND COALESCE(isArchived, 0) = 0")
+            for cid, lu, created, val in cur:
+                try:
+                    h = json.loads(val) if val else {}
+                except ValueError:
+                    h = {}
+                if not isinstance(h, dict):
+                    h = {}
+                info = h.get("subagentInfo") if isinstance(h.get("subagentInfo"), dict) else {}
+                parent = (info.get("parentComposerId")
+                          or info.get("rootParentConversationId")
+                          or info.get("forkedFromComposerId")
+                          or "")
+                last = _cursor_ms_to_epoch(h.get("lastUpdatedAt") or lu
+                                          or h.get("createdAt") or created)
+                age = (now - last) if last is not None else None
+                parent_live = bool(parent) and parent in live_sids
+                # Keep recently-touched orphans (parent closed) for a while,
+                # matching Claude's AGENT_RECENT_SECS behaviour.
+                if not parent_live and (age is None or age > AGENT_RECENT_SECS):
+                    continue
+                if age is not None and age > CURSOR_MAX_IDLE_SECS:
+                    continue
+                _SEEN_AGENTS.add(cid)
+                pct = h.get("contextUsagePercent")
+                if isinstance(pct, (int, float)):
+                    pct = float(pct)
+                else:
+                    pct = None
+                agent_type = ascii_safe(
+                    info.get("subagentTypeName") or info.get("subagentType") or "")
+                task = ascii_safe(
+                    (h.get("name") or h.get("subtitle") or "").strip() or "-")
+                tpath, _slug = _cursor_transcript_for(cid)
+                tinfo = scan_cursor_transcript(tpath) if tpath else {}
+                model = tinfo.get("model") or "-"
+                tok = tinfo.get("ctx_tokens")
+                win_label = "-"
+                if pct is not None and tok is None:
+                    window, win_label = window_for(
+                        1, model if model != "-" else "composer-2.5")
+                    tok = int(round(pct / 100.0 * window))
+                    win_label = _window_label(window)
+                elif tok is not None:
+                    window, win_label = window_for(
+                        tok, model if model != "-" else None)
+                    if pct is None:
+                        pct = 100.0 * tok / float(window)
+                if not parent_live:
+                    state = "orphan"
+                elif age is not None and age <= AGENT_ACTIVE_SECS:
+                    state = "working"
+                else:
+                    state = "idle"
+                rows.append({
+                    "source": "cursor",
+                    "agent_id": cid,
+                    "agent_type": str(agent_type),
+                    "parent_sid": parent,
+                    "task": task,
+                    "model": model,
+                    "ctx_tokens": tok,
+                    "ctx_pct": pct,
+                    "window": win_label,
+                    "idle_secs": age,
+                    "state": state,
+                    "parent_live": parent_live,
+                })
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError, ValueError):
+        return []
+    return rows
+
+
+def collect_subagents(live_sids):
+    """Claude sidechains plus Cursor Task composers, same row shape."""
+    rows = []
+    backends = _backends()
+    if "claude" in backends:
+        rows.extend(collect_claude_subagents(live_sids))
+    if "cursor" in backends:
+        rows.extend(collect_cursor_subagents(live_sids))
     rows.sort(key=lambda r: (r["state"] != "working", r["idle_secs"] or 1e9))
     return rows
 
 
-def collect_workers():
+def _backends():
+    raw = os.environ.get(BACKENDS_ENV, "claude,cursor")
+    return {b.strip().lower() for b in raw.split(",") if b.strip()}
+
+
+def cursor_project_slug(path):
+    """Cursor's ~/.cursor/projects/<slug> encoding for an absolute path."""
+    return "-".join(_cursor_path_parts(path))
+
+
+def _cursor_task_from_text(text):
+    if not text:
+        return ""
+    m = re.search(r"<user_query>\s*(.*?)\s*</user_query>", text, re.DOTALL)
+    if m:
+        return " ".join(m.group(1).split())
+    return " ".join(str(text).split())
+
+
+def _cursor_model_from_content(content):
+    """Newest Task tool_use model, if any. Parent transcripts rarely carry
+    message.model; the model string lives on spawned Task calls instead."""
+    if not isinstance(content, list):
+        return None
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "tool_use":
+            continue
+        if part.get("name") != "Task":
+            continue
+        inp = part.get("input")
+        if isinstance(inp, dict) and inp.get("model"):
+            return str(inp["model"])
+    return None
+
+
+def scan_cursor_transcript(path):
+    """Task text, optional usage, and a best-effort model from Cursor JSONL.
+
+    Live COOPER transcripts (71 files measured) carry *no* usage blocks and no
+    message.model -- those live in state.vscdb. This scan still matters for the
+    user_query task text and as a fallback when the SQLite index is missing.
+    """
+    out = {"model": None, "ctx_tokens": None, "last_write": None,
+           "title": None, "prompt": None, "ctx_history": []}
+    if not path:
+        return out
+    _SEEN_PATHS.add(path)
+    try:
+        out["last_write"] = os.path.getmtime(path)
+    except OSError:
+        pass
+
+    cached = _SCAN_CACHE.get(path)
+    if cached is not None and cached[0] == out["last_write"]:
+        return dict(cached[1])
+
+    for line in reversed(read_tail(path)):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        role = d.get("role")
+        msg = d.get("message") or {}
+        content = msg.get("content")
+
+        if role == "user" and out["prompt"] is None:
+            text = ""
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text = part.get("text") or ""
+                        break
+            elif isinstance(content, str):
+                text = content
+            out["prompt"] = _cursor_task_from_text(text)
+
+        if role != "assistant":
+            continue
+
+        if out["model"] is None:
+            out["model"] = (msg.get("model") or d.get("model")
+                            or _cursor_model_from_content(content))
+
+        usage = msg.get("usage") or d.get("usage") or {}
+        if not usage:
+            if out["model"] and out["prompt"]:
+                # No usage in the file at all is the common case; stop once we
+                # have a task and whatever model the Task tools named.
+                pass
+            continue
+        ctx = (
+            (usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+            + (usage.get("cache_read_input_tokens") or 0)
+            + (usage.get("cache_creation_input_tokens") or 0)
+        )
+        if out["ctx_tokens"] is None:
+            out["ctx_tokens"] = ctx
+        if len(out["ctx_history"]) < HISTORY_TURNS and (
+                not out["ctx_history"] or out["ctx_history"][-1] != ctx):
+            out["ctx_history"].append(ctx)
+        if out["model"] and out["prompt"] and len(out["ctx_history"]) >= HISTORY_TURNS:
+            break
+
+    out["ctx_history"].reverse()
+    if out["last_write"] is not None:
+        _SCAN_CACHE[path] = (out["last_write"], dict(out))
+    return out
+
+
+def _cursor_ms_to_epoch(ms):
+    """composerHeaders timestamps are ms since epoch; tolerate seconds too."""
+    if not isinstance(ms, (int, float)) or ms <= 0:
+        return None
+    return ms / 1000.0 if ms > 1e12 else float(ms)
+
+
+def read_cursor_composer_headers(db_path=None):
+    """Non-archived parent composers from state.vscdb's composerHeaders table.
+
+    Returns a list of dicts with composer_id, name, subtitle, ctx_pct,
+    last_write, workspace_id. Empty on any error -- missing DB is normal on a
+    machine that has never run Cursor.
+    """
+    path = Path(db_path) if db_path else cursor_state_db()
+    if path is None or not path.is_file():
+        return []
+    rows = []
+    try:
+        # URI mode=ro so we never write; Cursor keeps this file open while
+        # running and a write-mode open can fail or corrupt.
+        uri = "file:%s?mode=ro" % path.resolve().as_posix()
+        con = sqlite3.connect(uri, uri=True, timeout=0.5)
+        try:
+            cur = con.execute(
+                "SELECT composerId, workspaceId, lastUpdatedAt, createdAt, "
+                "isSubagent, value FROM composerHeaders "
+                "WHERE COALESCE(isArchived, 0) = 0")
+            for cid, ws, lu, created, is_sub, val in cur:
+                if is_sub:
+                    continue
+                try:
+                    h = json.loads(val) if val else {}
+                except ValueError:
+                    h = {}
+                if not isinstance(h, dict):
+                    h = {}
+                # Draft empty-state composers are noise on the board.
+                if h.get("isDraft") or cid == "empty-state-draft":
+                    continue
+                if h.get("unifiedMode") == "chat" and h.get("isEphemeral"):
+                    continue
+                pct = h.get("contextUsagePercent")
+                if isinstance(pct, (int, float)):
+                    pct = float(pct)
+                else:
+                    pct = None
+                last = _cursor_ms_to_epoch(h.get("lastUpdatedAt") or lu
+                                          or h.get("createdAt") or created)
+                name = (h.get("name") or "").strip() or None
+                subtitle = (h.get("subtitle") or "").strip() or None
+                rows.append({
+                    "composer_id": cid,
+                    "workspace_id": ws or (h.get("workspaceIdentifier") or {}).get("id"),
+                    "name": name,
+                    "subtitle": subtitle,
+                    "ctx_pct": pct,
+                    "last_write": last,
+                    "mode": h.get("unifiedMode") or "",
+                })
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError, ValueError):
+        return []
+    return rows
+
+
+def _cursor_transcript_for(composer_id):
+    if not composer_id or not CURSOR_PROJECTS_DIR.is_dir():
+        return None, ""
+    pattern = str(CURSOR_PROJECTS_DIR / "*" / "agent-transcripts"
+                  / composer_id / "*")
+    hits = sorted(glob.glob(pattern))
+    for path_str in hits:
+        path = Path(path_str)
+        if path.suffix in (".jsonl", ".txt"):
+            slug = path.parent.parent.parent.name
+            return str(path), slug
+    return None, ""
+
+
+def _cursor_worker_row(composer_id, name=None, task=None, task_src="-",
+                       model="-", ctx_tokens=None, ctx_pct=None, window="-",
+                       ctx_history=None, idle_secs=None, age_secs=None,
+                       slug="", flow=None, cwd=""):
+    short = composer_id[:8] if len(composer_id) >= 8 else composer_id
+    if cwd:
+        project = _cursor_path_basename(cwd)
+    else:
+        project = slug.rsplit("-", 1)[-1] if slug else "-"
+    return {
+        "source": "cursor",
+        "name": name or ("cursor/" + short),
+        "pid": None,
+        "session_id": composer_id,
+        "cwd": cwd or "",
+        "project": project,
+        "cursor_slug": slug,
+        "model": model or "-",
+        "ctx_tokens": ctx_tokens,
+        "ctx_pct": ctx_pct,
+        "ctx_history": ctx_history or [],
+        "window": window,
+        "task": ascii_safe(task or ""),
+        "task_src": task_src,
+        "idle_secs": idle_secs,
+        "age_secs": age_secs,
+        "flow": flow if flow is not None else (" " * SPARK_LEN),
+        "auto_compact": True,
+    }
+
+
+def collect_cursor_workers():
+    """Cursor composers: prefer composerHeaders (name + CTX%), fall back to
+    agent-transcript JSONL when the SQLite index is absent."""
+    rows = []
+    if "cursor" not in _backends():
+        return rows
+    now = time.time()
+    seen = set()
+    folders = read_cursor_workspace_folders()
+
+    for h in read_cursor_composer_headers():
+        cid = h["composer_id"]
+        last = h["last_write"]
+        if last is None:
+            continue
+        idle = now - last
+        if idle > CURSOR_MAX_IDLE_SECS:
+            continue
+        seen.add(cid)
+        tpath, slug = _cursor_transcript_for(cid)
+        info = scan_cursor_transcript(tpath) if tpath else {
+            "model": None, "ctx_tokens": None, "prompt": None,
+            "title": None, "ctx_history": []}
+        # Headers already store Cursor's own context %; trust that over any
+        # transcript inference (transcripts on COOPER carry no usage at all).
+        pct = h["ctx_pct"]
+        win_label = "-"
+        tok = info.get("ctx_tokens")
+        model = info.get("model") or "-"
+        if pct is not None and tok is None:
+            # Reverse the % against the known Cursor default window so TOKENS
+            # is an estimate, marked by the window label without a tilde only
+            # when we also know the model family.
+            window, win_label = window_for(1, model if model != "-" else "composer-2.5")
+            tok = int(round(pct / 100.0 * window))
+            win_label = _window_label(window)
+        elif tok is not None:
+            window, win_label = window_for(tok, model if model != "-" else None)
+            if pct is None:
+                pct = 100.0 * tok / float(window)
+
+        flow = " " * SPARK_LEN
+        st = _SPARK.setdefault(
+            cid, {"prev": None, "t": 0.0, "hist": deque(maxlen=SPARK_LEN)})
+        if tok is not None and now - st["t"] >= SPARK_MIN_STEP:
+            if st["prev"] is not None:
+                st["hist"].append(max(0, tok - st["prev"]))
+            st["prev"] = tok
+            st["t"] = now
+        flow = spark(st["hist"])
+
+        title = h["name"]
+        prompt = info.get("prompt") or h["subtitle"]
+        task = title or prompt or ""
+        task_src = "title" if title else ("prompt" if prompt else "-")
+        short = cid[:8] if len(cid) >= 8 else cid
+        display = "cursor/" + short
+        cwd = folders.get(h.get("workspace_id") or "") or ""
+        if not slug and cwd:
+            slug = cursor_project_slug(cwd)
+        # Keep the WORKER column short and stable; the full composer name is
+        # the TASK text -- same split Claude Code uses (name vs customTitle).
+        rows.append(_cursor_worker_row(
+            cid, name=display, task=task, task_src=task_src, model=model,
+            ctx_tokens=tok, ctx_pct=pct, window=win_label,
+            ctx_history=info.get("ctx_history") or [], idle_secs=idle,
+            slug=slug, flow=flow, cwd=cwd))
+
+    # Transcript-only fallback: composers with JSONL but no header row (older
+    # Cursor builds, or state.vscdb unavailable).
+    if not CURSOR_PROJECTS_DIR.is_dir():
+        return rows
+    pattern = str(CURSOR_PROJECTS_DIR / "*" / "agent-transcripts" / "*" / "*")
+    for path_str in glob.glob(pattern):
+        path = Path(path_str)
+        if path.suffix not in (".jsonl", ".txt"):
+            continue
+        composer_id = path.parent.name
+        if composer_id in seen:
+            continue
+        info = scan_cursor_transcript(str(path))
+        last = info["last_write"]
+        if last is None:
+            continue
+        idle = now - last
+        if idle > CURSOR_MAX_IDLE_SECS:
+            continue
+        seen.add(composer_id)
+        slug = path.parent.parent.parent.name
+        pct = None
+        win_label = "-"
+        if info["ctx_tokens"]:
+            window, win_label = window_for(info["ctx_tokens"], info["model"])
+            pct = 100.0 * info["ctx_tokens"] / float(window)
+        flow = " " * SPARK_LEN
+        st = _SPARK.setdefault(
+            composer_id, {"prev": None, "t": 0.0, "hist": deque(maxlen=SPARK_LEN)})
+        tok = info["ctx_tokens"]
+        if tok is not None and now - st["t"] >= SPARK_MIN_STEP:
+            if st["prev"] is not None:
+                st["hist"].append(max(0, tok - st["prev"]))
+            st["prev"] = tok
+            st["t"] = now
+        flow = spark(st["hist"])
+        short = composer_id[:8] if len(composer_id) >= 8 else composer_id
+        rows.append(_cursor_worker_row(
+            composer_id, name="cursor/" + short,
+            task=info["title"] or info["prompt"] or "",
+            task_src=("title" if info["title"] else
+                      ("prompt" if info["prompt"] else "-")),
+            model=info["model"] or "-", ctx_tokens=info["ctx_tokens"],
+            ctx_pct=pct, window=win_label, ctx_history=info["ctx_history"],
+            idle_secs=idle, slug=slug, flow=flow))
+    return rows
+
+
+def _worker_key(w):
+    src = w.get("source") or "claude"
+    if w.get("pid") is not None:
+        return (src, "pid", w["pid"])
+    return (src, "sid", w.get("session_id"))
+
+
+def collect_claude_workers():
     rows = []
     if not SESSIONS_DIR.is_dir():
         return rows
@@ -845,6 +1436,7 @@ def collect_workers():
         if cwd not in ac_cache:
             ac_cache[cwd] = auto_compact_enabled(cwd)
         rows.append({
+            "source": "claude",
             "name": s.get("name") or "-",
             "pid": pid,
             "session_id": sid,
@@ -869,6 +1461,14 @@ def collect_workers():
             "flow": flow,
             "auto_compact": ac_cache[cwd],
         })
+    return rows
+
+
+def collect_workers():
+    rows = []
+    if "claude" in _backends():
+        rows.extend(collect_claude_workers())
+    rows.extend(collect_cursor_workers())
     return rows
 
 
@@ -1547,7 +2147,11 @@ def advise(workers):
         tok = r["ctx_tokens"] or 0
         idle_h = (r["idle_secs"] or 0) / 3600.0
         pct = r["ctx_pct"] or 0
-        tag = "%s (pid %d)" % (r["name"], r["pid"])
+        # Cursor composers have no pid; the worker name already carries a short
+        # composer id (cursor/<8hex>). Formatting pid with %d used to crash the
+        # whole TUI the moment ADVICE opened on a mixed fleet.
+        pid = r.get("pid")
+        tag = ("%s (pid %d)" % (r["name"], pid)) if pid is not None else r["name"]
         # The pid alone does not tell you what you would be closing. The task is
         # what makes the call obvious -- "audit the build scripts" is easy to
         # abandon, "migrate the database" is not.
@@ -1691,7 +2295,13 @@ def bucket(w):
     tok = w["ctx_tokens"] or 0
     idle = w["idle_secs"]
     if w["ctx_tokens"] is None:
-        # No transcript yet -- genuinely unknown, not idle and not working.
+        # No usage yet. A brand-new unknown stays STARTING; once it has been
+        # idle for a minute it is noise -- Cursor composers often never grow a
+        # usage block at all, and without this they flood STARTING forever
+        # (never reaching QUIET collapse), burying the ranked board and every
+        # panel that paints below it.
+        if idle is not None and idle >= 60:
+            return 4, "QUIET"
         return 3, "STARTING"
     if pct >= NEAR_LIMIT_PCT:
         return 0, "NEAR LIMIT"
@@ -1730,10 +2340,14 @@ def render(workers, sel=None):
     """Table for `workers`. `sel` is an index into arrange()'s shown rows."""
     lines = []
     if not workers:
-        lines.append("no live Claude Code sessions")
+        lines.append("no live agent sessions")
         return lines
 
-    cols = [
+    mixed = any(w.get("source") not in (None, "claude") for w in workers)
+    cols = []
+    if mixed:
+        cols.append(("SRC", lambda r: (r.get("source") or "claude")[:6]))
+    cols.extend([
         ("WORKER", lambda r: r["name"]),
         ("MODEL", lambda r: (r["model"] or "-").replace("claude-", "")),
         ("CONTEXT", lambda r: bar(r["ctx_pct"])),
@@ -1746,7 +2360,7 @@ def render(workers, sel=None):
         ("TREND", lambda r: growth(r.get("ctx_history"))),
         ("FLOW", lambda r: r.get("flow") or " " * SPARK_LEN),
         ("IDLE", lambda r: dur(r["idle_secs"])),
-    ]
+    ])
 
     shown, quiet = arrange(workers, expand_quiet=sel is not None)
 
@@ -2141,7 +2755,10 @@ def frame(view=None, sel=None):
         sel = min(sel, len(rows) - 1) if rows else None
     # Infra leads because it is a constant: one quiet line you skim past, which
     # is exactly the weight it deserves until something turns red.
-    lines = render_infra(infra_cached()) + render(workers, sel)
+    lines = render_infra(infra_cached())
+    # Panels paint *above* the worker table. Below it they disappeared under
+    # "taller window" truncation whenever the board was long -- pressing s/m/a
+    # looked like a no-op even though the view toggled.
     if view == "agents":
         live_sids = set(w["session_id"] for w in workers if w.get("session_id"))
         lines.extend(render_subagents(collect_subagents(live_sids)))
@@ -2158,6 +2775,7 @@ def frame(view=None, sel=None):
     elif view == "advice":
         lines.append("")
         lines.extend(advise(workers))
+    lines.extend(render(workers, sel))
     prune_caches()
     return lines, rows, sel
 
@@ -2346,8 +2964,8 @@ def paint(lines, vt):
     if len(body) > rows - 1:
         hidden = len(body) - (rows - 2)
         body = body[: rows - 2] + [clip_ansi(
-            c("... %d more line(s) below -- taller window, or s/a/m/u/g/r/h to close a panel"
-              % hidden, DIM), cols - 1)]
+            c("... %d more line(s) below -- taller window, or close a panel "
+              "(s/a/m/u/g/r/h)" % hidden, DIM), cols - 1)]
 
     # Version, bottom-right. Stamped onto whatever the last visible line turns
     # out to be -- including the overflow notice above -- so it cannot itself be
@@ -2533,7 +3151,7 @@ def main():
                 # on pid rather than on the row dict is what makes that detectable:
                 # every frame rebuilds the dicts, so identity and equality both
                 # fail on rows that are in fact the same session.
-                if pending and not any(r["pid"] == pending["pid"] for r in rows):
+                if pending and not any(_worker_key(r) == _worker_key(pending) for r in rows):
                     pending, note = None, c("that session exited on its own", DIM)
 
                 # The status line lives in the header, above the table, and the
@@ -2544,8 +3162,12 @@ def main():
                 # precisely when there was most to act on, and the next keypress
                 # cancelled a prompt that had never been seen.
                 if pending:
-                    status = c("stop %s (pid %d)?   y = yes, any other key = no" % (
-                        pending["name"], pending["pid"]), BOLD, RED)
+                    if pending.get("pid") is not None:
+                        status = c("stop %s (pid %d)?   y = yes, any other key = no" % (
+                            pending["name"], pending["pid"]), BOLD, RED)
+                    else:
+                        status = c("stop %s?   y = yes, any other key = no" % (
+                            pending["name"],), BOLD, RED)
                 else:
                     status = note or ""
                 title = (c("roost", BOLD) + "  " + c(socket.gethostname(), CYAN)
@@ -2579,11 +3201,14 @@ def main():
                     # that a reflexive quit cannot be read as consent.
                     if pending is not None:
                         if key in ("y", "Y"):
-                            err = terminate(pending["pid"])
-                            log_action("stop", pending, ok=err is None, detail=err or "")
-                            note = c("stopped %s (pid %d)" % (
-                                pending["name"], pending["pid"]), GREEN) if err is None \
-                                else c(err, BOLD, RED)
+                            if pending.get("source") == "cursor" or pending.get("pid") is None:
+                                note = c("cursor composers cannot be stopped from roost", YELLOW)
+                            else:
+                                err = terminate(pending["pid"])
+                                log_action("stop", pending, ok=err is None, detail=err or "")
+                                note = c("stopped %s (pid %d)" % (
+                                    pending["name"], pending["pid"]), GREEN) if err is None \
+                                    else c(err, BOLD, RED)
                         else:
                             note = c("cancelled", DIM)
                         pending = None
@@ -2656,11 +3281,18 @@ def main():
                         elif sel is None or not rows:
                             note = c("select a row first -- j/k or the arrow keys", YELLOW)
                         elif key in ("x", "X"):
-                            # Captured from the frame on screen, not re-resolved later.
-                            pending = rows[sel]
+                            w = rows[sel]
+                            if w.get("source") == "cursor":
+                                note = c("cursor composers cannot be stopped from roost", YELLOW)
+                            else:
+                                pending = w
                         else:
                             w = rows[sel]
-                            note = c("copied %s -- claude --resume <paste>" % w["name"], GREEN) \
+                            if w.get("source") == "cursor":
+                                msg = "copied composer %s" % w["session_id"]
+                            else:
+                                msg = "copied %s -- claude --resume <paste>" % w["name"]
+                            note = c(msg, GREEN) \
                                 if to_clipboard(w["session_id"]) \
                                 else c("no clipboard helper (%s not found)" % CLIP_CMD[0], YELLOW)
                         break

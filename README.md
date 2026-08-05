@@ -350,14 +350,28 @@ scrolled out of reach.
 
 ## Where the numbers come from
 
-Three local, read-only sources. Nothing is sent anywhere; there is no network
-call except a localhost probe of the infra ports.
+Local, read-only sources. Nothing is sent anywhere; there is no network call
+except a localhost probe of the infra ports.
 
 | source | gives |
 | --- | --- |
-| `~/.claude/sessions/<pid>.json` | live sessions: pid, sessionId, launch cwd, name |
-| `~/.claude/projects/*/<sid>.jsonl` | model in use, token usage |
+| `~/.claude/sessions/<pid>.json` | Claude Code sessions: pid, sessionId, cwd, name |
+| `~/.claude/projects/*/<sid>.jsonl` | Claude model in use, token usage |
+| `~/.cursor/projects/*/agent-transcripts/*/*.jsonl` | Cursor composers: model, usage, task text (no pid) |
 | `127.0.0.1` ports | ollama / litellm / openwebui |
+
+**Backends** default to both Claude Code and Cursor (`ROOST_BACKENDS=claude,cursor`).
+Set `ROOST_BACKENDS=claude` for Claude-only. Cursor rows show in the `SRC`
+column when both are present. Cursor composers are read-only in interactive
+mode — `x` cannot stop them (there is no pid), and `y` copies the composer id.
+
+Cursor transcripts are supplementary on disk; roost prefers the
+`composerHeaders` table in Cursor's `state.vscdb` for name and context %,
+and falls back to JSONL tails when the DB is missing. Composers older than
+`ROOST_CURSOR_MAX_IDLE_SECS` (default 24h) drop off the board. See
+`docs/cursor-on-disk.md` and epic
+[#48](https://github.com/gmhoward9289-ops/roost/issues/48).
+`python scripts/cursor_recon.py` inventories the live layout.
 
 **Context** is the last assistant turn's `input_tokens + cache_read_input_tokens
 + cache_creation_input_tokens`. Cross-checked against an independent tool on the
@@ -392,6 +406,10 @@ ADVICE thresholds.
 
 ## Repo structure
 
+On COOPER the working copy lives at `dev/roost` (alongside `dev/heron`,
+`dev/swamp-ops`, and the rest of the estate). GitHub still hosts the remote;
+clone or copy there if you prefer `GitHub/roost`.
+
 - `roost.py` — the entire program. One file, stdlib only.
 - `bin/roost.js` — the npm wrapper; locates a Python interpreter and runs
   `roost.py` under it.
@@ -399,6 +417,8 @@ ADVICE thresholds.
   (`build-deb.sh`), the version-consistency check that CI runs on every PR
   (`check-version-consistency.sh`), and the apt signing key (`apt/`).
 - `tests/` — the unittest suite `ci.yml` runs on Linux, macOS and Windows.
+- `scripts/` — maintenance utilities (`cursor_recon.py` inventories Cursor's
+  on-disk layout for adapter work).
 - `demo/` — the vhs tapes and GIFs in this README, plus the fleet stager that
   produces the staged data they record against.
 - `.github/workflows/` — `ci.yml` (tests, packaging checks, semgrep),
