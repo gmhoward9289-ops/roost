@@ -68,7 +68,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from urllib.parse import unquote, urlparse
 
 # release-please rewrites the line below on a release PR. The marker is on
@@ -216,6 +216,9 @@ def cursor_folder_uri_to_path(uri):
     """Decode a workspace.json folder URI to a local path, or None.
 
     Accepts file:///… only; vscode-remote:// and other schemes are skipped.
+    Windows drive URIs (file:///c%3A/Users/...) decode to a PureWindowsPath
+    string on every host -- Path.resolve() on POSIX would otherwise treat
+    'C:\\Users\\...' as relative to the runner cwd.
     """
     if not uri or not isinstance(uri, str):
         return None
@@ -228,10 +231,36 @@ def cursor_folder_uri_to_path(uri):
         return None
     if not path:
         return None
-    # Windows: file:///c%3A/Users/... → /c:/Users/... → c:/Users/...
-    if sys.platform == "win32" and path.startswith("/") and len(path) >= 3 and path[2] == ":":
-        path = path[1:]
+    # Windows: file:///c%3A/Users/... → /c:/Users/... → c:\Users\...
+    if path.startswith("/") and len(path) >= 3 and path[2] == ":":
+        return str(PureWindowsPath(path[1:]))
     return str(Path(path))
+
+
+def _cursor_path_parts(path):
+    """Path parts for Cursor's project-slug encoding.
+
+    Windows-style absolute paths (drive letter / backslashes) use
+    PureWindowsPath even on POSIX, because workspace.json on a Windows Cursor
+    install stores those strings and CI must slug them the same way COOPER does.
+    """
+    s = str(path)
+    if re.match(r"^[A-Za-z]:[\\/]", s) or ("\\" in s and ":" in s[:3]):
+        p = PureWindowsPath(s)
+        return [p.drive.rstrip(":").lower()] + [x for x in p.parts[1:] if x]
+    p = Path(s).resolve()
+    if p.drive:
+        return [p.drive.rstrip(":").lower()] + [x for x in p.parts[1:] if x]
+    return [x for x in p.parts if x and x != "/"]
+
+
+def _cursor_path_basename(path):
+    s = str(path or "")
+    if not s:
+        return "-"
+    if re.match(r"^[A-Za-z]:[\\/]", s) or ("\\" in s and ":" in s[:3]):
+        return PureWindowsPath(s).name or "-"
+    return Path(s).name or "-"
 
 
 def read_cursor_workspace_folders(storage_dir=None):
@@ -1018,12 +1047,7 @@ def _backends():
 
 def cursor_project_slug(path):
     """Cursor's ~/.cursor/projects/<slug> encoding for an absolute path."""
-    p = Path(path).resolve()
-    parts = []
-    if p.drive:
-        parts.append(p.drive.rstrip(":").lower())
-    parts.extend(p.parts[1:] if p.drive else p.parts)
-    return "-".join(parts)
+    return "-".join(_cursor_path_parts(path))
 
 
 def _cursor_task_from_text(text):
@@ -1215,7 +1239,7 @@ def _cursor_worker_row(composer_id, name=None, task=None, task_src="-",
                        slug="", flow=None, cwd=""):
     short = composer_id[:8] if len(composer_id) >= 8 else composer_id
     if cwd:
-        project = Path(cwd).name or "-"
+        project = _cursor_path_basename(cwd)
     else:
         project = slug.rsplit("-", 1)[-1] if slug else "-"
     return {

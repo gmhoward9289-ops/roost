@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 import unittest
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("roost", str(ROOT / "roost.py"))
@@ -2014,8 +2014,9 @@ class TestCursorAdapter(unittest.TestCase):
     def test_folder_uri_to_path_decodes_windows_file_uri(self):
         got = roost.cursor_folder_uri_to_path(
             "file:///c%3A/Users/gmhow/dev/roost")
-        self.assertEqual(Path(got).resolve(),
-                         Path(r"C:\Users\gmhow\dev\roost").resolve())
+        # PureWindowsPath: same logical path on POSIX CI and Windows hosts.
+        self.assertEqual(PureWindowsPath(got),
+                         PureWindowsPath(r"C:\Users\gmhow\dev\roost"))
         self.assertIsNone(
             roost.cursor_folder_uri_to_path(
                 "vscode-remote://background-composer/workspace"))
@@ -2029,8 +2030,8 @@ class TestCursorAdapter(unittest.TestCase):
             "folder": "file:///c%3A/Users/gmhow/dev/roost",
         }), encoding="utf-8")
         got = roost.read_cursor_workspace_folders(root)
-        self.assertEqual(Path(got["wsid123"]).resolve(),
-                         Path(r"C:\Users\gmhow\dev\roost").resolve())
+        self.assertEqual(PureWindowsPath(got["wsid123"]),
+                         PureWindowsPath(r"C:\Users\gmhow\dev\roost"))
         td.cleanup()
 
     def test_collect_cursor_workers_sets_cwd_from_workspace_storage(self):
@@ -2078,8 +2079,8 @@ class TestCursorAdapter(unittest.TestCase):
             roost.CURSOR_MAX_IDLE_SECS = 86400
             rows = roost.collect_cursor_workers()
             self.assertEqual(len(rows), 1)
-            self.assertEqual(Path(rows[0]["cwd"]).resolve(),
-                             Path(r"C:\Users\gmhow\dev\heron-ops").resolve())
+            self.assertEqual(PureWindowsPath(rows[0]["cwd"]),
+                             PureWindowsPath(r"C:\Users\gmhow\dev\heron-ops"))
             self.assertEqual(rows[0]["project"], "heron-ops")
         finally:
             roost.CURSOR_MAX_IDLE_SECS = old_idle
