@@ -15,6 +15,13 @@ deliberately no `Unreleased` heading: unreleased work lives in the open release
 PR, and a hand-maintained section would sort below each new generated one and
 drift out of date.
 
+## [0.8.0](https://github.com/gmhoward9289-ops/roost/compare/v0.7.0...v0.8.0) (2026-08-05)
+
+
+### Added
+
+* Cursor IDE support (draft — major revision, not ready to merge) ([#52](https://github.com/gmhoward9289-ops/roost/issues/52)) ([c88db41](https://github.com/gmhoward9289-ops/roost/commit/c88db416d729c0a5a0c7d98e4cd56c07b0c2daa5))
+
 ## [0.7.0](https://github.com/gmhoward9289-ops/roost/compare/v0.6.1...v0.7.0) (2026-08-04)
 
 
