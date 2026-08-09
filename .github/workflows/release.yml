@@ -329,10 +329,36 @@ jobs:
     needs: [build, windows-exe]
     runs-on: windows-latest
     steps:
+      # winget-releaser only UPDATES a package that already exists; it cannot
+      # create one. Until the bootstrap PR merges it exits 1 with "Package ...
+      # does not exist", which turns every release red for a condition sitting
+      # in someone else's review queue -- nothing here can act on it, and a red
+      # nobody can act on trains you to ignore the ones you can.
+      #
+      # So ask winget-pkgs directly first, and skip with a notice instead. The
+      # day the bootstrap PR merges this starts publishing again on its own,
+      # with no edit here.
+      - name: Is the package bootstrapped in winget-pkgs yet?
+        id: bootstrapped
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PKG_ID: gmhoward9289-ops.roost
+        run: |
+          letter=$(echo "${PKG_ID:0:1}" | tr 'A-Z' 'a-z')
+          path="manifests/$letter/${PKG_ID//./\/}"
+          if gh api "repos/microsoft/winget-pkgs/contents/$path" --silent 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$PKG_ID is not in winget-pkgs yet -- skipping the winget publish. The first version of a new package needs a human-reviewed PR merged by Microsoft's moderators; see https://github.com/microsoft/winget-pkgs/pull/411432"
+          fi
+
       # SHA-pinned, not @v2: this job holds a classic PAT with public_repo --
       # write access to every public repo on the account -- and a mutable tag
       # on a third-party action is a supply-chain path to that token.
       - uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
+        if: steps.bootstrapped.outputs.exists == 'true'
         with:
           identifier: gmhoward9289-ops.roost
           installers-regex: '\.zip$'
