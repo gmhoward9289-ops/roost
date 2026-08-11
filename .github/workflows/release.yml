@@ -9,15 +9,9 @@ name: release
 # `sudo apt install roost` (via the hosted repo, with updates) both work --
 # see that job for how the repo itself gets built and signed.
 #
-# Windows gets a frozen exe (windows-exe job) attached to the release -- see
-# that job for why onedir/zip beats onefile here.
-#
-# winget was dropped 2026-08-11. winget-releaser cannot bootstrap a package
-# identifier ("Package gmhoward9289-ops.roost does not exist in the
-# winget-pkgs repository"); the first version has to be a hand-written PR
-# merged by Microsoft's moderators. The job therefore failed on every release
-# it ever ran, while total downloads across every Windows asset stayed in
-# single digits.
+# Windows gets a frozen exe (windows-exe job) and a PR against winget-pkgs
+# (winget job) -- see those jobs for why onedir/zip beats onefile here and
+# what the winget job's one-time setup looks like.
 on:
   push:
     tags: ["v*"]
@@ -268,12 +262,13 @@ jobs:
         if: always()
         run: rm -rf "$RUNNER_TEMP/gnupg"
 
-  # Builds a Windows executable and attaches it to the release, so Windows
-  # users have something other than a bare .py script to grab. --onedir rather
-  # than --onefile: onefile re-extracts to %TEMP% on every launch, which is bad
-  # for a tool people leave running, and is the specific shape that trips AV
-  # heuristics. Shipped as a zip -- no bundled installer needed for a console
-  # app with no state to migrate.
+  # Builds a Windows executable and attaches it to the release, so the winget
+  # job below has something other than a bare .py script to point at. --onedir
+  # rather than --onefile: onefile re-extracts to %TEMP% on every launch (bad
+  # for a tool people leave running) and is the specific shape that trips AV
+  # heuristics and stalls winget's moderation queue. Shipped as a zip, which
+  # winget's "zip" installer type unpacks directly -- no bundled installer
+  # needed for a console app with no state to migrate.
   windows-exe:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
@@ -306,6 +301,70 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$GITHUB_REF_NAME" "$ZIP" --clobber
+
+  # Opens (or updates) the PR against microsoft/winget-pkgs for this release,
+  # via the community winget-releaser action -- winget has no OIDC trusted-
+  # publishing equivalent, so this is the closest analog: no long-lived token
+  # on npm/PyPI's model, just a PAT scoped for exactly this one action to use.
+  #
+  # One-time setup this job depends on and cannot do for itself:
+  #   1. Fork microsoft/winget-pkgs to this account and keep the fork current
+  #      (winget-releaser pushes a branch to the fork, then opens the PR from
+  #      there against microsoft/winget-pkgs).
+  #   2. A WINGET_PAT secret on this repo -- unlike TAP_PUSH_TOKEN, this has to
+  #      be a *classic* PAT with the `public_repo` scope. Fine-grained PATs can
+  #      only be scoped to repos this account owns, and microsoft/winget-pkgs
+  #      is not one of them, so the classic-token/public_repo combination is
+  #      the only shape that works. That scope is wide -- write access to
+  #      every public repo on the account, not just the fork -- there is no
+  #      narrower option available.
+  #   3. The very first submission for a brand-new winget package identifier
+  #      needs a human-reviewed PR merged by Microsoft's moderators before
+  #      later versions auto-update smoothly. That happened on 2026-08-11:
+  #      microsoft/winget-pkgs#411432 merged 0.6.1 as gmhoward9289-ops.roost,
+  #      so from 0.9.0 on this job updates an existing package.
+  # Until all three are in place, this job fails alone; everything else above
+  # still publishes.
+  winget:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, windows-exe]
+    runs-on: windows-latest
+    steps:
+      # winget-releaser only UPDATES a package that already exists; it cannot
+      # create one. Before the bootstrap PR merged it exited 1 with "Package
+      # ... does not exist", turning every release red for a condition sitting
+      # in someone else's review queue -- nothing here could act on it, and a
+      # red nobody can act on trains you to ignore the ones you can.
+      #
+      # The bootstrap has since merged, so this guard now passes -- it stays
+      # because the same failure returns if the package is ever removed or the
+      # identifier is renamed, and a skip-with-notice is the right shape for
+      # that too.
+      - name: Is the package bootstrapped in winget-pkgs yet?
+        id: bootstrapped
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PKG_ID: gmhoward9289-ops.roost
+        run: |
+          letter=$(echo "${PKG_ID:0:1}" | tr 'A-Z' 'a-z')
+          path="manifests/$letter/${PKG_ID//./\/}"
+          if gh api "repos/microsoft/winget-pkgs/contents/$path" --silent 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$PKG_ID is not in winget-pkgs yet -- skipping the winget publish. The first version of a new package needs a human-reviewed PR merged by Microsoft's moderators; see https://github.com/microsoft/winget-pkgs/pull/411432"
+          fi
+
+      # SHA-pinned, not @v2: this job holds a classic PAT with public_repo --
+      # write access to every public repo on the account -- and a mutable tag
+      # on a third-party action is a supply-chain path to that token.
+      - uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
+        if: steps.bootstrapped.outputs.exists == 'true'
+        with:
+          identifier: gmhoward9289-ops.roost
+          installers-regex: '\.zip$'
+          token: ${{ secrets.WINGET_PAT }}
 
   # Publishes packaging/roost.rb (this repo's master copy) into the tap repo
   # (gmhoward9289-ops/homebrew-tap) as Formula/roost.rb, with a freshly

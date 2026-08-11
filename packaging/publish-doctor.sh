@@ -23,6 +23,8 @@ set -u
 OWNER=gmhoward9289-ops
 REPO=$OWNER/roost
 DIST=roost-top          # npm + PyPI name; see note above
+WINGET_ID=$OWNER.roost                  # winget package identifier
+WINGET_ID_PATH=${WINGET_ID//./\/}       # ...as its path under manifests/g/
 VERSION=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "$(dirname "$0")/../roost.py")
 PAGES=https://$OWNER.github.io/roost
 fail=0
@@ -81,15 +83,39 @@ else
   pend apt "no signed InRelease at $PAGES -- set ROOST_APT_GPG_PRIVATE_KEY and rerun the release's apt-repo job"
 fi
 
+# --- winget ------------------------------------------------------------------
+# The manifest directory is the registry: one subdirectory per published
+# version. It only appeared at all once microsoft/winget-pkgs#411432 (the
+# hand-reviewed bootstrap PR for a brand-new identifier) merged on 2026-08-11 --
+# before that the release job's winget step skipped itself with a notice.
+wg_ver=$(gh api "repos/microsoft/winget-pkgs/contents/manifests/g/$WINGET_ID_PATH" \
+           --jq '.[] | select(.type == "dir") | .name' 2>/dev/null | sort -V | tail -1)
+if [ "${wg_ver:-}" = "$VERSION" ]; then
+  say PASS winget "winget install $WINGET_ID ($wg_ver)"
+elif [ -n "${wg_ver:-}" ]; then
+  pend winget "winget-pkgs has $wg_ver, want $VERSION -- winget-releaser only runs on a tag, so this clears on the next release; to catch up now, rerun the release's winget job"
+else
+  pend winget "$WINGET_ID is not in winget-pkgs -- a brand-new identifier needs a hand-written PR merged by Microsoft's moderators before winget-releaser can update it"
+fi
+
 # --- repo secrets the automation depends on ----------------------------------
-secrets=$(gh secret list --repo "$REPO" 2>/dev/null)
-for s in ROOST_APT_GPG_PRIVATE_KEY TAP_PUSH_TOKEN ROOST_RELEASE_PLEASE; do
-  if grep -q "^$s" <<<"$secrets"; then
-    say PASS "secret" "$s"
-  else
-    pend "secret" "$s missing: gh secret set $s --repo $REPO"
-  fi
-done
+# Listing secrets needs admin, and GITHUB_TOKEN does not have it -- in CI this
+# can only ever report a false PENDING, which is how leghorn's first scheduled
+# run went red while every channel was actually live. A missing secret already
+# announces itself as a failed publish job, so CI skips it and the local run
+# keeps the check.
+if [ -n "${GITHUB_ACTIONS:-}" ]; then
+  say SKIP "secret" "needs admin to list; run this locally to check secrets"
+else
+  secrets=$(gh secret list --repo "$REPO" 2>/dev/null)
+  for s in ROOST_APT_GPG_PRIVATE_KEY TAP_PUSH_TOKEN ROOST_RELEASE_PLEASE WINGET_PAT; do
+    if grep -q "^$s" <<<"$secrets"; then
+      say PASS "secret" "$s"
+    else
+      pend "secret" "$s missing: gh secret set $s --repo $REPO"
+    fi
+  done
+fi
 
 echo
 if [ "$fail" = 0 ]; then
