@@ -144,11 +144,11 @@ Section: utils
 Maintainer: George M. Howard <dev@swamplink.com>
 Depends: python3 (>= 3.9)
 Filename: pool/main/r/roost/roost_0.8.0_all.deb
-Size: 44626
-MD5sum: b92eb84255d4c94c1fb4a330ec5ff652
-SHA1: 2fb8ccb27a858e02cbd46a021a2f29b436dc4544
-SHA256: dee93125e14cfebbc22944ed4ea1f5fc329e96c3e95939b128331674af994d2d
-SHA512: b4dac4da4dc4274c6057118bf273ac26f34c044bc6a373267245f183e39b40fdd7f600a96c4493932aeb8526ca72c7f48da4c54394fac63f8276aa0a21b5edc1
+Size: 44622
+MD5sum: 4c4f7b276392020cedbf6d4529a8b252
+SHA1: e5b48d27bdf92f53198a22467ab729f472c28ff1
+SHA256: fc3e29a76b1865fdaa7181e77d985c6d73a5891d041837fdf618a2be0ecba485
+SHA512: 4f116e2c0debc022c613e5458db8047487baf0e256597b671a2ff866085711672d48623a51c3428e05671094370ea3f2164af14dcf045b5d44d66068d0b4743e
 Homepage: https://github.com/gmhoward9289-ops/roost
 Description: top for Claude Code
  Shows every live Claude Code session on the machine, the model each is
