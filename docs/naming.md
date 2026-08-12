@@ -50,14 +50,42 @@ and `DiscoverWorthy.Roost` coexist in the same repo. Published as
 | winget | `gmhoward9289-ops.roost` |
 | Homebrew formula, `.deb` | `roost` |
 | Repo, module, man page | `roost` |
-| CLI command | `roost` — see open question |
+| CLI command | `roost` |
 
-## Open question
+The **CLI command stays `roost`** (decided 2026-08-11). Package name ≠ command
+name is the normal shape — `typescript` installs `tsc`, `@vue/cli` installs
+`vue` — and the `-top` suffix is a registry-collision artifact, not part of the
+product's identity. Users read the install line once and type the command
+forever, so optimizing the typed-once string at the cost of the typed-daily one
+is backwards. A rename would also break existing installs and force the Homebrew
+formula and `.deb`, which already ship `roost`, to follow or diverge.
 
-Whether the **CLI command** stays `roost` or becomes `roost-top` is not decided.
-Keeping `roost` means what users type differs from what they install on two of
-five surfaces; changing it costs a breaking rename for existing installs. Today
-it stays `roost`.
+## Name collisions users actually hit
+
+The collisions are on the bare `roost` that people naturally *try*, never on
+`roost-top` — that name is uniquely ours everywhere. Install docs must therefore
+always give the exact package name or `--id`, never a bare `install roost`.
+
+| Registry | Bare `roost` resolves to | Severity |
+|---|---|---|
+| npm | websecurify's 2013 "System provisioning toolkit", which **ships `bin: {roost: ./bin/roost}`** | **Silent** — installs a different program and puts its own `roost` on PATH |
+| winget | Ambiguous: `DiscoverWorthy.Roost` also declares `Moniker: roost` | Loud — winget refuses and demands `--id` |
+| crates.io | An existing placeholder crate, described "Coming soon" | Squatted, inert |
+| PyPI | Nothing — the name is prohibited | Harmless, `pip install roost` just errors |
+| Homebrew core | No such formula | Clear |
+
+The npm one is the dangerous case, because it succeeds. `npm i -g roost`
+installs an abandoned 2013 provisioning tool that claims the `roost` command,
+and nothing tells the user they got the wrong thing.
+
+**`DiscoverWorthy.Roost` is worth knowing about specifically.** It is not a
+squat — it is a live, adjacent product in our own niche, described as "Launch a
+Claude Code terminal per project and snap them into place across your monitors."
+It published to winget on 2026-07-17, ahead of us, and claims the same moniker.
+Two Claude Code tools named Roost is a product-identity fact to be aware of, not
+a packaging bug to fix. It installs via a Nullsoft installer and declares no
+`Commands`, so it is unlikely to contend for `roost` on PATH; the collision is
+at install-resolution time, not at runtime.
 
 ## Deferred work
 
