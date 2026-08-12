@@ -2010,7 +2010,11 @@ class TestCursorAdapter(unittest.TestCase):
         try:
             roost.CURSOR_HOME = Path(td.name)
             roost.CURSOR_PROJECTS_DIR = roost.CURSOR_HOME / "projects"
-            roost.CURSOR_MAX_IDLE_SECS = 86400
+            # headers.sqlite carries a fixed lastUpdatedAt (2026-08-05), so a
+            # real 24h window ages the row out and drops it back to the
+            # transcript-derived ctx_pct. Keep the window wide enough that the
+            # calendar cannot fail this test.
+            roost.CURSOR_MAX_IDLE_SECS = 10 ** 9
             os.environ[roost.BACKENDS_ENV] = "cursor"
             os.environ[roost.CURSOR_STATE_DB_ENV] = str(self.HEADERS_DB)
             rows = roost.collect_cursor_workers()
