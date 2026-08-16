@@ -1,6 +1,6 @@
 {
   "name": "roost-top",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "top for Claude Code -- live sessions, models, context, and the subagents they spawn",
   "keywords": [
     "claude",
