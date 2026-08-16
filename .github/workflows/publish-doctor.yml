@@ -1,0 +1,52 @@
+name: publish-doctor
+
+# Does every channel actually serve the version roost claims to be?
+#
+# This exists because job status is not the same fact. Between v0.7.0 and
+# v0.8.0, npm silently served 0.6.1: the publish job failed with a 404 on PUT
+# (npm's way of saying unauthorized -- no trusted publisher was configured for
+# roost-top), and since release.yml lets each publish job fail alone so the
+# others still land, that red job scrolled away and nobody looked. Meanwhile
+# `npm i -g roost-top` kept handing people software two releases old.
+#
+# So this checks the registries themselves rather than the workflow that should
+# have written to them, and it runs on a schedule rather than only at release
+# time -- a channel can rot after a successful publish (a tap PAT lapses, a
+# formula is overwritten), and the daily run is what catches that.
+#
+# Read-only. It installs nothing and publishes nothing.
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["release"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-doctor
+  cancel-in-progress: false
+
+jobs:
+  doctor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # A publish is not instant: npm and PyPI take a moment to serve a new
+      # version, and the tap push lands after the release job reports success.
+      # Without this the post-release run reports PENDING for things that are
+      # merely seconds away -- the cry-wolf failure that made leghorn's brew
+      # check worth ignoring.
+      - name: Let the registries catch up
+        if: github.event_name == 'workflow_run'
+        run: sleep 120
+
+      - name: Run the publish doctor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash packaging/publish-doctor.sh
