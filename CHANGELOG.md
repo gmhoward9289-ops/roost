@@ -15,6 +15,19 @@ deliberately no `Unreleased` heading: unreleased work lives in the open release
 PR, and a hand-maintained section would sort below each new generated one and
 drift out of date.
 
+## [0.8.1](https://github.com/gmhoward9289-ops/roost/compare/v0.8.0...v0.8.1) (2026-08-16)
+
+
+### Fixed
+
+* **test:** stop the Cursor header fixture aging out of the idle window ([#65](https://github.com/gmhoward9289-ops/roost/issues/65)) ([2fafbd1](https://github.com/gmhoward9289-ops/roost/commit/2fafbd1b8b40c164943cfe6f5249b7a6a17d1afa))
+
+
+### Documentation
+
+* add Discussions badge and pointer to README ([#62](https://github.com/gmhoward9289-ops/roost/issues/62)) ([9af2483](https://github.com/gmhoward9289-ops/roost/commit/9af24833e4a4044d2265c9be43caa8c00fdc8952))
+* record roost-top as the settled published name ([#64](https://github.com/gmhoward9289-ops/roost/issues/64)) ([615e7e5](https://github.com/gmhoward9289-ops/roost/commit/615e7e53e6e53c7ec83522abba4d95ecaf5f1e85))
+
 ## [0.8.0](https://github.com/gmhoward9289-ops/roost/compare/v0.7.0...v0.8.0) (2026-08-05)
 
 
