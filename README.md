@@ -3,6 +3,7 @@
 [![ci](https://github.com/gmhoward9289-ops/roost/actions/workflows/ci.yml/badge.svg)](https://github.com/gmhoward9289-ops/roost/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/roost-top)](https://www.npmjs.com/package/roost-top)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![discussions](https://img.shields.io/github/discussions/gmhoward9289-ops/roost)](https://github.com/gmhoward9289-ops/roost/discussions)
 
 `top` for Claude Code. Every live session, the model it is on, how much context
 it has burned — and, unlike anything else, **the subagents it spawned**.
@@ -403,6 +404,8 @@ are real asks, not decoration: Linux field reports, a canary test for the
 undocumented on-disk format, adapters for other agent CLIs (gated on demand —
 comment if you would use one), and config seams for the window tiers and the
 ADVICE thresholds.
+
+Questions or ideas? → [Discussions](https://github.com/gmhoward9289-ops/roost/discussions)
 
 ## Repo structure
 
