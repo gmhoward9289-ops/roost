@@ -14,11 +14,21 @@ jobs:
     # roost claims 3.9+ and claims to run on Windows and macOS. Both claims are
     # load-bearing -- the Windows path uses ctypes for process liveness and
     # console VT, which no Linux run would ever exercise.
+    #
+    # 3.14 is here because it is what the primary dev box actually runs -- every
+    # local test run happened on an interpreter CI never exercised. macos-13 is
+    # here because macos-latest is arm64 now, so Intel Macs were untested.
+    #
+    # Unlike leghorn, Windows gets no 3.14 exclusion: leghorn has to skip that
+    # leg because windows-curses wheels top out at 3.13, but roost has no
+    # dependencies at all (see pyproject.toml -- `dependencies = []`, stdlib
+    # only, no curses anywhere), so nothing about Windows + 3.14 can fail on
+    # dependency resolution. Every cell of this matrix is testing repo code.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        python: ["3.9", "3.13"]
+        os: [ubuntu-latest, macos-latest, macos-13, windows-latest]
+        python: ["3.9", "3.13", "3.14"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
