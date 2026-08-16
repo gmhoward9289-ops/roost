@@ -16,8 +16,11 @@ jobs:
     # console VT, which no Linux run would ever exercise.
     #
     # 3.14 is here because it is what the primary dev box actually runs -- every
-    # local test run happened on an interpreter CI never exercised. macos-13 is
-    # here because macos-latest is arm64 now, so Intel Macs were untested.
+    # local test run happened on an interpreter CI never exercised. macos-15-intel
+    # is here because macos-latest is arm64 now, so Intel Macs were untested.
+    # (It replaced macos-13, whose image GitHub retired in Dec 2025 -- jobs
+    # asking for it queue forever. macos-15-intel is the designated successor,
+    # available until Aug 2027; when it goes, the Intel leg goes with it.)
     #
     # Unlike leghorn, Windows gets no 3.14 exclusion: leghorn has to skip that
     # leg because windows-curses wheels top out at 3.13, but roost has no
@@ -27,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, macos-13, windows-latest]
+        os: [ubuntu-latest, macos-latest, macos-15-intel, windows-latest]
         python: ["3.9", "3.13", "3.14"]
     runs-on: ${{ matrix.os }}
     steps:
