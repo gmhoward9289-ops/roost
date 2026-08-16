@@ -308,9 +308,10 @@ jobs:
   # on npm/PyPI's model, just a PAT scoped for exactly this one action to use.
   #
   # One-time setup this job depends on and cannot do for itself:
-  #   1. Fork microsoft/winget-pkgs to this account and keep the fork current
-  #      (winget-releaser pushes a branch to the fork, then opens the PR from
-  #      there against microsoft/winget-pkgs).
+  #   1. Fork microsoft/winget-pkgs to this account (winget-releaser pushes a
+  #      branch to the fork, then opens the PR from there against
+  #      microsoft/winget-pkgs). Keeping the fork current is no longer manual:
+  #      the sync step below does it on every run.
   #   2. A WINGET_PAT secret on this repo -- unlike TAP_PUSH_TOKEN, this has to
   #      be a *classic* PAT with the `public_repo` scope. Fine-grained PATs can
   #      only be scoped to repos this account owns, and microsoft/winget-pkgs
@@ -355,6 +356,19 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
             echo "::notice::$PKG_ID is not in winget-pkgs yet -- skipping the winget publish. The first version of a new package needs a human-reviewed PR merged by Microsoft's moderators; see https://github.com/microsoft/winget-pkgs/pull/411432"
           fi
+
+      # winget-releaser creates its branch on the fork from the fork's own
+      # default branch, and a fork that has drifted behind upstream makes that
+      # fail outright -- v0.8.1 died with "failed to create branch" because the
+      # fork was two weeks stale, and the fix was this exact sync run by hand.
+      # The fork only ever receives generated manifest branches, never direct
+      # commits to its default branch, so a fast-forward sync always succeeds.
+      - name: Sync the winget-pkgs fork with upstream
+        if: steps.bootstrapped.outputs.exists == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_PAT }}
+        run: gh repo sync gmhoward9289-ops/winget-pkgs --source microsoft/winget-pkgs
 
       # SHA-pinned, not @v2: this job holds a classic PAT with public_repo --
       # write access to every public repo on the account -- and a mutable tag
