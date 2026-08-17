@@ -18,7 +18,7 @@
     "type": "git",
     "url": "git+https://github.com/gmhoward9289-ops/roost.git"
   },
-  "license": "MIT",
+  "license": "Apache-2.0",
   "author": "George M. Howard <dev@swamplink.com>",
   "bin": {
     "roost": "bin/roost.js"

@@ -2,7 +2,7 @@
 
 [![ci](https://github.com/gmhoward9289-ops/roost/actions/workflows/ci.yml/badge.svg)](https://github.com/gmhoward9289-ops/roost/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/roost-top)](https://www.npmjs.com/package/roost-top)
-[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![license](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![discussions](https://img.shields.io/github/discussions/gmhoward9289-ops/roost)](https://github.com/gmhoward9289-ops/roost/discussions)
 
 `top` for Claude Code. Every live session, the model it is on, how much context
