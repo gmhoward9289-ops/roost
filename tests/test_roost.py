@@ -1941,8 +1941,13 @@ class TestJsonContract(unittest.TestCase):
 
     def test_the_payload_carries_every_section(self):
         self.assertEqual(set(self.emit()),
-                         {"workers", "infra", "usage_caps", "local_models",
-                          "gateway"})
+                         {"version", "workers", "infra", "usage_caps",
+                          "local_models", "gateway"})
+
+    def test_the_payload_carries_the_version(self):
+        # Programmatic consumers should not have to shell out to --version
+        # to learn which roost produced the payload.
+        self.assertEqual(self.emit()["version"], roost.__version__)
 
     def test_the_payload_renders_as_a_remote_row(self):
         out = "\n".join(roost.render_remote(

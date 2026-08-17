@@ -3050,6 +3050,7 @@ def main():
 
     if args.json:
         print(json.dumps({
+            "version": __version__,
             "workers": collect_workers(),
             "infra": collect_infra(),
             "usage_caps": collect_usage_caps(),
