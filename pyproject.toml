@@ -11,14 +11,14 @@ dynamic = ["version"]
 description = "top for Claude Code -- live sessions, models, context, and the subagents they spawn"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 authors = [{ name = "George M. Howard", email = "dev@swamplink.com" }]
 keywords = ["claude", "claude-code", "tui", "top", "monitoring", "context"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: MacOS :: MacOS X",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",

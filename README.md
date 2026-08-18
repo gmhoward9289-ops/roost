@@ -435,6 +435,6 @@ See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Contact: dev@swamplink.com
+Apache-2.0 — see [LICENSE](LICENSE). Contact: dev@swamplink.com
 
 Built in a Digital Swamp. From my swamp to yours.
