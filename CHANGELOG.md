@@ -15,6 +15,18 @@ deliberately no `Unreleased` heading: unreleased work lives in the open release
 PR, and a hand-maintained section would sort below each new generated one and
 drift out of date.
 
+## [0.10.0](https://github.com/gmhoward9289-ops/roost/compare/v0.9.0...v0.10.0) (2026-08-20)
+
+
+### Added
+
+* canary, gateway aliases, TUI detail, json subagents, window env ([#82](https://github.com/gmhoward9289-ops/roost/issues/82)) ([2f65269](https://github.com/gmhoward9289-ops/roost/commit/2f6526975f41f28ee61f19c2b49a8a183184368a))
+
+
+### Fixed
+
+* correct stale MIT license references and widen the CI Python matrix ([#75](https://github.com/gmhoward9289-ops/roost/issues/75)) ([b0e71e0](https://github.com/gmhoward9289-ops/roost/commit/b0e71e0aeebb96637c99559053b6e0bfbff027cb))
+
 ## [0.9.0](https://github.com/gmhoward9289-ops/roost/compare/v0.8.1...v0.9.0) (2026-08-20)
 
 
