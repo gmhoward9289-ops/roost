@@ -407,6 +407,15 @@ ADVICE thresholds.
 
 Questions or ideas? → [Discussions](https://github.com/gmhoward9289-ops/roost/discussions)
 
+## Ecosystem
+
+Transcript parsing and session tables live in
+[henhouse](https://github.com/gmhoward9289-ops/henhouse) (`pip install henhouse`).
+Pin saved agent sessions in CI with
+[pytest-session-trace](https://github.com/gmhoward9289-ops/pytest-session-trace)
+(`pip install pytest-session-trace`). roost `--json` emits
+`{"schema": "roost.snapshot.v1", ...}` for the same proof-stack consumers.
+
 ## Repo structure
 
 On COOPER the working copy lives at `dev/roost` (alongside `dev/heron`,

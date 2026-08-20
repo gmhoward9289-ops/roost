@@ -80,6 +80,8 @@ from urllib.parse import unquote, urlparse
 __version__ = "0.8.1"
 # x-release-please-end
 
+SCHEMA_SNAPSHOT = "roost.snapshot.v1"
+
 HOME = Path.home()
 SESSIONS_DIR = HOME / ".claude" / "sessions"
 PROJECTS_DIR = HOME / ".claude" / "projects"
@@ -3050,6 +3052,7 @@ def main():
 
     if args.json:
         print(json.dumps({
+            "schema": SCHEMA_SNAPSHOT,
             "version": __version__,
             "workers": collect_workers(),
             "infra": collect_infra(),
