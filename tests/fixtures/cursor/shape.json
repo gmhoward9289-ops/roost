@@ -1,0 +1,24 @@
+{
+  "transcript_role_keys_required": [
+    "message",
+    "role"
+  ],
+  "usage_parent": "message.usage",
+  "usage_keys_required": [
+    "input_tokens"
+  ],
+  "task_tool_use": {
+    "content_part_type": "tool_use",
+    "name": "Task",
+    "model_path": "message.content[].input.model"
+  },
+  "user_query_tag": "<user_query>",
+  "headers_table": "composerHeaders",
+  "headers_columns_required": [
+    "composerId",
+    "isSubagent",
+    "lastUpdatedAt",
+    "value"
+  ],
+  "subagent_path_note": "Cursor subagents are composerHeaders isSubagent=1, not a JSONL sidechain dir"
+}

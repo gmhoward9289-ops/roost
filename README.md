@@ -151,7 +151,7 @@ roost -1           one frame, then exit
 roost --json       joined records, for piping
 ```
 
-While running: `space` refresh now · `a` advice panel · `s` subagents panel · `m` local models panel · `u` usage panel · `g` gateway panel · `r` remote panel · `h` or `?` what am I looking at · `i` arm interactive · `q` quit
+While running: `space` refresh now · `a` advice panel · `s` subagents panel · `m` local models panel · `u` usage panel · `g` gateway panel · `r` remote panel · `h` or `?` what am I looking at · `i` arm interactive (Tab switches tables, Enter opens a row) · `q` quit
 
 The `FLOW` column is a sparkline of each session's recent token throughput —
 context growth per refresh, normalised to its own busiest moment, newest at the
@@ -269,17 +269,29 @@ nothing. Day boundaries are UTC, because transcript timestamps are.
 ## Gateway and batch runs
 
 `g` opens the GATEWAY panel: whether the LiteLLM proxy answers on
-`127.0.0.1:4000`, plus one row per batch-extraction run under the batch
-directory (`ROOST_BATCH_DIR`, default `~/litellm-server/batch`):
+`127.0.0.1:4000`, the **aliases configured in LiteLLM `config.yaml`**, plus
+one row per batch-extraction run under the batch directory
+(`ROOST_BATCH_DIR`, default `~/litellm-server/batch`):
 
 ```
 GATEWAY
   litellm up (127.0.0.1:4000)   last request 42s ago   3 req/min
+  configured models (intent, not liveness)
+  ALIAS                BACKING                                 WHERE  OLLAMA
+  gemma-32k            ollama_chat/gemma4-32k:latest           local  installed
+  openrouter-free-zdr  openrouter/inclusionai/ling-3.0-flash:free  cloud  -
   jobs queue: inbox 0  running 1  done 12  failed 0
   BATCH RUN              MODEL           DONE/TOTAL  FAIL  RATE   ETA    LAST
   results-laneB-derived  gemma4-32k      121/300     2     64/hr  2h48m  35s ago
-  results-laneA-derived  qwen-coder-16k  5/5         0     -      done   3d ago
 ```
+
+Configured models come from `model_list` in `ROOST_LITELLM_CONFIG`
+(default `~/litellm-server/config.yaml`). roost reads only `model_name`,
+`model`, and `api_base` — never keys. A missing file is a labelled gap, not a
+crash (hyrule has no local stack). `ollama_chat/*` aliases are cross-checked
+against Ollama's installed list so a gateway alias whose backing model is
+gone shows `missing`. This is configured intent, not whether the alias will
+answer.
 
 The proxy itself is asked nothing beyond "are you up" — a DB-less LiteLLM
 keeps no request history (every activity endpoint 400s), so progress is
@@ -287,7 +299,7 @@ derived from the batch pipeline's own output files: one JSON per finished
 item means done/total, failure count, write rate, and ETA all fall out of a
 directory listing. Runs whose `extract.py` wrote a `_run.json` breadcrumb show
 their model and worklist; older runs still appear, just with less detail.
-Green rows are actively writing; the last-request/req-per-min figures are a
+Green rows are actively writing; the last-request/req-min figures are a
 best-effort read of `proxy.log`'s tail and disappear rather than guess when
 the log doesn't parse. The `jobs queue` line counts the file-based job queue's
 dirs (`JOBS_ROOT`, default `~/jobs`) if present.
@@ -382,13 +394,20 @@ same session: 77% vs 77.29%.
 window a session opened with, and a session on the 1M window will read 480k+
 cache tokens in a single call — scoring that against 200k yields a nonsense
 "242%". roost picks the smallest standard tier the usage fits and prints it in
-the `WIN` column, so the assumption is visible rather than silent. If a new tier
-ships, `WINDOW_TIERS` is the one line to edit.
+the `WIN` column, so the assumption is visible rather than silent. Override
+the fallback list with `ROOST_WINDOW_TIERS=200000:200k,1000000:1M` (built-in
+default is `200k`, `256k`, `1M`). Skip inference entirely with
+`ROOST_WINDOW=1M` when you already know the window. A bad value keeps the
+built-in list and labels the gap on a `WINDOW` line; a working override also
+shows there so it is never silent. Known models still resolve from
+`MODEL_WINDOWS` unless `ROOST_WINDOW` is set.
 
 ## Caveats
 
 - It reads an **undocumented on-disk format** that can change without warning.
   That is the whole foundation; treat breakage as expected, not exceptional.
+  `tests/test_ondisk_canary.py` pins the shapes roost depends on against
+  checked-in fixtures and fails with a key-tree diff when they drift.
 - The window inference above is a heuristic.
 - The `ADVICE` panel's thresholds are tuned to one person's usage. Read
   `EXPENSIVE_TOKENS` and friends before trusting the advice.
@@ -415,6 +434,8 @@ Pin saved agent sessions in CI with
 [pytest-session-trace](https://github.com/gmhoward9289-ops/pytest-session-trace)
 (`pip install pytest-session-trace`). roost `--json` emits
 `{"schema": "roost.snapshot.v1", ...}` for the same proof-stack consumers.
+Field list, units, and how workers vs subagents vs infra vs gateway are
+distinguished: [`docs/json-output.md`](docs/json-output.md).
 
 ## Repo structure
 
@@ -430,7 +451,8 @@ clone or copy there if you prefer `GitHub/roost`.
   (`check-version-consistency.sh`), and the apt signing key (`apt/`).
 - `tests/` — the unittest suite `ci.yml` runs on Linux, macOS and Windows.
 - `scripts/` — maintenance utilities (`cursor_recon.py` inventories Cursor's
-  on-disk layout for adapter work).
+  on-disk layout; `regen_claude_fixtures.py` refreshes the Claude canary
+  fixtures after a Claude Code upgrade).
 - `demo/` — the vhs tapes and GIFs in this README, plus the fleet stager that
   produces the staged data they record against.
 - `.github/workflows/` — `ci.yml` (tests, packaging checks, semgrep),

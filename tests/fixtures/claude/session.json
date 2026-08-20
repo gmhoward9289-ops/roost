@@ -1,0 +1,14 @@
+{
+  "cwd": "/tmp/roost-canary",
+  "entrypoint": "cli",
+  "kind": "session",
+  "name": "canary-session",
+  "nameSince": 0,
+  "nameSource": "user",
+  "peerProtocol": 1,
+  "pid": 4242,
+  "procStart": 1700000000000,
+  "sessionId": "11111111-2222-3333-4444-555555555555",
+  "startedAt": 1700000000000,
+  "version": "2.0.0"
+}
