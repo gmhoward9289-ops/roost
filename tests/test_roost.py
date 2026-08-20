@@ -1456,9 +1456,12 @@ class TestGatewayCollect(unittest.TestCase):
         self.root.mkdir()
         self.jobs = Path(self.td.name) / "jobs"
         self._env = {k: os.environ.get(k)
-                     for k in (roost.BATCH_DIR_ENV, roost.JOBS_DIR_ENV)}
+                     for k in (roost.BATCH_DIR_ENV, roost.JOBS_DIR_ENV,
+                               roost.LITELLM_CONFIG_ENV)}
         os.environ[roost.BATCH_DIR_ENV] = str(self.root)
         os.environ[roost.JOBS_DIR_ENV] = str(self.jobs)
+        os.environ[roost.LITELLM_CONFIG_ENV] = str(
+            Path(self.td.name) / "missing-litellm-config.yaml")
         self._port_open = roost.port_open
         roost.port_open = lambda port, timeout=0.35: True
 
@@ -1905,7 +1908,7 @@ class TestJsonContract(unittest.TestCase):
     panel silently, on the other machine, with no error anywhere."""
 
     PATCHED = ("collect_workers", "collect_infra", "collect_usage_caps",
-               "collect_local_models", "collect_gateway")
+               "collect_local_models", "collect_gateway", "collect_subagents")
 
     def setUp(self):
         self._orig = {n: getattr(roost, n) for n in self.PATCHED}
@@ -1917,6 +1920,11 @@ class TestJsonContract(unittest.TestCase):
         roost.collect_infra = lambda: [{"name": "ollama", "port": 11434,
                                         "up": True, "detail": ""}]
         roost.collect_usage_caps = lambda: None
+        roost.collect_subagents = lambda sids: [
+            {"source": "claude", "agent_id": "abc123", "agent_type": "Explore",
+             "parent_sid": "sid-1", "task": "Scout URLs", "model": "claude-haiku-4-5",
+             "ctx_tokens": 40, "ctx_pct": 0.02, "window": "200k",
+             "idle_secs": 3.0, "state": "working", "parent_live": True}]
         roost.collect_local_models = lambda: [
             {"name": "qwen-coder-16k", "disk_gb": 9.2, "resident": True,
              "vram_gb": 9.2, "expires_secs": 300.0}]
@@ -1941,8 +1949,8 @@ class TestJsonContract(unittest.TestCase):
 
     def test_the_payload_carries_every_section(self):
         self.assertEqual(set(self.emit()),
-                         {"schema", "version", "workers", "infra", "usage_caps",
-                          "local_models", "gateway"})
+                         {"schema", "version", "workers", "subagents", "infra",
+                          "usage_caps", "local_models", "gateway"})
 
     def test_the_payload_carries_the_version(self):
         # Programmatic consumers should not have to shell out to --version
@@ -1951,6 +1959,11 @@ class TestJsonContract(unittest.TestCase):
 
     def test_the_payload_carries_schema(self):
         self.assertEqual(self.emit()["schema"], roost.SCHEMA_SNAPSHOT)
+
+    def test_the_payload_includes_subagents(self):
+        payload = self.emit()
+        self.assertEqual(payload["subagents"][0]["agent_id"], "abc123")
+        self.assertIn("parent_sid", payload["subagents"][0])
 
     def test_the_payload_renders_as_a_remote_row(self):
         out = "\n".join(roost.render_remote(
@@ -2240,6 +2253,207 @@ class TestCursorAdapter(unittest.TestCase):
         ]))
         self.assertIn("SRC", out)
         self.assertIn("cursor", out)
+
+
+class TestWindowEnv(unittest.TestCase):
+    def setUp(self):
+        self._tiers = os.environ.get(roost.WINDOW_TIERS_ENV)
+        self._win = os.environ.get(roost.WINDOW_ENV)
+
+    def tearDown(self):
+        for key, old in ((roost.WINDOW_TIERS_ENV, self._tiers),
+                         (roost.WINDOW_ENV, self._win)):
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
+
+    def test_custom_tiers_replace_the_builtin_fallback(self):
+        os.environ[roost.WINDOW_TIERS_ENV] = "50000:50k,400000:400k"
+        os.environ.pop(roost.WINDOW_ENV, None)
+        self.assertEqual(roost.window_for(40000, "unknown-model"), (50000, "~50k"))
+        self.assertEqual(roost.window_for(60000, "unknown-model"), (400000, "~400k"))
+
+    def test_forced_window_skips_model_table_and_inference(self):
+        os.environ[roost.WINDOW_ENV] = "1M"
+        size, label = roost.window_for(1000, "claude-haiku-4-5")
+        self.assertEqual((size, label), (1000000, "1M"))
+        self.assertNotIn("~", label)
+
+    def test_bad_tiers_keep_defaults_and_label_the_gap(self):
+        os.environ[roost.WINDOW_TIERS_ENV] = "not-a-tier"
+        os.environ.pop(roost.WINDOW_ENV, None)
+        self.assertEqual(roost.window_for(100000), (200000, "~200k"))
+        note = roost.window_config_note()
+        self.assertIn("ROOST_WINDOW_TIERS", note)
+        self.assertIn("built-in", note)
+
+    def test_unset_env_keeps_silent_defaults(self):
+        os.environ.pop(roost.WINDOW_TIERS_ENV, None)
+        os.environ.pop(roost.WINDOW_ENV, None)
+        self.assertIsNone(roost.window_config_note())
+        self.assertEqual(roost.window_for(100000), (200000, "~200k"))
+
+
+class TestLiteLLMConfig(unittest.TestCase):
+    YAML = """
+model_list:
+  - model_name: gemma-32k
+    litellm_params:
+      model: ollama_chat/gemma4-32k:latest
+      api_base: http://127.0.0.1:11434
+      api_key: super-secret-key
+  - model_name: openrouter-free-zdr
+    litellm_params:
+      model: openrouter/inclusionai/ling-3.0-flash:free
+      api_key: os.environ/OPENROUTER_API_KEY
+  - litellm_params:
+      model: ollama_chat/orphan:latest
+"""
+
+    def test_parses_only_the_three_safe_fields(self):
+        rows = roost.parse_litellm_model_list(self.YAML)
+        self.assertEqual([r["model_name"] for r in rows],
+                         ["gemma-32k", "openrouter-free-zdr"])
+        self.assertEqual(rows[0]["model"], "ollama_chat/gemma4-32k:latest")
+        self.assertEqual(rows[0]["api_base"], "http://127.0.0.1:11434")
+        blob = json.dumps(rows)
+        self.assertNotIn("super-secret", blob)
+        self.assertNotIn("OPENROUTER", blob)
+        self.assertNotIn("api_key", blob)
+
+    def test_does_not_invent_an_alias_when_model_name_is_missing(self):
+        rows = roost.parse_litellm_model_list(self.YAML)
+        self.assertFalse(any(r["model_name"] == "orphan" for r in rows))
+        self.assertFalse(any("orphan" in r["model_name"] for r in rows))
+
+    def test_missing_config_is_a_labelled_gap(self):
+        old = os.environ.get(roost.LITELLM_CONFIG_ENV)
+        os.environ[roost.LITELLM_CONFIG_ENV] = str(
+            Path(tempfile.gettempdir()) / "roost-no-such-litellm.yaml")
+        try:
+            rows, gap = roost.collect_gateway_models()
+            self.assertEqual(rows, [])
+            self.assertIn("no LiteLLM config", gap)
+        finally:
+            if old is None:
+                os.environ.pop(roost.LITELLM_CONFIG_ENV, None)
+            else:
+                os.environ[roost.LITELLM_CONFIG_ENV] = old
+
+    def test_render_shows_alias_backing_and_ollama_mismatch(self):
+        roost.COLOR = False
+        out = "\n".join(roost.render_gateway({
+            "litellm_up": True, "runs": [], "jobs": None,
+            "last_req_secs": None, "req_per_min": None,
+            "configured_gap": None,
+            "configured": [
+                {"alias": "gemma-32k",
+                 "model": "ollama_chat/gemma4-32k:latest",
+                 "api_base": "http://127.0.0.1:11434",
+                 "kind": "local", "ollama_name": "gemma4-32k:latest",
+                 "ollama": "installed"},
+                {"alias": "ghost",
+                 "model": "ollama_chat/not-installed:latest",
+                 "api_base": "", "kind": "local",
+                 "ollama_name": "not-installed:latest", "ollama": "missing"},
+                {"alias": "openrouter-free-zdr",
+                 "model": "openrouter/inclusionai/ling-3.0-flash:free",
+                 "api_base": "", "kind": "cloud",
+                 "ollama_name": None, "ollama": "-"},
+            ],
+        }))
+        self.assertIn("gemma-32k", out)
+        self.assertIn("openrouter-free-zdr", out)
+        self.assertIn("missing", out)
+        self.assertIn("cloud", out)
+        self.assertNotIn("api_key", out)
+
+    def test_collect_gateway_cross_checks_ollama_names(self):
+        td = tempfile.TemporaryDirectory()
+        cfg = Path(td.name) / "config.yaml"
+        cfg.write_text(self.YAML, encoding="utf-8")
+        old = os.environ.get(roost.LITELLM_CONFIG_ENV)
+        os.environ[roost.LITELLM_CONFIG_ENV] = str(cfg)
+        orig_models = roost.collect_local_models
+        roost.collect_local_models = lambda: [
+            {"name": "gemma4-32k:latest", "disk_gb": 1, "resident": False,
+             "vram_gb": None, "expires_secs": None}]
+        orig_open = roost.port_open
+        roost.port_open = lambda *a, **k: False
+        try:
+            gw = roost.collect_gateway()
+            by_alias = {r["alias"]: r for r in gw["configured"]}
+            self.assertEqual(by_alias["gemma-32k"]["ollama"], "installed")
+            self.assertEqual(by_alias["openrouter-free-zdr"]["kind"], "cloud")
+            self.assertIsNone(gw["configured_gap"])
+            self.assertNotIn("super-secret", json.dumps(gw))
+        finally:
+            roost.collect_local_models = orig_models
+            roost.port_open = orig_open
+            if old is None:
+                os.environ.pop(roost.LITELLM_CONFIG_ENV, None)
+            else:
+                os.environ[roost.LITELLM_CONFIG_ENV] = old
+            td.cleanup()
+
+
+class TestInteractiveTables(unittest.TestCase):
+    def setUp(self):
+        roost.COLOR = False
+        self.agent = {
+            "source": "claude", "agent_id": "abc123def", "agent_type": "Explore",
+            "parent_sid": "sid-1", "task": "Scout the source URLs without clipping "
+            + ("word " * 40),
+            "model": "claude-haiku-4-5", "ctx_tokens": 40, "ctx_pct": 0.02,
+            "window": "200k", "idle_secs": 3.0, "state": "working",
+            "parent_live": True,
+        }
+
+    def test_tab_opens_subagents_and_cycles_back_to_workers(self):
+        focus, view = roost.tab_table_focus("workers", None)
+        self.assertEqual((focus, view), ("agents", "agents"))
+        focus, view = roost.tab_table_focus(focus, view)
+        self.assertEqual(focus, "workers")
+        self.assertEqual(view, "agents")
+
+    def test_subagent_rows_are_selectable(self):
+        out = "\n".join(roost.render_subagents([self.agent], sel=0))
+        self.assertTrue(any(ln.startswith("> ") for ln in out.splitlines()))
+        self.assertIn("abc12", out)
+
+    def test_enter_detail_keeps_the_full_task(self):
+        out = "\n".join(roost.render_detail(self.agent))
+        self.assertIn("DETAIL", out)
+        self.assertIn("Scout the source URLs without clipping", out)
+        self.assertIn("abc123def", out)
+        self.assertIn("not on disk", out)
+        self.assertIn("esc returns", out)
+
+    def test_worker_detail_lists_child_subagents(self):
+        w = worker(task="a very long task " + ("x" * 80))
+        out = "\n".join(roost.render_detail(w, children=[self.agent]))
+        self.assertIn(w["session_id"], out)
+        self.assertIn("a very long task", out)
+        self.assertIn("Explore", out)
+
+    def test_frame_focus_agents_indexes_subagent_rows(self):
+        saved = {n: getattr(roost, n) for n in
+                 ("collect_workers", "collect_infra", "collect_subagents")}
+        roost.collect_infra = lambda: []
+        roost.collect_workers = lambda: [worker(idle_secs=5)]
+        roost.collect_subagents = lambda sids: [self.agent]
+        try:
+            lines, rows, sel = roost.frame(
+                view="agents", sel=0, focus="agents")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["agent_id"], "abc123def")
+            self.assertEqual(sel, 0)
+            text = "\n".join(lines)
+            self.assertIn("> ", text)
+        finally:
+            for n, fn in saved.items():
+                setattr(roost, n, fn)
 
 
 if __name__ == "__main__":

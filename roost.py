@@ -157,6 +157,7 @@ PROXY_LOG_TAIL = 65536
 OLLAMA_PORT_ENV = "ROOST_OLLAMA_PORT"
 LITELLM_PORT_ENV = "ROOST_LITELLM_PORT"
 OPENWEBUI_PORT_ENV = "ROOST_OPENWEBUI_PORT"
+LITELLM_CONFIG_ENV = "ROOST_LITELLM_CONFIG"
 OLLAMA_PORT = int(os.environ.get(OLLAMA_PORT_ENV, 11434))
 LITELLM_PORT = int(os.environ.get(LITELLM_PORT_ENV, 4000))
 OPENWEBUI_PORT = int(os.environ.get(OPENWEBUI_PORT_ENV, 8080))
@@ -360,6 +361,90 @@ MODEL_WINDOWS = {
 }
 
 WINDOW_TIERS = ((200000, "200k"), (256000, "256k"), (1000000, "1M"))
+WINDOW_TIERS_ENV = "ROOST_WINDOW_TIERS"
+WINDOW_ENV = "ROOST_WINDOW"
+
+
+def _parse_size_token(token):
+    """Parse 200000, 200k, or 1M into an int. None if it is not a size."""
+    if token is None:
+        return None
+    raw = str(token).strip().replace("_", "").replace(",", "")
+    if not raw:
+        return None
+    try:
+        if raw[-1] in "kKmM" and raw[:-1].replace(".", "", 1).isdigit():
+            n = float(raw[:-1])
+            return int(n * (1000000 if raw[-1] in "mM" else 1000))
+        if raw.isdigit():
+            return int(raw)
+    except ValueError:
+        return None
+    return None
+
+
+def parse_window_tiers(raw):
+    """Parse ROOST_WINDOW_TIERS (`200000:200k,1000000:1M`).
+
+    Returns (tiers_tuple, error_or_None). On any parse failure the caller keeps
+    the built-in list -- a bad env var is a labelled gap, not a crash.
+    """
+    if raw is None or not str(raw).strip():
+        return WINDOW_TIERS, None
+    tiers = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            return WINDOW_TIERS, "ROOST_WINDOW_TIERS: missing label in %r" % part
+        size_s, label = part.split(":", 1)
+        size = _parse_size_token(size_s.strip())
+        label = label.strip()
+        if not size or size <= 0 or not label:
+            return WINDOW_TIERS, "ROOST_WINDOW_TIERS: bad entry %r" % part
+        tiers.append((size, label))
+    if not tiers:
+        return WINDOW_TIERS, "ROOST_WINDOW_TIERS is empty"
+    tiers.sort(key=lambda t: t[0])
+    return tuple(tiers), None
+
+
+def parse_forced_window(raw):
+    """Parse ROOST_WINDOW (`1M`, `200k`, or a token count). None if unset."""
+    if raw is None or not str(raw).strip():
+        return None, None
+    token = str(raw).strip()
+    size = _parse_size_token(token)
+    if not size or size <= 0:
+        return None, "ROOST_WINDOW: not a size: %r" % token
+    if len(token) >= 2 and token[-1] in "kKmM" and token[:-1].replace(".", "", 1).isdigit():
+        label = token[:-1] + ("M" if token[-1] in "mM" else "k")
+    else:
+        label = _window_label(size)
+    return (size, label), None
+
+
+def active_window_tiers():
+    """Built-in WINDOW_TIERS, or ROOST_WINDOW_TIERS when that parses."""
+    tiers, err = parse_window_tiers(os.environ.get(WINDOW_TIERS_ENV))
+    return tiers if err is None else WINDOW_TIERS
+
+
+def window_config_note():
+    """One-line WINDOW status for the frame, or None when using silent defaults."""
+    forced, ferr = parse_forced_window(os.environ.get(WINDOW_ENV))
+    if ferr:
+        return ferr + "; using built-in tiers"
+    if forced:
+        return "override %s (%s)" % (forced[1], WINDOW_ENV)
+    raw = os.environ.get(WINDOW_TIERS_ENV)
+    tiers, terr = parse_window_tiers(raw)
+    if terr:
+        return terr + "; using built-in 200k/256k/1M"
+    if raw and str(raw).strip():
+        return "tiers %s (%s)" % (", ".join(t[1] for t in tiers), WINDOW_TIERS_ENV)
+    return None
 
 
 def model_window(model):
@@ -387,14 +472,25 @@ def _window_label(size):
 def window_for(tokens, model=None):
     """(window_size, label) for a session's context window. Known models
     resolve exactly off MODEL_WINDOWS; anything else falls back to the old
-    usage-based inference, its label "~"-marked to say so."""
+    usage-based inference, its label "~"-marked to say so.
+
+    ROOST_WINDOW, when set and parseable, skips inference and the model table
+    entirely -- the user stated the window. ROOST_WINDOW_TIERS replaces the
+    built-in fallback list. Neither is silent: window_config_note() surfaces
+    the assumption on the frame.
+    """
+    forced, ferr = parse_forced_window(os.environ.get(WINDOW_ENV))
+    if ferr is None and forced is not None:
+        return forced
     size = model_window(model)
     if size is not None:
         return size, _window_label(size)
-    for size, label in WINDOW_TIERS:
+    tiers = active_window_tiers()
+    tokens = tokens or 0
+    for size, label in tiers:
         if tokens <= size:
             return size, "~" + label
-    return WINDOW_TIERS[-1][0], "~" + WINDOW_TIERS[-1][1]
+    return tiers[-1][0], "~" + tiers[-1][1]
 
 
 # ---- auto-compact resolution ------------------------------------------------
@@ -1647,6 +1743,147 @@ def collect_local_models():
     return out
 
 
+def _yaml_scalar(value):
+    v = (value or "").strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        return v[1:-1]
+    return v
+
+
+def parse_litellm_model_list(text):
+    """Pull model_name, model, and api_base out of a LiteLLM config.yaml.
+
+    Everything else -- api_key, drop_params, the rest of litellm_params -- is
+    ignored on purpose. Aliases are never invented: an entry without
+    model_name is skipped.
+    """
+    if not text:
+        return []
+    lines = text.splitlines()
+    start = None
+    for i, ln in enumerate(lines):
+        stripped = ln.split("#", 1)[0].rstrip()
+        if stripped == "model_list:":
+            start = i + 1
+            break
+        if stripped.startswith("model_list:"):
+            rest = stripped[len("model_list:"):].strip()
+            if rest in ("[]", "null", "~"):
+                return []
+            start = i + 1
+            break
+    if start is None:
+        return []
+
+    items = []
+    current = None
+    keep = ("model_name", "model", "api_base")
+
+    def flush():
+        nonlocal current
+        if current and current.get("model_name"):
+            items.append({
+                "model_name": current["model_name"],
+                "model": current.get("model") or "",
+                "api_base": current.get("api_base") or "",
+            })
+        current = None
+
+    for ln in lines[start:]:
+        cut = ln.split("#", 1)[0].rstrip()
+        if not cut.strip():
+            continue
+        indent = len(ln) - len(ln.lstrip(" "))
+        if indent == 0 and not cut.lstrip().startswith("-"):
+            break
+        stripped = cut.strip()
+        if stripped.startswith("-"):
+            flush()
+            current = {}
+            rest = stripped[1:].strip()
+            if rest and ":" in rest:
+                key, val = rest.split(":", 1)
+                key = key.strip()
+                if key in keep:
+                    parsed = _yaml_scalar(val)
+                    if parsed:
+                        current[key] = parsed
+            continue
+        if current is None or ":" not in stripped:
+            continue
+        key, val = stripped.split(":", 1)
+        key = key.strip()
+        if key in keep:
+            parsed = _yaml_scalar(val)
+            if parsed:
+                current[key] = parsed
+    flush()
+    return items
+
+
+def _litellm_config_path():
+    return Path(os.environ.get(
+        LITELLM_CONFIG_ENV, str(HOME / "litellm-server" / "config.yaml")))
+
+
+def _ollama_backing(model):
+    for prefix in ("ollama_chat/", "ollama/"):
+        if model.startswith(prefix):
+            return model[len(prefix):]
+    return None
+
+
+def _ollama_name_installed(name, installed):
+    if not name or not installed:
+        return False
+    if name in installed:
+        return True
+    if (name + ":latest") in installed:
+        return True
+    if name.endswith(":latest") and name[:-7] in installed:
+        return True
+    return False
+
+
+def collect_gateway_models(installed_names=None):
+    """Configured LiteLLM aliases from config.yaml, plus an Ollama cross-check.
+
+    This is configured intent, not liveness. Missing config is a labelled gap.
+    """
+    path = _litellm_config_path()
+    if not path.is_file():
+        return [], "no LiteLLM config at %s" % path
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return [], "LiteLLM config unreadable at %s" % path
+    entries = parse_litellm_model_list(text)
+    if not entries:
+        return [], "no model_list in LiteLLM config"
+    rows = []
+    for e in entries:
+        backing = e["model"]
+        ollama = _ollama_backing(backing)
+        kind = "local" if ollama else "cloud"
+        if kind == "cloud":
+            ollama_state = "-"
+        elif installed_names is None:
+            ollama_state = "unknown"
+        elif _ollama_name_installed(ollama, installed_names):
+            ollama_state = "installed"
+        else:
+            ollama_state = "missing"
+        rows.append({
+            "alias": e["model_name"],
+            "model": backing,
+            "api_base": e["api_base"],
+            "kind": kind,
+            "ollama_name": ollama,
+            "ollama": ollama_state,
+        })
+    return rows, None
+
+
 def _batch_root():
     return Path(os.environ.get(BATCH_DIR_ENV,
                                str(HOME / "litellm-server" / "batch")))
@@ -1697,7 +1934,15 @@ def collect_gateway():
     """
     now = time.time()
     out = {"litellm_up": port_open(LITELLM_PORT), "runs": [], "jobs": None,
-           "last_req_secs": None, "req_per_min": None}
+           "last_req_secs": None, "req_per_min": None,
+           "configured": [], "configured_gap": None}
+
+    configured, gap = collect_gateway_models(None)
+    if configured and any(r["kind"] == "local" for r in configured):
+        names = {m["name"] for m in collect_local_models() if m.get("name")}
+        configured, gap = collect_gateway_models(names)
+    out["configured"] = configured
+    out["configured_gap"] = gap
 
     root = _batch_root()
     log = root.parent / "proxy.log"
@@ -1801,6 +2046,35 @@ def render_gateway(gw):
             c(str(j["running"]), GREEN) if j["running"] else j["running"],
             j["done"],
             c(str(j["failed"]), RED) if j["failed"] else j["failed"]))
+
+    gap = gw.get("configured_gap")
+    configured = gw.get("configured") or []
+    lines.append(c("  configured models (intent, not liveness)", DIM))
+    if gap:
+        lines.append(c("  " + gap, YELLOW))
+    elif configured:
+        cols = [
+            ("ALIAS", lambda r: r["alias"]),
+            ("BACKING", lambda r: r["model"] or "-"),
+            ("WHERE", lambda r: r["kind"]),
+            ("OLLAMA", lambda r: r["ollama"]),
+        ]
+        table = [[h for h, _ in cols]] + [[f(r) for _, f in cols] for r in configured]
+        w = [max(len(row[i]) for row in table) for i in range(len(cols))]
+        lines.append("  " + c("  ".join(
+            table[0][i].ljust(w[i]) for i in range(len(cols))), BOLD))
+        for row, r in zip(table[1:], configured):
+            cells = [row[i].ljust(w[i]) for i in range(len(cols))]
+            line = "  " + "  ".join(cells)
+            if r["ollama"] == "missing":
+                lines.append(c(line, BOLD, YELLOW))
+            elif r["kind"] == "cloud":
+                lines.append(c(line, CYAN))
+            else:
+                lines.append(line)
+        missing = sum(1 for r in configured if r["ollama"] == "missing")
+        lines.append("  " + c("%d alias(es), %d missing locally" % (
+            len(configured), missing), DIM))
 
     if not gw["runs"]:
         lines.append(c("  no batch runs found", DIM))
@@ -2591,7 +2865,7 @@ def style_cell(header, text, row):
     return text
 
 
-def render_subagents(agents):
+def render_subagents(agents, sel=None):
     """Subagents are the work a session farmed out -- and they are invisible in
     any pid-based view, since they share the parent's process."""
     lines = ["", c("SUBAGENTS", BOLD)]
@@ -2618,10 +2892,10 @@ def render_subagents(agents):
     table = [[h for h, _ in cols]] + [[f(r) for _, f in cols] for r in agents]
     w = [max(len(row[i]) for row in table) for i in range(len(cols))]
     lines.append("  " + c("  ".join(table[0][i].ljust(w[i]) for i in range(len(cols))), BOLD))
-    for row, r in zip(table[1:], agents):
+    for i, (row, r) in enumerate(zip(table[1:], agents)):
         cells = []
-        for i, (header, _) in enumerate(cols):
-            txt = row[i].ljust(w[i])
+        for j, (header, _) in enumerate(cols):
+            txt = row[j].ljust(w[j])
             if header == "STATE":
                 code = {"working": GREEN, "idle": YELLOW}.get(r["state"], DIM)
                 cells.append(c(txt, BOLD, code))
@@ -2633,11 +2907,77 @@ def render_subagents(agents):
                 cells.append(c(txt, DIM))
             else:
                 cells.append(txt)
-        lines.append("  " + "  ".join(cells))
+        mark = "> " if i == sel else "  "
+        line = mark + "  ".join(cells)
+        lines.append(highlight(line) if i == sel else line)
 
     working = sum(1 for r in agents if r["state"] == "working")
     lines.append("  " + c("%d subagent(s), %d working" % (len(agents), working), DIM))
     return lines
+
+
+def render_detail(row, children=None):
+    """Read-only row detail. Replaces the panel slot; esc returns."""
+    lines = ["", c("DETAIL", BOLD) + "  " + c("esc returns", DIM)]
+    if not row:
+        lines.append(c("  no row selected", DIM))
+        return lines
+    is_agent = "agent_id" in row and "parent_sid" in row
+    lines.append("  " + c("subagent" if is_agent else "worker", BOLD))
+
+    def field(label, value):
+        text = "" if value is None else str(value)
+        lines.append("  %s  %s" % (c(label.ljust(14), DIM), ascii_safe(text)))
+
+    if is_agent:
+        field("agent_id", row.get("agent_id"))
+        field("type", row.get("agent_type") or "-")
+        field("parent", row.get("parent_sid"))
+        field("state", row.get("state"))
+    else:
+        field("name", row.get("name"))
+        field("source", row.get("source") or "claude")
+        field("pid", row.get("pid") if row.get("pid") is not None else "none")
+        field("sessionId", row.get("session_id"))
+        field("cwd", row.get("cwd") or "-")
+        field("age", dur(row.get("age_secs")) if row.get("age_secs") is not None else "-")
+    field("model", row.get("model") or "-")
+    tok = row.get("ctx_tokens")
+    win = row.get("window") or "-"
+    if tok is not None:
+        pct = row.get("ctx_pct")
+        pct_s = "" if pct is None else "  %.1f%%" % pct
+        field("tokens", "%s / %s%s" % (compact(tok), win, pct_s))
+    else:
+        field("tokens", "- / %s" % win)
+    field("idle", dur(row.get("idle_secs")) if row.get("idle_secs") is not None else "-")
+    field("cost/turn", "not on disk")
+    task = ascii_safe(row.get("task") or "")
+    lines.append("  " + c("task", DIM))
+    if task:
+        width = max(40, shutil.get_terminal_size((100, 40)).columns - 6)
+        for part in textwrap.wrap(task, width) or [task]:
+            lines.append("    " + part)
+    else:
+        lines.append(c("    (none)", DIM))
+    if not is_agent:
+        kids = children if children is not None else []
+        lines.append("  " + c("subagents", DIM))
+        if not kids:
+            lines.append(c("    none", DIM))
+        else:
+            for a in kids:
+                label = a.get("agent_type") or (a.get("agent_id") or "")[:10]
+                lines.append("    %s  %s  %s" % (
+                    a.get("state", "-"), label, ascii_safe(a.get("task") or "")))
+    return lines
+
+
+def tab_table_focus(focus, view):
+    """Tab cycles WORKERS <-> SUBAGENTS. Opens the subagents panel if needed."""
+    if focus != "agents":
+        return "agents", "agents"
+    return "workers", view if view else "agents"
 
 
 def render_models(models):
@@ -2707,10 +3047,9 @@ HELP_SCREENS = (
      "from the budget math. First open scans a week of transcripts and can pause for a "
      "moment; after that it reads only what was appended."),
     ("GATEWAY", "g",
-     "LiteLLM liveliness plus batch-run progress. The gateway is DB-less so it keeps no "
-     "request history -- progress is derived from the batch pipeline's own output files "
-     "(one JSON per finished item), the job queue dirs, and a best-effort read of "
-     "proxy.log. Green rows are actively writing."),
+     "LiteLLM liveliness, the aliases in config.yaml (configured intent, not "
+     "whether a backing model will answer), plus batch-run progress from output "
+     "files. Missing config is a labelled gap. Green batch rows are writing."),
     ("REMOTE", "r",
      "other machines' roost, over ssh. One row per host in ROOST_REMOTES: workers, "
      "resident models, batch progress, job queue. Fetched on a background thread and "
@@ -2736,34 +3075,53 @@ def render_help():
             gutter = c(label.ljust(lw), BOLD) if i == 0 else " " * lw
             lines.append("  " + gutter + "  " + c(part, DIM))
     lines.append("")
-    lines.append("  " + c("interactive mode (i) arms the cursor: j/k select, x stop, "
+    lines.append("  " + c("interactive mode (i) arms the cursor: j/k select, Tab "
+                          "switches tables, Enter opens a row, x stop, "
                           "y copy sessionId, esc deselect.", DIM))
     return lines
 
 
-def frame(view=None, sel=None):
+def frame(view=None, sel=None, focus="workers", detail=None):
     """Returns (lines, rows, sel). `view` is the open panel: "agents",
-    "models", "advice", "usage", "help", or None for the bare worker table.
+    "models", "advice", "usage", "help", "detail", or None for the bare worker table.
 
-    `rows` is what the cursor indexes, handed back so the key handler acts on the
-    frame the user was actually looking at. `sel` comes back clamped: sessions
-    exit between frames, and a cursor left pointing past the end would silently
-    address nothing.
+    `rows` is what the cursor indexes for the focused table (workers or
+    subagents). `sel` comes back clamped: sessions exit between frames, and a
+    cursor left pointing past the end would silently address nothing.
     """
     workers = collect_workers()
-    shown, _ = arrange(workers, expand_quiet=sel is not None)
-    rows = [w for _, w in shown]
+    shown, _ = arrange(workers, expand_quiet=sel is not None and focus == "workers")
+    worker_rows = [w for _, w in shown]
+    live_sids = set(w["session_id"] for w in workers if w.get("session_id"))
+    agents = []
+    if view in ("agents", "detail") or focus == "agents":
+        agents = collect_subagents(live_sids)
+    if focus == "agents":
+        rows = agents
+    else:
+        rows = worker_rows
     if sel is not None:
         sel = min(sel, len(rows) - 1) if rows else None
     # Infra leads because it is a constant: one quiet line you skim past, which
     # is exactly the weight it deserves until something turns red.
     lines = render_infra(infra_cached())
+    win_note = window_config_note()
+    if win_note:
+        lines.append(c("WINDOW ", BOLD) + win_note)
+        lines.append("")
     # Panels paint *above* the worker table. Below it they disappeared under
     # "taller window" truncation whenever the board was long -- pressing s/m/a
     # looked like a no-op even though the view toggled.
     if view == "agents":
-        live_sids = set(w["session_id"] for w in workers if w.get("session_id"))
-        lines.extend(render_subagents(collect_subagents(live_sids)))
+        lines.extend(render_subagents(
+            agents, sel=sel if focus == "agents" else None))
+    elif view == "detail":
+        kids = []
+        if detail and detail.get("session_id"):
+            kids = [a for a in agents if a.get("parent_sid") == detail.get("session_id")]
+            if not kids:
+                kids = collect_subagents({detail["session_id"]})
+        lines.extend(render_detail(detail, children=kids))
     elif view == "models":
         lines.extend(render_models(collect_local_models()))
     elif view == "usage":
@@ -2777,7 +3135,7 @@ def frame(view=None, sel=None):
     elif view == "advice":
         lines.append("")
         lines.extend(advise(workers))
-    lines.extend(render(workers, sel))
+    lines.extend(render(workers, sel if focus == "workers" else None))
     prune_caches()
     return lines, rows, sel
 
@@ -3039,6 +3397,7 @@ def main():
         "h or ? = what am I looking at   "
         "i = arm interactive mode   q = quit\n"
         "interactive mode (armed with i):  j/k or arrows move a cursor   "
+        "Tab = workers/subagents   Enter = row detail   "
         "x = stop the session (confirms)   y = copy its sessionId   esc = deselect")
     args = ap.parse_args()
 
@@ -3051,10 +3410,13 @@ def main():
         OPENWEBUI_PORT = args.openwebui_port
 
     if args.json:
+        workers = collect_workers()
+        live_sids = set(w["session_id"] for w in workers if w.get("session_id"))
         print(json.dumps({
             "schema": SCHEMA_SNAPSHOT,
             "version": __version__,
-            "workers": collect_workers(),
+            "workers": workers,
+            "subagents": collect_subagents(live_sids),
             "infra": collect_infra(),
             "usage_caps": collect_usage_caps(),
             "local_models": collect_local_models(),
@@ -3116,6 +3478,8 @@ def main():
     # arming it is one deliberate keypress rather than "having a terminal."
     interactive = bool(args.interactive)
     sel = None      # cursor row index, or None when there is no cursor
+    focus = "workers"  # "workers" or "agents" -- Tab switches
+    detail = None   # row shown in the DETAIL panel, or None
     pending = None  # the worker row awaiting a y/n answer
     note = None     # result of the last action, cleared by the next keypress
     try:
@@ -3134,10 +3498,10 @@ def main():
                     # they can do something.
                     if interactive:
                         i_tag = c("i", BOLD, GREEN) + " interactive " + c("ARMED", BOLD, GREEN)
-                        cur_tag = "j/k x y esc"
+                        cur_tag = "j/k Tab Enter x y esc"
                     else:
                         i_tag = c("i", BOLD) + " interactive " + c("off  ", DIM)
-                        cur_tag = c("j/k x y esc", DIM)
+                        cur_tag = c("j/k Tab Enter x y esc", DIM)
                     a_tag = c("a", BOLD, GREEN) if view == "advice" else "a"
                     s_tag = c("s", BOLD, GREEN) if view == "agents" else "s"
                     m_tag = c("m", BOLD, GREEN) if view == "models" else "m"
@@ -3150,7 +3514,7 @@ def main():
                             "%s help | q quit") % (
                         i_tag, cur_tag, a_tag, s_tag, m_tag, u_tag, g_tag,
                         r_tag, h_tag)
-                lines, rows, sel = frame(view, sel)
+                lines, rows, sel = frame(view, sel, focus=focus, detail=detail)
                 # A session can exit while its confirmation is on screen. Matching
                 # on pid rather than on the row dict is what makes that detectable:
                 # every frame rebuilds the dicts, so identity and equality both
@@ -3223,28 +3587,42 @@ def main():
                     if key == " ":
                         break  # repaint now
                     if key == "ESC":
-                        sel = None
+                        if view == "detail":
+                            view = "agents" if focus == "agents" else None
+                            detail = None
+                        else:
+                            sel = None
                         break
                     if key in ("a", "A"):
                         view = None if view == "advice" else "advice"
+                        detail = None
                         break  # repaint immediately, do not wait out the tick
                     if key in ("s", "S"):
                         view = None if view == "agents" else "agents"
+                        if view != "agents" and focus == "agents":
+                            focus = "workers"
+                            sel = None
+                        detail = None
                         break
                     if key in ("m", "M"):
                         view = None if view == "models" else "models"
+                        detail = None
                         break
                     if key in ("u", "U"):
                         view = None if view == "usage" else "usage"
+                        detail = None
                         break
                     if key in ("g", "G"):
                         view = None if view == "gateway" else "gateway"
+                        detail = None
                         break
                     if key in ("r", "R"):
                         view = None if view == "remote" else "remote"
+                        detail = None
                         break
                     if key in ("h", "H", "?"):
                         view = None if view == "help" else "help"
+                        detail = None
                         break
                     if key in ("i", "I"):
                         # The one key that arms the whole risky half at once --
@@ -3260,11 +3638,33 @@ def main():
                             # at whatever row happens to occupy that index by
                             # then, not the one it was left on.
                             sel = None
+                            focus = "workers"
+                            detail = None
                             note = c("interactive off -- view only", DIM)
+                        break
+                    if key in ("\t",):
+                        if not interactive:
+                            note = c("press i to arm interactive mode first", YELLOW)
+                        else:
+                            focus, view = tab_table_focus(focus, view)
+                            sel = 0
+                            detail = None
+                            note = c("focus %s -- Enter for detail" % focus, DIM)
+                        break
+                    if key in ("\r", "\n"):
+                        if not interactive:
+                            note = c("press i to arm interactive mode first", YELLOW)
+                        elif sel is None or not rows:
+                            note = c("select a row first -- j/k or the arrow keys", YELLOW)
+                        else:
+                            detail = rows[sel]
+                            view = "detail"
                         break
                     if key in ("j", "J", "DOWN"):
                         if not interactive:
                             note = c("press i to arm interactive mode first", YELLOW)
+                        elif view == "detail":
+                            note = c("esc to leave detail first", DIM)
                         else:
                             # Unbounded on purpose -- frame() clamps against the row
                             # count it actually rendered, which is the only correct one.
@@ -3273,6 +3673,8 @@ def main():
                     if key in ("k", "K", "UP"):
                         if not interactive:
                             note = c("press i to arm interactive mode first", YELLOW)
+                        elif view == "detail":
+                            note = c("esc to leave detail first", DIM)
                         else:
                             sel = 0 if sel is None else max(0, sel - 1)
                         break
@@ -3282,11 +3684,17 @@ def main():
                         # no-ops is indistinguishable from a broken one.
                         if not interactive:
                             note = c("press i to arm interactive mode first", YELLOW)
+                        elif view == "detail":
+                            note = c("detail is read-only -- esc to return", DIM)
                         elif sel is None or not rows:
                             note = c("select a row first -- j/k or the arrow keys", YELLOW)
+                        elif focus == "agents" or (
+                                rows[sel].get("agent_id")
+                                and "parent_sid" in rows[sel]):
+                            note = c("subagents are read-only in roost", YELLOW)
                         elif key in ("x", "X"):
                             w = rows[sel]
-                            if w.get("source") == "cursor":
+                            if w.get("source") == "cursor" or w.get("pid") is None:
                                 note = c("cursor composers cannot be stopped from roost", YELLOW)
                             else:
                                 pending = w

@@ -1,0 +1,2 @@
+{"type":"user","agentId":"abc123","cwd":"/tmp/roost-canary","isSidechain":true,"message":{"role":"user","content":"Scout the source URLs"},"sessionId":"11111111-2222-3333-4444-555555555555","timestamp":"2026-08-01T00:00:01.500Z","uuid":"sa1"}
+{"type":"assistant","agentId":"abc123","isSidechain":true,"message":{"model":"claude-haiku-4-5","role":"assistant","usage":{"input_tokens":40,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":12}},"sessionId":"11111111-2222-3333-4444-555555555555","timestamp":"2026-08-01T00:00:02.000Z","uuid":"sa2"}

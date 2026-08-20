@@ -1,0 +1,73 @@
+{
+  "session_keys": [
+    "cwd",
+    "entrypoint",
+    "kind",
+    "name",
+    "nameSince",
+    "nameSource",
+    "peerProtocol",
+    "pid",
+    "procStart",
+    "sessionId",
+    "startedAt",
+    "version"
+  ],
+  "session_keys_required": [
+    "cwd",
+    "name",
+    "pid",
+    "sessionId",
+    "startedAt"
+  ],
+  "transcript_assistant_top_keys": [
+    "cwd",
+    "isSidechain",
+    "message",
+    "sessionId",
+    "timestamp",
+    "type",
+    "uuid"
+  ],
+  "transcript_assistant_message_keys": [
+    "content",
+    "id",
+    "model",
+    "role",
+    "type",
+    "usage"
+  ],
+  "usage_parent": "message.usage",
+  "usage_keys_required": [
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "input_tokens"
+  ],
+  "title_fields": [
+    "customTitle",
+    "lastPrompt"
+  ],
+  "harvest_tool_result_keys": [
+    "agentId",
+    "agentType",
+    "description",
+    "resolvedModel",
+    "status"
+  ],
+  "subagent_first_keys": [
+    "agentId",
+    "cwd",
+    "isSidechain",
+    "message",
+    "sessionId",
+    "timestamp",
+    "type",
+    "uuid"
+  ],
+  "subagent_first_keys_required": [
+    "agentId",
+    "isSidechain",
+    "message"
+  ],
+  "subagent_path": "projects/<slug>/<parentSessionId>/subagents/agent-<id>.jsonl"
+}
