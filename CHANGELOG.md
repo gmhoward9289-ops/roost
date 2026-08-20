@@ -15,6 +15,19 @@ deliberately no `Unreleased` heading: unreleased work lives in the open release
 PR, and a hand-maintained section would sort below each new generated one and
 drift out of date.
 
+## [0.9.0](https://github.com/gmhoward9289-ops/roost/compare/v0.8.1...v0.9.0) (2026-08-20)
+
+
+### Added
+
+* carry the version in --json output ([#72](https://github.com/gmhoward9289-ops/roost/issues/72)) ([cd5ccd3](https://github.com/gmhoward9289-ops/roost/commit/cd5ccd3769d4dbd61c2795464f5828cf958e0c85))
+* roost.snapshot.v1 schema on --json output ([bc26903](https://github.com/gmhoward9289-ops/roost/commit/bc26903857f3cde1b9482a99d8b17e539cfed818))
+
+
+### Documentation
+
+* align license text with Apache-2.0 relicense ([0b5d3e0](https://github.com/gmhoward9289-ops/roost/commit/0b5d3e080b7387b08523993cc8188fc34fa499f9))
+
 ## [0.8.1](https://github.com/gmhoward9289-ops/roost/compare/v0.8.0...v0.8.1) (2026-08-16)
 
 
