@@ -153,6 +153,12 @@ roost -1           one frame, then exit
 roost --json       joined records, for piping
 ```
 
+`--json` is an object (not a list). Keys: `schema` (`roost.snapshot.v1`),
+`version`, `workers`, `subagents`, `infra`, `usage_caps`, `local_models`,
+`gateway`. The session/tool-call event types live in
+[henhouse](https://github.com/gmhoward9289-ops/henhouse). roost does not
+`pip install henhouse` — this file stays the one-file install.
+
 | flag | does |
 | --- | --- |
 | `-w`, `--watch [SECS]` | refresh interval in seconds (default 1; live is the default) |
