@@ -1,0 +1,4 @@
+{
+  "name": "roost",
+  "install": "sudo ln -sf \"$(command -v python3)\" /usr/local/bin/python && python3 -m pip install -e ."
+}
