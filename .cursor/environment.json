@@ -1,0 +1,4 @@
+{
+  "name": "roost",
+  "install": "sudo ln -sf \"$(command -v python3)\" /usr/local/bin/python && sudo python3 -m pip install --break-system-packages -e ."
+}
