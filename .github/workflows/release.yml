@@ -363,12 +363,29 @@ jobs:
       # fork was two weeks stale, and the fix was this exact sync run by hand.
       # The fork only ever receives generated manifest branches, never direct
       # commits to its default branch, so a fast-forward sync always succeeds.
-      - name: Sync the winget-pkgs fork with upstream
+      # Sync failure must not block winget-releaser: a stale fork is better than
+      # no publish attempt, and a missing/expired WINGET_PAT fails here with a
+      # clearer message before the releaser step runs.
+      - name: Require WINGET_PAT
         if: steps.bootstrapped.outputs.exists == 'true'
         shell: bash
         env:
+          WINGET_PAT: ${{ secrets.WINGET_PAT }}
+        run: |
+          if [ -z "$WINGET_PAT" ]; then
+            echo "::error::WINGET_PAT secret is missing. Create a classic PAT with the public_repo scope and set it with: gh secret set WINGET_PAT --repo ${{ github.repository }}"
+            exit 1
+          fi
+
+      - name: Sync the winget-pkgs fork with upstream
+        if: steps.bootstrapped.outputs.exists == 'true'
+        continue-on-error: true
+        shell: bash
+        env:
           GH_TOKEN: ${{ secrets.WINGET_PAT }}
-        run: gh repo sync gmhoward9289-ops/winget-pkgs --source microsoft/winget-pkgs
+        run: |
+          gh repo sync gmhoward9289-ops/winget-pkgs --source microsoft/winget-pkgs \
+            || echo "::warning::fork sync failed; continuing with winget-releaser against the fork as-is"
 
       # SHA-pinned, not @v2: this job holds a classic PAT with public_repo --
       # write access to every public repo on the account -- and a mutable tag
@@ -397,6 +414,16 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Require TAP_PUSH_TOKEN
+        shell: bash
+        env:
+          TAP_PUSH_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+        run: |
+          if [ -z "$TAP_PUSH_TOKEN" ]; then
+            echo "::error::TAP_PUSH_TOKEN secret is missing. Create a fine-grained PAT scoped to gmhoward9289-ops/homebrew-tap with Contents read/write and set it with: gh secret set TAP_PUSH_TOKEN --repo ${{ github.repository }}"
+            exit 1
+          fi
+
       - name: Check out this repo (for packaging/roost.rb)
         uses: actions/checkout@v7
         with:

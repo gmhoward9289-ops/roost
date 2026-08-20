@@ -37,7 +37,7 @@ class Roost < Formula
   homepage "https://github.com/gmhoward9289-ops/roost"
   version "0.10.0" # x-release-please-version
   url "https://github.com/gmhoward9289-ops/roost/releases/download/v#{version}/roost_top-#{version}.tar.gz"
-  sha256 "87f1c68bc6d1b3c383ebec53e8e4a8d9ad197fd54b1a29abe70e2942dd625dda"
+  sha256 "e1626bbddff473172385e6cd1b7d3f3137f7ed9587a45fdc6892ca04520aec31"
   license "Apache-2.0"
 
   depends_on "python@3.13"
