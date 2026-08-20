@@ -65,8 +65,12 @@ fi
 
 # No other version literal may appear anywhere in the formula -- one copy, on
 # the marked line, is the whole design.
-# (python@3.x interpreter pins are not release versions; exclude them.)
-rb_literals=$(grep -oE '\b[0-9]+\.[0-9]+(\.[0-9]+)?\b' packaging/roost.rb | grep -vE '^3\.[0-9]+$' | sort -u)
+# (python@3.x interpreter pins are not release versions; exclude them.
+#  SPDX license strings like Apache-2.0 contain "2.0" -- exclude that line.)
+rb_literals=$(grep -vE '^\s*license ' packaging/roost.rb \
+  | grep -oE '\b[0-9]+\.[0-9]+(\.[0-9]+)?\b' \
+  | grep -vE '^3\.[0-9]+$' \
+  | sort -u)
 if [ "$rb_literals" = "$VERSION" ]; then
   printf '  ok    %-22s single version literal\n' "roost.rb literals"
 else
