@@ -15,6 +15,18 @@ deliberately no `Unreleased` heading: unreleased work lives in the open release
 PR, and a hand-maintained section would sort below each new generated one and
 drift out of date.
 
+## [0.10.1](https://github.com/gmhoward9289-ops/roost/compare/v0.10.0...v0.10.1) (2026-08-21)
+
+
+### Fixed
+
+* harden channel publish jobs and add recover-channels workflow ([#86](https://github.com/gmhoward9289-ops/roost/issues/86)) ([0ed7a49](https://github.com/gmhoward9289-ops/roost/commit/0ed7a4947b625554579e8ce8e734070ba59cb82e))
+
+
+### Documentation
+
+* regenerate roost-demo.gif from vhs tape at v0.9.0 ([#85](https://github.com/gmhoward9289-ops/roost/issues/85)) ([0a3fb10](https://github.com/gmhoward9289-ops/roost/commit/0a3fb10d4f103ac98f4fb2f7b27fdbcf0e96797d))
+
 ## [0.10.0](https://github.com/gmhoward9289-ops/roost/compare/v0.9.0...v0.10.0) (2026-08-20)
 
 
