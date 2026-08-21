@@ -3349,8 +3349,7 @@ def paint(lines, vt):
     sys.stdout.flush()
 
 
-def main():
-    global LOGGING, OLLAMA_PORT, LITELLM_PORT, OPENWEBUI_PORT
+def build_parser():
     ap = argparse.ArgumentParser(description="Live Claude workers and local infra on one screen.")
     ap.add_argument("-w", "--watch", nargs="?", const=REFRESH_SECONDS, type=float,
                     metavar="SECS",
@@ -3390,6 +3389,8 @@ def main():
     ap.add_argument("--openwebui-port", type=int, metavar="PORT",
                     help="open-webui port for the INFRA panel (default %d, or %s)"
                          % (OPENWEBUI_PORT, OPENWEBUI_PORT_ENV))
+    ap.add_argument("--print-completion", choices=["bash", "zsh", "powershell"],
+                    help="print a shell completion script and exit")
     ap.epilog = (
         "keys while running:  space = refresh now   a = advice panel   "
         "s = subagents panel   m = local models panel   u = usage panel   "
@@ -3399,7 +3400,106 @@ def main():
         "interactive mode (armed with i):  j/k or arrows move a cursor   "
         "Tab = workers/subagents   Enter = row detail   "
         "x = stop the session (confirms)   y = copy its sessionId   esc = deselect")
+    return ap
+
+
+def _completion_flag_words():
+    words = []
+    for action in build_parser()._actions:
+        if action.option_strings:
+            words.extend(action.option_strings)
+    return sorted(set(words), key=lambda s: (len(s), s))
+
+
+# Flags that take a value on the command line. Kept in one place so completion
+# scripts stay aligned with argparse without pulling in argcomplete.
+def print_completion(shell):
+    flags = " ".join(_completion_flag_words())
+    if shell == "bash":
+        return """# bash completion for roost. Install to
+# /usr/share/bash-completion/completions/roost, or eval:
+#   eval "$(roost --print-completion bash)"
+_roost() {
+    local cur prev
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    local opts="%s"
+    case "$prev" in
+        -w|--watch|--ollama-port|--litellm-port|--openwebui-port)
+            return 0
+            ;;
+        --print-completion)
+            COMPREPLY=( $(compgen -W "bash zsh powershell" -- "$cur") )
+            return 0
+            ;;
+    esac
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+    fi
+}
+complete -F _roost roost
+""" % flags
+    if shell == "zsh":
+        return """#compdef roost
+# zsh completion for roost. Install to
+# /usr/share/zsh/vendor-completions/_roost, or eval:
+#   source <(roost --print-completion zsh)
+_arguments -S -C \\
+  '(-1 --once)'{-1,--once}'[print a single frame and exit]' \\
+  '--json[emit records as JSON and exit]' \\
+  '--no-color[disable colour output]' \\
+  '--advise[start with the ADVICE panel open]' \\
+  '--no-agents[start with the SUBAGENTS panel closed]' \\
+  '--models[start with the LOCAL MODELS panel open]' \\
+  '--usage[start with the USAGE panel open]' \\
+  '--gateway[start with the GATEWAY panel open]' \\
+  '--remote[start with the REMOTE panel open]' \\
+  '--interactive[start with interactive mode armed]' \\
+  '--no-log[do not record stopped sessions]' \\
+  '--version[print the version and exit]' \\
+  '(-w --watch)'{-w,--watch}'[refresh interval in seconds]:seconds:' \\
+  '--ollama-port[ollama port for the INFRA panel]:port:' \\
+  '--litellm-port[litellm port for the INFRA/GATEWAY panels]:port:' \\
+  '--openwebui-port[open-webui port for the INFRA panel]:port:' \\
+  '--print-completion[print a shell completion script]:shell:(bash zsh powershell)'
+"""
+    if shell == "powershell":
+        ps_flags = ", ".join("'%s'" % f for f in _completion_flag_words())
+        return """# PowerShell completion for roost. Add to your profile:
+#   . (roost --print-completion powershell | Out-String | Invoke-Expression)
+Register-ArgumentCompleter -Native -CommandName roost -ScriptBlock {
+    param($wordToComplete, $commandAst, $cursorPosition)
+    $flags = @(%s)
+    $valueFlags = @('-w', '--watch', '--ollama-port', '--litellm-port',
+                    '--openwebui-port', '--print-completion')
+    $prev = $commandAst.CommandElements[
+        [Math]::Max(0, $commandAst.CommandElements.Count - 2)].ToString()
+    if ($valueFlags -contains $prev) {
+        if ($prev -eq '--print-completion') {
+            'bash', 'zsh', 'powershell' | Where-Object {
+                $_ -like "$wordToComplete*"
+            } | ForEach-Object {
+                [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
+            }
+        }
+        return
+    }
+    $flags | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
+        [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterName', $_)
+    }
+}
+""" % ps_flags
+    raise ValueError("unknown shell %r" % shell)
+
+
+def main():
+    global LOGGING, OLLAMA_PORT, LITELLM_PORT, OPENWEBUI_PORT
+    ap = build_parser()
     args = ap.parse_args()
+
+    if args.print_completion:
+        sys.stdout.write(print_completion(args.print_completion))
+        return
 
     LOGGING = not args.no_log
     if args.ollama_port is not None:

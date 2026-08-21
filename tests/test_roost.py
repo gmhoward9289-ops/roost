@@ -2456,5 +2456,34 @@ class TestInteractiveTables(unittest.TestCase):
                 setattr(roost, n, fn)
 
 
+class TestShellCompletion(unittest.TestCase):
+    def test_print_completion_covers_every_flag(self):
+        expected = set()
+        for action in roost.build_parser()._actions:
+            if action.option_strings:
+                expected.update(
+                    s for s in action.option_strings if s not in ("-h", "--help"))
+        for shell in ("bash", "zsh", "powershell"):
+            script = roost.print_completion(shell)
+            for flag in expected:
+                self.assertIn(flag, script, msg="%s missing from %s completion" % (flag, shell))
+
+    def test_print_completion_rejects_unknown_shell(self):
+        with self.assertRaises(ValueError):
+            roost.print_completion("fish")
+
+    def test_print_completion_flag_exits_before_live_mode(self):
+        argv, stdout = sys.argv[:], sys.stdout
+        try:
+            sys.argv = ["roost", "--print-completion", "bash"]
+            sys.stdout = io.StringIO()
+            roost.main()
+            out = sys.stdout.getvalue()
+        finally:
+            sys.argv, sys.stdout = argv, stdout
+        self.assertIn("complete -F _roost roost", out)
+        self.assertIn("--gateway", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
