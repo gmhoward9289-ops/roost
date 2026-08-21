@@ -12,7 +12,12 @@
       "extra-files": [
         "roost.py",
         "roost.1",
-        "packaging/roost.rb"
+        "packaging/roost.rb",
+        {
+          "type": "json",
+          "path": "packaging/swamplink-roost.json",
+          "jsonpath": "$.version"
+        }
       ]
     }
   },

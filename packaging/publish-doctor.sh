@@ -98,6 +98,22 @@ else
   pend winget "$WINGET_ID is not in winget-pkgs -- a brand-new identifier needs a hand-written PR merged by Microsoft's moderators before winget-releaser can update it"
 fi
 
+# --- swamplink tools catalog -------------------------------------------------
+# Live file is out of repo (swamplink-root). This check is how drift like
+# issue #93 (catalog frozen at 0.10.1 while GitHub/PyPI served 0.11.0) shows
+# up as PENDING instead of a stale landing page nobody diffs.
+swamplink_json=$(curl -sf --max-time 20 "https://swamplink.com/tools/versions.json" 2>/dev/null || true)
+if [ -n "$swamplink_json" ]; then
+  swamplink_ver=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["roost"]["version"])' <<<"$swamplink_json" 2>/dev/null || true)
+  if [ "${swamplink_ver:-}" = "$VERSION" ]; then
+    say PASS swamplink "https://swamplink.com/tools/versions.json roost $swamplink_ver"
+  else
+    pend swamplink "catalog has ${swamplink_ver:-unparseable}, want $VERSION -- bump tools/versions.json in swamplink-root (see docs/swamplink.md), or set SWAMPLINK_* secrets and rerun the release's swamplink-tools job"
+  fi
+else
+  say SKIP swamplink "https://swamplink.com/tools/versions.json unreachable from here"
+fi
+
 # --- repo secrets the automation depends on ----------------------------------
 # Listing secrets needs admin, and GITHUB_TOKEN does not have it -- in CI this
 # can only ever report a false PENDING, which is how leghorn's first scheduled
