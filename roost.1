@@ -112,6 +112,18 @@ number from Claude Code's /usage once. The tally is an estimate read from
 transcripts, not the real Anthropic meter; models without a claude\- name
 are flagged (local) and excluded from the budget math.
 .TP
+.B \-\-gateway
+Start with the GATEWAY panel open. Toggle it live with
+.BR g .
+Shows litellm routes and recent request activity.
+.TP
+.B \-\-remote
+Start with the REMOTE panel open. Toggle it live with
+.BR r .
+Hosts come from
+.BR ROOST_REMOTES
+(comma\-separated ssh aliases).
+.TP
 .B \-\-interactive
 Start with interactive mode armed \(em the cursor,
 .BR x / y ,
@@ -144,6 +156,17 @@ Open-webui port for the INFRA panel. Default 8080, or
 .TP
 .B \-\-version
 Print the version and exit.
+.TP
+.BI \-\-print\-completion " SHELL"
+Print a tab\-completion script for
+.IR SHELL
+(one of
+.BR bash ", "
+.BR zsh ", or "
+.BR powershell )
+and exit. The
+.BR .deb
+and Homebrew installs register bash and zsh completion automatically.
 .SH INTERACTIVE KEYS
 .TP
 .B space

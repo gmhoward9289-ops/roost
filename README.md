@@ -151,6 +151,41 @@ roost -1           one frame, then exit
 roost --json       joined records, for piping
 ```
 
+| flag | does |
+| --- | --- |
+| `-w`, `--watch [SECS]` | refresh interval in seconds (default 1; live is the default) |
+| `-1`, `--once` | print one frame and exit |
+| `--json` | emit workers, subagents, and infra as JSON, then exit — for piping |
+| `--no-color` | disable colour (also off when `NO_COLOR` is set or stdout is not a tty) |
+| `--advise` | start with the ADVICE panel open (toggle live with `a`) |
+| `--no-agents` | start with the SUBAGENTS panel closed (toggle live with `s`) |
+| `--models` | start with the LOCAL MODELS panel open (toggle live with `m`) |
+| `--usage` | start with the USAGE panel open (toggle live with `u`); set `ROOST_WEEKLY_BUDGET` (e.g. `60M`) to show weekly burn against a budget |
+| `--gateway` | start with the GATEWAY panel open (toggle live with `g`) — litellm routes and recent requests |
+| `--remote` | start with the REMOTE panel open (toggle live with `r`); hosts from `ROOST_REMOTES` (comma-separated ssh aliases) |
+| `--interactive` | start with interactive mode armed — cursor, `x`/`y`, and the EXPERIMENTAL tag (toggle live with `i`) |
+| `--no-log` | do not record stopped sessions to `~/.claude/logs/roost.jsonl` |
+| `--ollama-port PORT` | ollama port for the INFRA panel (default 11434, or `ROOST_OLLAMA_PORT`) |
+| `--litellm-port PORT` | litellm port for INFRA and GATEWAY (default 4000, or `ROOST_LITELLM_PORT`) |
+| `--openwebui-port PORT` | open-webui port for INFRA (default 8080, or `ROOST_OPENWEBUI_PORT`) |
+| `--print-completion SHELL` | print a tab-completion script for `bash`, `zsh`, or `powershell` |
+| `--version` | print the version and exit |
+
+Several flags above (`--usage`, `--gateway`, `--remote`, `--models`, `--advise`) are useful for scripting: combine with `-1` to dump a single panel without entering the live TUI.
+
+### Tab completion
+
+The `.deb` and Homebrew installs register bash and zsh completion automatically. On pip/pipx installs, or to load PowerShell completion:
+
+```bash
+eval "$(roost --print-completion bash)"    # bash
+source <(roost --print-completion zsh)   # zsh
+```
+
+```powershell
+. (roost --print-completion powershell | Out-String | Invoke-Expression)
+```
+
 While running: `space` refresh now · `a` advice panel · `s` subagents panel · `m` local models panel · `u` usage panel · `g` gateway panel · `r` remote panel · `h` or `?` what am I looking at · `i` arm interactive (Tab switches tables, Enter opens a row) · `q` quit
 
 The `FLOW` column is a sparkline of each session's recent token throughput —

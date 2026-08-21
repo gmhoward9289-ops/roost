@@ -49,6 +49,9 @@ class Roost < Formula
     # user activated for something else. Pin it to the formula's interpreter.
     rewrite_shebang detected_python_shebang(use_python_from_path: false), bin/"roost"
     man1.install "roost.1"
+    (bash_completion/"roost").write shell_output("#{bin}/roost --print-completion bash")
+    zsh_completion.install shell_output("#{bin}/roost --print-completion zsh")
+    (pkgshare/"roost-completions.ps1").write shell_output("#{bin}/roost --print-completion powershell")
   end
 
   test do

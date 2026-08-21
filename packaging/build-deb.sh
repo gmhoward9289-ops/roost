@@ -19,11 +19,16 @@ trap 'rm -rf "$BUILD"' EXIT
 PKG="$BUILD/roost_${VERSION}_all"
 
 mkdir -p "$PKG/DEBIAN" "$PKG/usr/bin" "$PKG/usr/share/man/man1" \
-         "$PKG/usr/share/doc/roost"
+         "$PKG/usr/share/doc/roost" \
+         "$PKG/usr/share/bash-completion/completions" \
+         "$PKG/usr/share/zsh/vendor-completions"
 
 # Installed as `roost`, not `roost.py`: the shebang and the executable bit are
 # what make it a command, and the .py suffix only matters on Windows.
 install -m 0755 "$ROOT/roost.py" "$PKG/usr/bin/roost"
+python3 "$ROOT/roost.py" --print-completion bash > "$PKG/usr/share/bash-completion/completions/roost"
+python3 "$ROOT/roost.py" --print-completion zsh > "$PKG/usr/share/zsh/vendor-completions/_roost"
+python3 "$ROOT/roost.py" --print-completion powershell > "$PKG/usr/share/doc/roost/roost-completions.ps1"
 gzip -9nc "$ROOT/roost.1" > "$PKG/usr/share/man/man1/roost.1.gz"
 chmod 0644 "$PKG/usr/share/man/man1/roost.1.gz"
 install -m 0644 "$ROOT/LICENSE" "$PKG/usr/share/doc/roost/copyright"
@@ -35,6 +40,7 @@ Section: utils
 Priority: optional
 Architecture: all
 Depends: python3 (>= 3.9)
+Recommends: bash-completion, zsh
 Maintainer: George M. Howard <dev@swamplink.com>
 Homepage: https://github.com/gmhoward9289-ops/roost
 Description: top for Claude Code
