@@ -314,6 +314,18 @@ _SEEN_AGENTS = set()
 # a transcript that has not been written to cannot have a new model or usage.
 _SCAN_CACHE = {}
 
+# composer_id -> (transcript_path, project_slug). Rebuilt each frame; cleared in
+# prune_caches so a vanished composer does not keep a stale path forever.
+_CURSOR_TX_INDEX = None
+
+# True after read_cursor_composer_headers successfully opened state.vscdb.
+# Distinguishes "DB present, zero rows" from "DB missing / unreadable", which
+# is when the agent-transcripts glob fallback still has to run.
+_CURSOR_HEADERS_OK = False
+
+# Live mode may paint the first frame before localhost INFRA probes finish.
+_INFRA_ALLOW_DEFER = False
+
 # sessionId -> {"prev": last ctx_tokens, "t": last sample time, "hist": deque}.
 # In-memory only: the sparkline shows flow since roost started, nothing older.
 _SPARK = {}
@@ -978,14 +990,22 @@ def collect_claude_subagents(live_sids):
     for path in glob.glob(pattern):
         p = Path(path)
         parent_sid = p.parent.parent.name
+        parent_live = parent_sid in live_sids
+        # mtime before scan_transcript: a cold board can have hundreds of
+        # finished sidechains, and reading every tail is what made the first
+        # frame stall for seconds with a blank terminal.
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        age = now - mtime
+        if not parent_live and age > AGENT_RECENT_SECS:
+            continue  # finished long ago -- history, not a live worker
         agent_id = p.stem[len("agent-"):] if p.stem.startswith("agent-") else p.stem
 
         info = scan_transcript(path)
-        last = info["last_write"]
-        parent_live = parent_sid in live_sids
+        last = info["last_write"] if info["last_write"] is not None else mtime
         age = (now - last) if last else None
-        if not parent_live and (age is None or age > AGENT_RECENT_SECS):
-            continue  # finished long ago -- history, not a live worker
 
         _SEEN_AGENTS.add(agent_id)
         # Re-harvest while the type is still missing: a running agent's early
@@ -1086,21 +1106,17 @@ def collect_cursor_subagents(live_sids, db_path=None):
                     info.get("subagentTypeName") or info.get("subagentType") or "")
                 task = ascii_safe(
                     (h.get("name") or h.get("subtitle") or "").strip() or "-")
-                tpath, _slug = _cursor_transcript_for(cid)
-                tinfo = scan_cursor_transcript(tpath) if tpath else {}
-                model = tinfo.get("model") or "-"
-                tok = tinfo.get("ctx_tokens")
+                # Headers already carry name + contextUsagePercent. Live Cursor
+                # transcripts rarely have usage or message.model (those live in
+                # state.vscdb), so scanning every Task composer on first paint
+                # was pure stall for no MODEL/TOKENS gain.
+                model = "-"
+                tok = None
                 win_label = "-"
-                if pct is not None and tok is None:
-                    window, win_label = window_for(
-                        1, model if model != "-" else "composer-2.5")
+                if pct is not None:
+                    window, win_label = window_for(1, "composer-2.5")
                     tok = int(round(pct / 100.0 * window))
                     win_label = _window_label(window)
-                elif tok is not None:
-                    window, win_label = window_for(
-                        tok, model if model != "-" else None)
-                    if pct is None:
-                        pct = 100.0 * tok / float(window)
                 if not parent_live:
                     state = "orphan"
                 elif age is not None and age <= AGENT_ACTIVE_SECS:
@@ -1266,6 +1282,8 @@ def read_cursor_composer_headers(db_path=None):
     last_write, workspace_id. Empty on any error -- missing DB is normal on a
     machine that has never run Cursor.
     """
+    global _CURSOR_HEADERS_OK
+    _CURSOR_HEADERS_OK = False
     path = Path(db_path) if db_path else cursor_state_db()
     if path is None or not path.is_file():
         return []
@@ -1314,23 +1332,50 @@ def read_cursor_composer_headers(db_path=None):
                 })
         finally:
             con.close()
+        # Query succeeded even if every row was filtered out -- the SQLite
+        # index is authoritative, so collect_cursor_workers must not fall
+        # through to a full agent-transcripts scan.
+        _CURSOR_HEADERS_OK = True
     except (sqlite3.Error, OSError, ValueError):
         return []
     return rows
 
 
-def _cursor_transcript_for(composer_id):
-    if not composer_id or not CURSOR_PROJECTS_DIR.is_dir():
-        return None, ""
-    pattern = str(CURSOR_PROJECTS_DIR / "*" / "agent-transcripts"
-                  / composer_id / "*")
-    hits = sorted(glob.glob(pattern))
-    for path_str in hits:
+def _cursor_transcript_index():
+    """One directory walk → composer_id → (path, slug).
+
+    collect_cursor_workers used to glob once per idle composer; with dozens of
+    live Task composers that is hundreds of identical tree walks per frame.
+    """
+    global _CURSOR_TX_INDEX
+    if _CURSOR_TX_INDEX is not None:
+        return _CURSOR_TX_INDEX
+    index = {}
+    if not CURSOR_PROJECTS_DIR.is_dir():
+        _CURSOR_TX_INDEX = index
+        return index
+    pattern = str(CURSOR_PROJECTS_DIR / "*" / "agent-transcripts" / "*" / "*")
+    by_cid = {}
+    for path_str in glob.glob(pattern):
         path = Path(path_str)
-        if path.suffix in (".jsonl", ".txt"):
-            slug = path.parent.parent.parent.name
-            return str(path), slug
-    return None, ""
+        if path.suffix not in (".jsonl", ".txt"):
+            continue
+        by_cid.setdefault(path.parent.name, []).append(path_str)
+    for cid, paths in by_cid.items():
+        # Match _cursor_transcript_for's old sorted(glob) first-hit rule.
+        path = Path(sorted(paths)[0])
+        index[cid] = (str(path), path.parent.parent.parent.name)
+    _CURSOR_TX_INDEX = index
+    return index
+
+
+def _cursor_transcript_for(composer_id):
+    if not composer_id:
+        return None, ""
+    hit = _cursor_transcript_index().get(composer_id)
+    if hit is None:
+        return None, ""
+    return hit
 
 
 def _cursor_worker_row(composer_id, name=None, task=None, task_src="-",
@@ -1433,8 +1478,10 @@ def collect_cursor_workers():
             slug=slug, flow=flow, cwd=cwd))
 
     # Transcript-only fallback: composers with JSONL but no header row (older
-    # Cursor builds, or state.vscdb unavailable).
-    if not CURSOR_PROJECTS_DIR.is_dir():
+    # Cursor builds, or state.vscdb unavailable). When the SQLite index opened
+    # cleanly it is authoritative -- rescanning every agent-transcripts file
+    # for composers the idle window already dropped was the multi-second stall.
+    if _CURSOR_HEADERS_OK or not CURSOR_PROJECTS_DIR.is_dir():
         return rows
     pattern = str(CURSOR_PROJECTS_DIR / "*" / "agent-transcripts" / "*" / "*")
     for path_str in glob.glob(pattern):
@@ -1624,14 +1671,24 @@ def infra_cached():
 
     The first call probes synchronously so a one-shot frame is never missing
     the INFRA line, then hands refreshing to a daemon thread. Staleness is
-    bounded by INFRA_REFRESH_SECONDS plus one probe."""
+    bounded by INFRA_REFRESH_SECONDS plus one probe.
+
+    Live mode sets _INFRA_ALLOW_DEFER so the first paint can show "…" instead
+    of waiting on three localhost connects (filtered ports time out on Windows).
+    """
     global _INFRA_SNAPSHOT, _INFRA_THREAD
     with _INFRA_LOCK:
         snap = _INFRA_SNAPSHOT
     if snap is None:
-        snap = collect_infra()
-        with _INFRA_LOCK:
-            _INFRA_SNAPSHOT = snap
+        if _INFRA_ALLOW_DEFER:
+            snap = [
+                {"name": name, "port": port, "up": None, "detail": ""}
+                for name, port, _path in _services()
+            ]
+        else:
+            snap = collect_infra()
+            with _INFRA_LOCK:
+                _INFRA_SNAPSHOT = snap
     if _INFRA_THREAD is None:
         _INFRA_THREAD = threading.Thread(
             target=_infra_worker, name="infra-probe", daemon=True)
@@ -2720,7 +2777,12 @@ def render_infra(infra):
     """One horizontal line: it is always present and rarely the thing you need."""
     parts = []
     for s in infra:
-        mark = c("up", GREEN) if s["up"] else c("DOWN", BOLD, RED)
+        if s["up"] is None:
+            mark = c("…", DIM)
+        elif s["up"]:
+            mark = c("up", GREEN)
+        else:
+            mark = c("DOWN", BOLD, RED)
         extra = ""
         if s["up"] and s["detail"]:
             extra = " " + c(s["detail"], CYAN)
@@ -3147,6 +3209,7 @@ def prune_caches():
     over is history -- without this the caches grow for as long as the dashboard
     stays open, which is days.
     """
+    global _CURSOR_TX_INDEX
     for cache in (_SCAN_CACHE, _HARVEST_POS):
         for k in [k for k in cache if k not in _SEEN_PATHS]:
             del cache[k]
@@ -3155,6 +3218,7 @@ def prune_caches():
             del cache[k]
     _SEEN_PATHS.clear()
     _SEEN_AGENTS.clear()
+    _CURSOR_TX_INDEX = None
 
 
 # (handle, original mode) when enable_vt() changed the console, else None.
@@ -3571,8 +3635,21 @@ def main():
         return
     interval = args.watch if args.watch else REFRESH_SECONDS
 
+    global _INFRA_ALLOW_DEFER
+    _INFRA_ALLOW_DEFER = True
+    # Kick the INFRA probe thread before the first collect so localhost
+    # timeouts overlap with transcript work instead of serialising after it.
+    infra_cached()
+
     if vt:
         sys.stdout.write("\033[2J\033[?25l")  # one clear up front, then hide the cursor
+        # Immediate feedback: a cold first frame used to sit on a blank screen
+        # for many seconds while hundreds of finished transcripts were scanned.
+        host = socket.gethostname()
+        msg = (c("roost", BOLD) + "  " + c(host, CYAN)
+               + "  " + c("loading…", DIM) + "\n")
+        sys.stdout.write("\033[H" + msg)
+        sys.stdout.flush()
 
     # Off by default: this is the gate on the half that can end a process, and
     # arming it is one deliberate keypress rather than "having a terminal."
