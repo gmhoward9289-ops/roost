@@ -1,0 +1,138 @@
+name: recover-channels
+
+# Catch up distribution channels after a release job failed without rebuilding
+# PyPI/npm/apt artifacts. Typical use: homebrew-tap or winget failed because
+# TAP_PUSH_TOKEN or WINGET_PAT was missing/expired; refresh the secret, then
+# run this against the tag that already shipped.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish channels for (e.g. v0.10.0)
+        required: true
+        type: string
+      homebrew:
+        description: Push the Homebrew formula to gmhoward9289-ops/homebrew-tap
+        type: boolean
+        default: true
+      winget:
+        description: Open/update the winget-pkgs PR for this release
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  homebrew-tap:
+    if: inputs.homebrew
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require TAP_PUSH_TOKEN
+        env:
+          TAP_PUSH_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+        run: |
+          if [ -z "$TAP_PUSH_TOKEN" ]; then
+            echo "::error::TAP_PUSH_TOKEN secret is missing. Create a fine-grained PAT scoped to gmhoward9289-ops/homebrew-tap with Contents read/write."
+            exit 1
+          fi
+
+      - name: Check out the release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+          path: src
+
+      - name: Check out the tap
+        uses: actions/checkout@v7
+        with:
+          repository: gmhoward9289-ops/homebrew-tap
+          ref: master
+          path: tap
+          token: ${{ secrets.TAP_PUSH_TOKEN }}
+
+      - name: Download the release sdist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          gh release download "${{ inputs.tag }}" --repo "${{ github.repository }}" \
+            --pattern '*.tar.gz' --dir dist
+
+      - name: Compute the release asset checksum
+        run: |
+          sdist=$(ls dist/*.tar.gz)
+          version="${{ inputs.tag }}"
+          version="${version#v}"
+          url="https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}/$(basename "$sdist")"
+          sha256=$(sha256sum "$sdist" | cut -d' ' -f1)
+          echo "URL=$url" >> "$GITHUB_ENV"
+          echo "SHA256=$sha256" >> "$GITHUB_ENV"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Write the formula with this release's url, checksum, and version
+        run: |
+          sed -e "s#^  url \".*\"#  url \"$URL\"#" \
+              -e "s#^  sha256 \".*\"#  sha256 \"$SHA256\"#" \
+              -e "s#^  version \".*\"#  version \"$VERSION\"#" \
+              src/packaging/roost.rb > tap/Formula/roost.rb
+
+      - name: Commit and push
+        working-directory: tap
+        run: |
+          git config user.name "roost-release-bot"
+          git config user.email "dev@swamplink.com"
+          git add Formula/roost.rb
+          git diff --cached --quiet && echo "nothing changed" || git commit -m "roost ${{ inputs.tag }}"
+          git push origin master
+
+  winget:
+    if: inputs.winget
+    runs-on: windows-latest
+    steps:
+      - name: Is the package bootstrapped in winget-pkgs yet?
+        id: bootstrapped
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PKG_ID: gmhoward9289-ops.roost
+        run: |
+          letter=$(echo "${PKG_ID:0:1}" | tr 'A-Z' 'a-z')
+          path="manifests/$letter/${PKG_ID//./\/}"
+          if gh api "repos/microsoft/winget-pkgs/contents/$path" --silent 2>/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$PKG_ID is not in winget-pkgs yet -- skipping"
+          fi
+
+      - name: Require WINGET_PAT
+        if: steps.bootstrapped.outputs.exists == 'true'
+        shell: bash
+        env:
+          WINGET_PAT: ${{ secrets.WINGET_PAT }}
+        run: |
+          if [ -z "$WINGET_PAT" ]; then
+            echo "::error::WINGET_PAT secret is missing. Create a classic PAT with the public_repo scope."
+            exit 1
+          fi
+
+      - name: Sync the winget-pkgs fork with upstream
+        if: steps.bootstrapped.outputs.exists == 'true'
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_PAT }}
+        run: |
+          gh repo sync gmhoward9289-ops/winget-pkgs --source microsoft/winget-pkgs \
+            || echo "::warning::fork sync failed; continuing with winget-releaser against the fork as-is"
+
+      - uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
+        if: steps.bootstrapped.outputs.exists == 'true'
+        with:
+          identifier: gmhoward9289-ops.roost
+          installers-regex: '\.zip$'
+          token: ${{ secrets.WINGET_PAT }}
+          release-repository: roost
+          release-tag: ${{ inputs.tag }}
