@@ -15,6 +15,13 @@ deliberately no `Unreleased` heading: unreleased work lives in the open release
 PR, and a hand-maintained section would sort below each new generated one and
 drift out of date.
 
+## [0.11.0](https://github.com/gmhoward9289-ops/roost/compare/v0.10.1...v0.11.0) (2026-08-21)
+
+
+### Added
+
+* shell tab completion and full CLI flag docs ([#76](https://github.com/gmhoward9289-ops/roost/issues/76), [#78](https://github.com/gmhoward9289-ops/roost/issues/78)) ([2d410e6](https://github.com/gmhoward9289-ops/roost/commit/2d410e651951277efd0235b8c0235f71d165c99b))
+
 ## [0.10.1](https://github.com/gmhoward9289-ops/roost/compare/v0.10.0...v0.10.1) (2026-08-21)
 
 
