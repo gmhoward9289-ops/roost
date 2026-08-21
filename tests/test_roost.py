@@ -2097,6 +2097,51 @@ class TestCursorAdapter(unittest.TestCase):
                 os.environ[roost.CURSOR_STATE_DB_ENV] = old_db
             td.cleanup()
 
+    def test_headers_index_skips_transcript_fallback(self):
+        """A readable state.vscdb is authoritative -- do not rescan every
+        agent-transcripts file for composers the idle window already dropped.
+        That fallback was the multi-second blank-screen stall on COOPER."""
+        td = tempfile.TemporaryDirectory()
+        db = Path(td.name) / "state.vscdb"
+        con = sqlite3.connect(str(db))
+        con.execute(
+            "CREATE TABLE composerHeaders ("
+            "composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER, "
+            "lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER, "
+            "recency INTEGER, checkpointAt INTEGER, value TEXT)")
+        # Empty table is still a successful open (_CURSOR_HEADERS_OK).
+        con.commit()
+        con.close()
+        root = Path(td.name) / "projects" / "c-demo" / "agent-transcripts"
+        cid = "only-in-transcripts-aaaa-bbbb-cccc-dddd"
+        comp = root / cid
+        comp.mkdir(parents=True)
+        shutil.copy(self.FIXTURE, comp / (cid + ".jsonl"))
+        old_home = roost.CURSOR_HOME
+        old_projects = roost.CURSOR_PROJECTS_DIR
+        old_backends = os.environ.get(roost.BACKENDS_ENV)
+        old_db = os.environ.get(roost.CURSOR_STATE_DB_ENV)
+        try:
+            roost.CURSOR_HOME = Path(td.name)
+            roost.CURSOR_PROJECTS_DIR = roost.CURSOR_HOME / "projects"
+            os.environ[roost.BACKENDS_ENV] = "cursor"
+            os.environ[roost.CURSOR_STATE_DB_ENV] = str(db)
+            rows = roost.collect_cursor_workers()
+            self.assertEqual(rows, [])
+            self.assertTrue(roost._CURSOR_HEADERS_OK)
+        finally:
+            roost.CURSOR_HOME = old_home
+            roost.CURSOR_PROJECTS_DIR = old_projects
+            if old_backends is None:
+                os.environ.pop(roost.BACKENDS_ENV, None)
+            else:
+                os.environ[roost.BACKENDS_ENV] = old_backends
+            if old_db is None:
+                os.environ.pop(roost.CURSOR_STATE_DB_ENV, None)
+            else:
+                os.environ[roost.CURSOR_STATE_DB_ENV] = old_db
+            td.cleanup()
+
     def test_composer_window_known_for_cursor_models(self):
         self.assertEqual(roost.window_for(1000, "composer-2.5-fast"),
                          (256000, "256k"))
