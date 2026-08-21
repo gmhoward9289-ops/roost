@@ -20,13 +20,42 @@ on:
         description: Open/update the winget-pkgs PR for this release
         type: boolean
         default: true
+  push:
+    branches: [main]
+    paths:
+      - .github/trigger-recover-channels
 
 permissions:
   contents: read
 
 jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      homebrew: ${{ steps.resolve.outputs.homebrew }}
+      winget: ${{ steps.resolve.outputs.winget }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve recovery inputs
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "homebrew=${{ inputs.homebrew }}" >> "$GITHUB_OUTPUT"
+            echo "winget=${{ inputs.winget }}" >> "$GITHUB_OUTPUT"
+          else
+            tag=$(grep '^tag=' .github/trigger-recover-channels | cut -d= -f2-)
+            homebrew=$(grep '^homebrew=' .github/trigger-recover-channels | cut -d= -f2-)
+            winget=$(grep '^winget=' .github/trigger-recover-channels | cut -d= -f2-)
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+            echo "homebrew=${homebrew:-true}" >> "$GITHUB_OUTPUT"
+            echo "winget=${winget:-true}" >> "$GITHUB_OUTPUT"
+          fi
+
   homebrew-tap:
-    if: inputs.homebrew
+    needs: resolve
+    if: needs.resolve.outputs.homebrew == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Require TAP_PUSH_TOKEN
@@ -41,7 +70,7 @@ jobs:
       - name: Check out the release tag
         uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.resolve.outputs.tag }}
           path: src
 
       - name: Check out the tap
@@ -57,15 +86,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p dist
-          gh release download "${{ inputs.tag }}" --repo "${{ github.repository }}" \
+          gh release download "${{ needs.resolve.outputs.tag }}" --repo "${{ github.repository }}" \
             --pattern '*.tar.gz' --dir dist
 
       - name: Compute the release asset checksum
         run: |
           sdist=$(ls dist/*.tar.gz)
-          version="${{ inputs.tag }}"
+          version="${{ needs.resolve.outputs.tag }}"
           version="${version#v}"
-          url="https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}/$(basename "$sdist")"
+          url="https://github.com/${{ github.repository }}/releases/download/${{ needs.resolve.outputs.tag }}/$(basename "$sdist")"
           sha256=$(sha256sum "$sdist" | cut -d' ' -f1)
           echo "URL=$url" >> "$GITHUB_ENV"
           echo "SHA256=$sha256" >> "$GITHUB_ENV"
@@ -84,11 +113,12 @@ jobs:
           git config user.name "roost-release-bot"
           git config user.email "dev@swamplink.com"
           git add Formula/roost.rb
-          git diff --cached --quiet && echo "nothing changed" || git commit -m "roost ${{ inputs.tag }}"
+          git diff --cached --quiet && echo "nothing changed" || git commit -m "roost ${{ needs.resolve.outputs.tag }}"
           git push origin master
 
   winget:
-    if: inputs.winget
+    needs: resolve
+    if: needs.resolve.outputs.winget == 'true'
     runs-on: windows-latest
     steps:
       - name: Is the package bootstrapped in winget-pkgs yet?
@@ -135,4 +165,4 @@ jobs:
           installers-regex: '\.zip$'
           token: ${{ secrets.WINGET_PAT }}
           release-repository: roost
-          release-tag: ${{ inputs.tag }}
+          release-tag: ${{ needs.resolve.outputs.tag }}
