@@ -1951,6 +1951,7 @@ class TestJsonContract(unittest.TestCase):
         self.assertEqual(set(self.emit()),
                          {"schema", "version", "workers", "subagents", "infra",
                           "usage_caps", "local_models", "gateway"})
+        self.assertEqual(self.emit()["schema"], roost.SCHEMA_SNAPSHOT)
 
     def test_the_payload_carries_the_version(self):
         # Programmatic consumers should not have to shell out to --version
