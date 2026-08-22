@@ -15,6 +15,13 @@ deliberately no `Unreleased` heading: unreleased work lives in the open release
 PR, and a hand-maintained section would sort below each new generated one and
 drift out of date.
 
+## [0.12.0](https://github.com/gmhoward9289-ops/roost/compare/v0.11.1...v0.12.0) (2026-08-22)
+
+
+### Added
+
+* show cursor worker branch name instead of composer hash ([#95](https://github.com/gmhoward9289-ops/roost/issues/95)) ([1756ce2](https://github.com/gmhoward9289-ops/roost/commit/1756ce25d97dfdd1c37afdf3b22d9c8c53405d4b))
+
 ## [0.11.1](https://github.com/gmhoward9289-ops/roost/compare/v0.11.0...v0.11.1) (2026-08-22)
 
 
