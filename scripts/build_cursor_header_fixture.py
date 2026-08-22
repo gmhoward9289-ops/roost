@@ -26,6 +26,19 @@ value = {
     "isDraft": False,
     "isArchived": False,
     "workspaceIdentifier": {"id": "test-ws"},
+    # Shape measured on COOPER (Cursor 2026-08): per-repo branch list with
+    # lastInteractionAt -- the newest branch is the WORKER display name.
+    "trackedGitRepos": [
+        {
+            "repoPath": "c:\\Users\\gmhow\\dev\\roost",
+            "branches": [
+                {"branchName": "cursor/abc12345",
+                 "lastInteractionAt": now_ms - 7200_000},
+                {"branchName": "feat/cursor-bname",
+                 "lastInteractionAt": now_ms - 60_000},
+            ],
+        },
+    ],
 }
 
 con = sqlite3.connect(str(OUT))

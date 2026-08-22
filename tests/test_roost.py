@@ -2015,6 +2015,65 @@ class TestCursorAdapter(unittest.TestCase):
                          "abc12345-aaaa-bbbb-cccc-ddddeeeeffff")
         self.assertEqual(rows[0]["name"], "Add cursor support to roost")
         self.assertAlmostEqual(rows[0]["ctx_pct"], 42.5)
+        # Newest lastInteractionAt across trackedGitRepos wins.
+        self.assertEqual(rows[0]["branch"], "feat/cursor-bname")
+
+    def test_cursor_branch_name_collisions_get_short_id_suffix(self):
+        """Two composers that last touched the same branch must not render
+        identical WORKER names; unique branches stay clean (no suffix)."""
+        td = tempfile.TemporaryDirectory()
+        db = Path(td.name) / "state.vscdb"
+        con = sqlite3.connect(str(db))
+        con.execute(
+            "CREATE TABLE composerHeaders ("
+            "composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER, "
+            "lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER, "
+            "recency INTEGER, checkpointAt INTEGER, value TEXT)")
+        now_ms = int(time.time() * 1000)
+        branch = {"trackedGitRepos": [{"branches": [
+            {"branchName": "land/shared", "lastInteractionAt": now_ms}]}]}
+        for cid in ("aaaa1111-0000-0000-0000-000000000000",
+                    "bbbb2222-0000-0000-0000-000000000000"):
+            val = dict(branch, composerId=cid, name="t", unifiedMode="agent",
+                       lastUpdatedAt=now_ms)
+            con.execute(
+                "INSERT INTO composerHeaders VALUES (?,?,?,?,?,?,?,?,?)",
+                (cid, "ws", now_ms, now_ms, 0, 0, now_ms, None,
+                 json.dumps(val)))
+        con.commit()
+        con.close()
+        old_backends = os.environ.get(roost.BACKENDS_ENV)
+        old_db = os.environ.get(roost.CURSOR_STATE_DB_ENV)
+        try:
+            os.environ[roost.BACKENDS_ENV] = "cursor"
+            os.environ[roost.CURSOR_STATE_DB_ENV] = str(db)
+            rows = roost.collect_cursor_workers()
+            self.assertEqual(
+                sorted(r["name"] for r in rows),
+                ["land/shared-aaaa", "land/shared-bbbb"])
+        finally:
+            if old_backends is None:
+                os.environ.pop(roost.BACKENDS_ENV, None)
+            else:
+                os.environ[roost.BACKENDS_ENV] = old_backends
+            if old_db is None:
+                os.environ.pop(roost.CURSOR_STATE_DB_ENV, None)
+            else:
+                os.environ[roost.CURSOR_STATE_DB_ENV] = old_db
+            td.cleanup()
+
+    def test_cursor_recent_branch_tolerates_malformed_shapes(self):
+        self.assertIsNone(roost._cursor_recent_branch({}))
+        self.assertIsNone(roost._cursor_recent_branch({"trackedGitRepos": "x"}))
+        self.assertIsNone(roost._cursor_recent_branch(
+            {"trackedGitRepos": [{"branches": [{"branchName": "  "}]}]}))
+        self.assertEqual(
+            roost._cursor_recent_branch({"trackedGitRepos": [
+                {"branches": [{"branchName": "a", "lastInteractionAt": 1}]},
+                {"repoPath": "r", "branches": [
+                    {"branchName": "b", "lastInteractionAt": 2}]},
+            ]}),
+            "b")
 
     def test_collect_cursor_workers_prefer_headers_for_ctx_pct(self):
         td = tempfile.TemporaryDirectory()
@@ -2044,6 +2103,9 @@ class TestCursorAdapter(unittest.TestCase):
             self.assertAlmostEqual(rows[0]["ctx_pct"], 42.5)
             self.assertEqual(rows[0]["task"], "Add cursor support to roost")
             self.assertIsNone(rows[0]["pid"])
+            # WORKER shows the branch the composer last touched, not the
+            # composer-id hash, when the headers carry trackedGitRepos.
+            self.assertEqual(rows[0]["name"], "feat/cursor-bname")
         finally:
             roost.CURSOR_HOME = old_home
             roost.CURSOR_PROJECTS_DIR = old_projects

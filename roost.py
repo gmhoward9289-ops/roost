@@ -1275,10 +1275,39 @@ def _cursor_ms_to_epoch(ms):
     return ms / 1000.0 if ms > 1e12 else float(ms)
 
 
+def _cursor_recent_branch(h):
+    """Most recently interacted branch across a header's trackedGitRepos.
+
+    Cursor records every branch the composer touched, per repo, each with a
+    lastInteractionAt -- the newest one is where the work actually is.
+    """
+    repos = h.get("trackedGitRepos")
+    if not isinstance(repos, list):
+        return None
+    best, best_t = None, None
+    for repo in repos:
+        if not isinstance(repo, dict):
+            continue
+        branches = repo.get("branches")
+        if not isinstance(branches, list):
+            continue
+        for b in branches:
+            if not isinstance(b, dict):
+                continue
+            name = (b.get("branchName") or "").strip()
+            if not name:
+                continue
+            t = b.get("lastInteractionAt")
+            t = float(t) if isinstance(t, (int, float)) else 0.0
+            if best_t is None or t > best_t:
+                best, best_t = name, t
+    return best
+
+
 def read_cursor_composer_headers(db_path=None):
     """Non-archived parent composers from state.vscdb's composerHeaders table.
 
-    Returns a list of dicts with composer_id, name, subtitle, ctx_pct,
+    Returns a list of dicts with composer_id, name, subtitle, branch, ctx_pct,
     last_write, workspace_id. Empty on any error -- missing DB is normal on a
     machine that has never run Cursor.
     """
@@ -1326,6 +1355,7 @@ def read_cursor_composer_headers(db_path=None):
                     "workspace_id": ws or (h.get("workspaceIdentifier") or {}).get("id"),
                     "name": name,
                     "subtitle": subtitle,
+                    "branch": _cursor_recent_branch(h),
                     "ctx_pct": pct,
                     "last_write": last,
                     "mode": h.get("unifiedMode") or "",
@@ -1409,6 +1439,19 @@ def _cursor_worker_row(composer_id, name=None, task=None, task_src="-",
     }
 
 
+def _dedupe_cursor_names(rows):
+    """Several composers in one workspace often last touched the *same*
+    branch, and identical WORKER names make rows indistinguishable. Suffix
+    the composer short-id only on collisions so unique branches stay clean."""
+    counts = {}
+    for r in rows:
+        counts[r["name"]] = counts.get(r["name"], 0) + 1
+    for r in rows:
+        if counts[r["name"]] > 1 and r.get("session_id"):
+            r["name"] = r["name"] + "-" + r["session_id"][:4]
+    return rows
+
+
 def collect_cursor_workers():
     """Cursor composers: prefer composerHeaders (name + CTX%), fall back to
     agent-transcript JSONL when the SQLite index is absent."""
@@ -1465,7 +1508,10 @@ def collect_cursor_workers():
         task = title or prompt or ""
         task_src = "title" if title else ("prompt" if prompt else "-")
         short = cid[:8] if len(cid) >= 8 else cid
-        display = "cursor/" + short
+        # Prefer the branch the composer last touched -- that is the name a
+        # human recognises, same as Claude worktree sessions. The composer id
+        # short-hash is the fallback when no repo was ever tracked.
+        display = ascii_safe(h.get("branch") or "") or ("cursor/" + short)
         cwd = folders.get(h.get("workspace_id") or "") or ""
         if not slug and cwd:
             slug = cursor_project_slug(cwd)
@@ -1482,7 +1528,7 @@ def collect_cursor_workers():
     # cleanly it is authoritative -- rescanning every agent-transcripts file
     # for composers the idle window already dropped was the multi-second stall.
     if _CURSOR_HEADERS_OK or not CURSOR_PROJECTS_DIR.is_dir():
-        return rows
+        return _dedupe_cursor_names(rows)
     pattern = str(CURSOR_PROJECTS_DIR / "*" / "agent-transcripts" / "*" / "*")
     for path_str in glob.glob(pattern):
         path = Path(path_str)
@@ -1524,7 +1570,7 @@ def collect_cursor_workers():
             model=info["model"] or "-", ctx_tokens=info["ctx_tokens"],
             ctx_pct=pct, window=win_label, ctx_history=info["ctx_history"],
             idle_secs=idle, slug=slug, flow=flow))
-    return rows
+    return _dedupe_cursor_names(rows)
 
 
 def _worker_key(w):
