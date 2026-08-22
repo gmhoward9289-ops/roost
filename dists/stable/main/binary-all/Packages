@@ -70,6 +70,30 @@ Description: top for Claude Code
 
 Package: roost
 Architecture: all
+Version: 0.11.1
+Priority: optional
+Section: utils
+Maintainer: George M. Howard <dev@swamplink.com>
+Depends: python3 (>= 3.9)
+Recommends: bash-completion, zsh
+Filename: pool/main/r/roost/roost_0.11.1_all.deb
+Size: 53328
+MD5sum: 7d8260a0cfcb183c4a659eec19567eb0
+SHA1: 0fb483f38e06b45662f2105cc770d9dbb861ac6e
+SHA256: 81f0af7bf70ea8c17ef45f1d7aef348c610098e4c80feeb2ad73bc6a0c63828d
+SHA512: 2d2b187a5137b1e033e775310b13cdd0337a57d2d2fd9cf34fde88b3a737e009e2baa845ea055bed5c5da43dde759d047e24915d997a13583bbc4310bc671d8f
+Homepage: https://github.com/gmhoward9289-ops/roost
+Description: top for Claude Code
+ Shows every live Claude Code session on the machine, the model each is
+ running, how much of its context window it has consumed, and the subagents
+ it has spawned -- which have no process of their own and are invisible to
+ any pid-based view.
+ .
+ Reads only local Claude Code state and probes localhost inference ports.
+ It sends nothing anywhere.
+
+Package: roost
+Architecture: all
 Version: 0.2
 Priority: optional
 Section: utils
