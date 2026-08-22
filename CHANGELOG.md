@@ -15,6 +15,14 @@ deliberately no `Unreleased` heading: unreleased work lives in the open release
 PR, and a hand-maintained section would sort below each new generated one and
 drift out of date.
 
+## [0.11.1](https://github.com/gmhoward9289-ops/roost/compare/v0.11.0...v0.11.1) (2026-08-22)
+
+
+### Fixed
+
+* keep the swamplink roost version line aligned with GitHub/PyPI ([#94](https://github.com/gmhoward9289-ops/roost/issues/94)) ([2ec8660](https://github.com/gmhoward9289-ops/roost/commit/2ec8660f46212eeb68965f95bb416aa40c925898))
+* stop cold first paint from scanning finished sidechains ([#91](https://github.com/gmhoward9289-ops/roost/issues/91)) ([934a305](https://github.com/gmhoward9289-ops/roost/commit/934a30523dee92bb6bc46d4c95270a5ea09a7205))
+
 ## [0.11.0](https://github.com/gmhoward9289-ops/roost/compare/v0.10.1...v0.11.0) (2026-08-21)
 
 

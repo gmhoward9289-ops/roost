@@ -77,7 +77,7 @@ from urllib.parse import unquote, urlparse
 # greedy `sed -n 's/^__version__ = "\(.*\)"/\1/p'`, which would swallow a
 # trailing comment into the version string.
 # x-release-please-start-version
-__version__ = "0.11.0"
+__version__ = "0.11.1"
 # x-release-please-end
 
 SCHEMA_SNAPSHOT = "roost.snapshot.v1"
