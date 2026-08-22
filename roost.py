@@ -35,13 +35,16 @@ Sources, all local and all read-only:
 
 Backends default to both Claude Code and Cursor (ROOST_BACKENDS=claude,cursor).
 
-WORKERS is what each session *is*; INFRA is what it is running against. hyrule has
-no local inference stack, so its INFRA panel reads "not running" -- that is
-accurate there, not a failure. Same story for anyone without a local gateway at
-all (pure openrouter or the Anthropic API, no litellm): INFRA just reads DOWN,
-harmless. If your ports differ from the 11434/4000/8080 defaults, override with
-ROOST_OLLAMA_PORT / ROOST_LITELLM_PORT / ROOST_OPENWEBUI_PORT (or the matching
---ollama-port / --litellm-port / --openwebui-port flags, which win per-run).
+WORKERS is what each session *is*; INFRA is what it is running against. A
+service that has never answered on an untouched default port shows a dim
+"off?", not a red DOWN -- hyrule has no local inference stack, and anyone
+without a local gateway at all (pure openrouter or the Anthropic API, no
+litellm) is in the same boat: nothing is broken, roost just was never told a
+port. Red DOWN is reserved for a port you configured, or a service that was up
+earlier this run and stopped answering. If your ports differ from the
+11434/4000/8080 defaults, override with ROOST_OLLAMA_PORT / ROOST_LITELLM_PORT
+/ ROOST_OPENWEBUI_PORT (or the matching --ollama-port / --litellm-port /
+--openwebui-port flags, which win per-run).
 roost writes nothing to disk on your behalf besides its own run log
 (~/.claude/logs/roost.jsonl, off with --no-log) -- no config file, ever.
 
@@ -161,6 +164,17 @@ LITELLM_CONFIG_ENV = "ROOST_LITELLM_CONFIG"
 OLLAMA_PORT = int(os.environ.get(OLLAMA_PORT_ENV, 11434))
 LITELLM_PORT = int(os.environ.get(LITELLM_PORT_ENV, 4000))
 OPENWEBUI_PORT = int(os.environ.get(OPENWEBUI_PORT_ENV, 8080))
+
+# Whether the user told us the port (env var here, CLI flag in main()). A
+# configured port that probes closed is DOWN -- they claimed a service lives
+# there. An untouched default that has never once answered is "off?" instead:
+# most likely there is no such service, or it lives on a port we were never
+# told about, and red would send them chasing a crash that never happened.
+_PORT_CONFIGURED = {
+    "ollama": OLLAMA_PORT_ENV in os.environ,
+    "litellm": LITELLM_PORT_ENV in os.environ,
+    "openwebui": OPENWEBUI_PORT_ENV in os.environ,
+}
 
 # REMOTE panel: ssh aliases come from the environment only, never from file
 # contents -- anything writable over the network must not choose ssh targets.
@@ -1663,12 +1677,21 @@ def collect_workers():
     return rows
 
 
+# Services that have answered at least once this run. Down-after-up is a real
+# outage (red DOWN); never-up on an unconfigured default port is "off?".
+_INFRA_EVER_UP = set()
+
+
 def collect_infra():
     out = []
     for name, port, path in _services():
         if not port_open(port):
-            out.append({"name": name, "port": port, "up": False, "detail": "not running"})
+            unseen = name not in _INFRA_EVER_UP and not _PORT_CONFIGURED.get(name)
+            out.append({"name": name, "port": port, "up": False,
+                        "unseen": unseen,
+                        "detail": "never seen on this port" if unseen else "not running"})
             continue
+        _INFRA_EVER_UP.add(name)
         detail = ""
         if name == "ollama":
             ps = http_json(port, path)
@@ -1680,7 +1703,8 @@ def collect_infra():
                 )
             else:
                 detail = "no model resident"
-        out.append({"name": name, "port": port, "up": True, "detail": detail})
+        out.append({"name": name, "port": port, "up": True, "unseen": False,
+                    "detail": detail})
     return out
 
 
@@ -2822,18 +2846,27 @@ def render(workers, sel=None):
 def render_infra(infra):
     """One horizontal line: it is always present and rarely the thing you need."""
     parts = []
+    any_unseen = False
     for s in infra:
         if s["up"] is None:
             mark = c("…", DIM)
         elif s["up"]:
             mark = c("up", GREEN)
+        elif s.get("unseen"):
+            # Never answered on an untouched default port: probably not a
+            # crashed service but a port we were never told about, so no red.
+            mark = c("off?", DIM)
+            any_unseen = True
         else:
             mark = c("DOWN", BOLD, RED)
         extra = ""
         if s["up"] and s["detail"]:
             extra = " " + c(s["detail"], CYAN)
         parts.append("%s:%d %s%s" % (c(s["name"], BOLD), s["port"], mark, extra))
-    return [c("INFRA  ", BOLD) + "   ".join(parts), ""]
+    line = c("INFRA  ", BOLD) + "   ".join(parts)
+    if any_unseen:
+        line += "   " + c("off? = never up here; set ROOST_*_PORT if it runs elsewhere", DIM)
+    return [line, ""]
 
 
 def _pct_color(pct):
@@ -3130,7 +3163,9 @@ def render_models(models):
 # is small enough that this list is the whole manual.
 HELP_SCREENS = (
     ("INFRA", None,
-     "ollama / litellm / openwebui: up or down, plus what's resident in Ollama's VRAM right now."),
+     "ollama / litellm / openwebui: up, DOWN, or off? (never answered on a default "
+     "port -- likely no such service, or set ROOST_*_PORT to where it lives), "
+     "plus what's resident in Ollama's VRAM right now."),
     ("WORKERS", None,
      "every live Claude Code session: model, context window used, idle time, current task. "
      "TREND is how much context the session added over its last few turns, read out of the "
@@ -3614,10 +3649,13 @@ def main():
     LOGGING = not args.no_log
     if args.ollama_port is not None:
         OLLAMA_PORT = args.ollama_port
+        _PORT_CONFIGURED["ollama"] = True
     if args.litellm_port is not None:
         LITELLM_PORT = args.litellm_port
+        _PORT_CONFIGURED["litellm"] = True
     if args.openwebui_port is not None:
         OPENWEBUI_PORT = args.openwebui_port
+        _PORT_CONFIGURED["openwebui"] = True
 
     if args.json:
         workers = collect_workers()

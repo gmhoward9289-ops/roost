@@ -28,9 +28,11 @@ ports.
 .RE
 .PP
 Without a local gateway at all (pure openrouter or the Anthropic API, no
-litellm) the INFRA panel simply reads everything DOWN \(em harmless, the same
-as it reads on a machine with no local inference stack at all. If your ports
-differ from the 11434/4000/8080 defaults, see
+litellm) the INFRA panel simply reads everything as a dim "off?" \(em never
+answered on an untouched default port, so most likely no such service, or one
+on a port roost was never told. Red DOWN is reserved for a port you configured
+yourself, or a service that was up earlier in the run and stopped answering.
+If your ports differ from the 11434/4000/8080 defaults, see
 .B \-\-ollama\-port ,
 .B \-\-litellm\-port ,
 and

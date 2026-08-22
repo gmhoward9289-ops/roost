@@ -40,8 +40,15 @@ SUBAGENTS
 
   2 subagent(s), 1 working
 
-INFRA  ollama:11434 up qwen2.5-coder:14b (9.2 GB)   litellm:4000 up   openwebui:8080 DOWN
+INFRA  ollama:11434 up qwen2.5-coder:14b (9.2 GB)   litellm:4000 up   openwebui:8080 off?
 ```
+
+An INFRA service that has never answered on an untouched default port shows a
+dim `off?` instead of a red `DOWN` — that usually means there is no such
+service, or it lives on a port roost was never told about (`ROOST_OLLAMA_PORT`
+/ `ROOST_LITELLM_PORT` / `ROOST_OPENWEBUI_PORT`, or the matching flags). Red
+`DOWN` is reserved for a port you configured yourself, or a service that was
+up earlier in the run and stopped answering.
 
 Sessions are grouped by what it costs to ignore them, not by size: `NEAR LIMIT`
 is about to stop working, `PARKED + COSTLY` bills its whole context on the next

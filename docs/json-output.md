@@ -64,7 +64,8 @@ Distinguished from workers by `agent_id` + `parent_sid` (no `pid`).
 | `name` | `ollama`, `litellm`, `openwebui` |
 | `port` | probed localhost port |
 | `up` | boolean |
-| `detail` | resident models, or `not running` |
+| `unseen` | true when down, on an unconfigured default port, and never seen up this run — "no such service or wrong port", not an outage |
+| `detail` | resident models, `not running`, or `never seen on this port` |
 
 ## gateway
 
