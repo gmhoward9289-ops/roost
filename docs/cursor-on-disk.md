@@ -41,7 +41,7 @@ into `-` (e.g. `C:\Users\gmhow\dev\roost` → `c-Users-gmhow-dev-roost`).
 | roost field | Cursor source |
 | --- | --- |
 | `session_id` | `composerId` |
-| `name` | `cursor/<first-8-of-id>` (stable short id) |
+| `name` | newest `trackedGitRepos[].branches[].branchName` by `lastInteractionAt`; else `cursor/<first-8-of-id>` |
 | `task` | `composerHeaders.value.name`, else transcript `<user_query>`, else `subtitle` |
 | `model` | transcript `message.model` (rare); else newest `Task` tool_use `input.model`; else `-` |
 | `ctx_pct` | `composerHeaders.value.contextUsagePercent` (Cursor’s own meter) |

@@ -25,7 +25,7 @@ One object per live row. Units: token counts are integers, times are seconds
 | field | notes |
 | --- | --- |
 | `source` | `claude` or `cursor` |
-| `name` | session name, or `cursor/<first-8>` |
+| `name` | session name; Cursor: last-touched branch name, or `cursor/<first-8>` |
 | `pid` | OS pid, or `null` for Cursor |
 | `session_id` | Claude sessionId or Cursor composerId |
 | `cwd` / `project` | working directory and its basename |
