@@ -314,6 +314,12 @@ _SEEN_AGENTS = set()
 # a transcript that has not been written to cannot have a new model or usage.
 _SCAN_CACHE = {}
 
+# path -> first-turn token total (system prompt + tool/skill/MCP schemas,
+# before any real work happens). Unlike _SCAN_CACHE this never invalidates --
+# the first assistant turn a transcript ever wrote does not change -- so it is
+# read once per session, from the head of the file, not the tail.
+_START_CACHE = {}
+
 # composer_id -> (transcript_path, project_slug). Rebuilt each frame; cleared in
 # prune_caches so a vanished composer does not keep a stale path forever.
 _CURSOR_TX_INDEX = None
@@ -889,6 +895,48 @@ def scan_transcript(path):
     if out["last_write"] is not None:
         _SCAN_CACHE[path] = (out["last_write"], dict(out))
     return out
+
+
+def startup_context(path):
+    """Tokens billed on the session's first assistant turn.
+
+    Before any user message is really answered, Claude Code has already
+    loaded the system prompt plus every tool, skill listing, and MCP server's
+    tool schemas -- that's what shows up as input + cache tokens on turn one.
+    A big number here means a heavy skills/MCP set is taxing every session
+    from the first token, independent of anything the user has done since.
+    Read forward from the head of the file (scan_transcript reads the tail),
+    and cache forever once found -- turn one never changes.
+    """
+    if not path:
+        return None
+    if path in _START_CACHE:
+        return _START_CACHE[path]
+    total = None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or '"usage"' not in line or '"assistant"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                usage = (d.get("message") or {}).get("usage") or {}
+                if not usage:
+                    continue
+                total = (
+                    (usage.get("input_tokens") or 0)
+                    + (usage.get("cache_read_input_tokens") or 0)
+                    + (usage.get("cache_creation_input_tokens") or 0)
+                )
+                break
+    except OSError:
+        return None
+    if total is not None:
+        _START_CACHE[path] = total
+    return total
 
 
 def harvest_agent_meta(parent_transcript):
@@ -1627,6 +1675,7 @@ def collect_claude_workers():
         if cwd not in ac_cache:
             ac_cache[cwd] = auto_compact_enabled(cwd)
         rows.append({
+            "start_tokens": startup_context(transcript_for(sid)),
             "source": "claude",
             "name": s.get("name") or "-",
             "pid": pid,
@@ -3059,6 +3108,10 @@ def render_detail(row, children=None):
     else:
         field("tokens", "- / %s" % win)
     field("idle", dur(row.get("idle_secs")) if row.get("idle_secs") is not None else "-")
+    if not is_agent:
+        start_tok = row.get("start_tokens")
+        field("startup", "%s tokens (before the first real turn)" % compact(start_tok)
+              if start_tok is not None else "-")
     field("cost/turn", "not on disk")
     task = ascii_safe(row.get("task") or "")
     lines.append("  " + c("task", DIM))
