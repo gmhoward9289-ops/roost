@@ -1,7 +1,9 @@
 # roost
 
 [![ci](https://github.com/gmhoward9289-ops/roost/actions/workflows/ci.yml/badge.svg)](https://github.com/gmhoward9289-ops/roost/actions/workflows/ci.yml)
+[![pypi](https://img.shields.io/pypi/v/roost-top)](https://pypi.org/project/roost-top/)
 [![npm](https://img.shields.io/npm/v/roost-top)](https://www.npmjs.com/package/roost-top)
+[![github release](https://img.shields.io/github/v/release/gmhoward9289-ops/roost)](https://github.com/gmhoward9289-ops/roost/releases/latest)
 [![license](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![discussions](https://img.shields.io/github/discussions/gmhoward9289-ops/roost)](https://github.com/gmhoward9289-ops/roost/discussions)
 
@@ -483,7 +485,9 @@ clone or copy there if you prefer `GitHub/roost`.
   `roost.py` under it.
 - `packaging/` — the Homebrew formula (`roost.rb`), the `.deb` build
   (`build-deb.sh`), the version-consistency check that CI runs on every PR
-  (`check-version-consistency.sh`), and the apt signing key (`apt/`).
+  (`check-version-consistency.sh`), the roost stanza for the swamplink tools
+  catalog (`swamplink-roost.json`; live `versions.json` is out of repo — see
+  [`docs/swamplink.md`](docs/swamplink.md)), and the apt signing key (`apt/`).
 - `tests/` — the unittest suite `ci.yml` runs on Linux, macOS and Windows.
 - `scripts/` — maintenance utilities (`cursor_recon.py` inventories Cursor's
   on-disk layout; `regen_claude_fixtures.py` refreshes the Claude canary

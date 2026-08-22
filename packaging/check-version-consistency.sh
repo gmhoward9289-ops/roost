@@ -102,6 +102,13 @@ npm_version=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\
               package.json | head -1)
 report "package.json version" "$npm_version" "$NPM_WANT"
 
+# --- swamplink roost stanza ---------------------------------------------------
+# The live catalog is swamplink-root:/tools/versions.json (not this repo).
+# This file is the roost object that catalog must carry; CI fails the bump
+# PR if it drifts the way roost.1 and roost.rb used to.
+swamplink_version=$(python3 -c 'import json; print(json.load(open("packaging/swamplink-roost.json"))["version"])')
+report "swamplink-roost.json" "$swamplink_version" "$VERSION"
+
 # --- --version output ---------------------------------------------------------
 cli_version=$(python3 roost.py --version 2>&1 | sed -n 's/^roost \(.*\)$/\1/p')
 report "roost --version" "$cli_version" "$VERSION"
@@ -111,12 +118,13 @@ if [ "$fail" -ne 0 ]; then
 
 Version drift. Every artifact above must say $VERSION.
 
-  roost.1            .TH ROOST 1 "<date>" "roost $VERSION" "User Commands"
-  package.json       "version": "$NPM_WANT"   (npm needs three components)
-  packaging/roost.rb url     ...releases/download/v$VERSION/roost_top-$VERSION.tar.gz
-                     version "$VERSION"
-                     and refresh sha256:
-                       curl -sL https://github.com/gmhoward9289-ops/roost/releases/download/v$VERSION/roost_top-$VERSION.tar.gz | shasum -a 256
+  roost.1                      .TH ROOST 1 "<date>" "roost $VERSION" "User Commands"
+  package.json                 "version": "$NPM_WANT"   (npm needs three components)
+  packaging/swamplink-roost.json  {"version": "$VERSION", "date": "YYYY-MM-DD"}
+  packaging/roost.rb url       ...releases/download/v$VERSION/roost_top-$VERSION.tar.gz
+                               version "$VERSION"
+                               and refresh sha256:
+                                 curl -sL https://github.com/gmhoward9289-ops/roost/releases/download/v$VERSION/roost_top-$VERSION.tar.gz | shasum -a 256
 
 A stale formula does not fail loudly: with an explicit \`version\` line, Homebrew's
 built-in version assertion checks that stale number against a tarball that still

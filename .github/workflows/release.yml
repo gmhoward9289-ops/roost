@@ -472,3 +472,56 @@ jobs:
           git add Formula/roost.rb
           git diff --cached --quiet && echo "nothing changed" || git commit -m "roost $GITHUB_REF_NAME"
           git push origin master
+
+  # Rewrites the roost stanza in swamplink-root's tools/versions.json, which
+  # is what https://swamplink.com/tools/roost/ displays as "latest release".
+  # The catalog is a family file (roost + leghorn + legbar); this job must
+  # never replace the whole object. Until the SWAMPLINK_* secrets exist on
+  # this repo the job notices and exits 0 -- a missing one-time setup must
+  # not redden the rest of the release, same as winget before its bootstrap
+  # PR merged. xycalc keeps the same secret names on a `production`
+  # environment; roost reads them as repo secrets so a missing environment
+  # cannot stall the tag.
+  swamplink-tools:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Patch swamplink-root tools/versions.json
+        env:
+          SSH_KEY: ${{ secrets.SWAMPLINK_SSH_KEY }}
+          HOST: ${{ secrets.SWAMPLINK_HOST }}
+          KNOWN_HOSTS: ${{ secrets.SWAMPLINK_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SSH_KEY:-}" ] || [ -z "${HOST:-}" ] || [ -z "${KNOWN_HOSTS:-}" ]; then
+            echo "::notice::SWAMPLINK_SSH_KEY / SWAMPLINK_HOST / SWAMPLINK_KNOWN_HOSTS are not set. Live https://swamplink.com/tools/versions.json lives in swamplink-root, not this repo. Bump the roost stanza there by hand (packaging/swamplink-roost.json is the object to copy). See docs/swamplink.md."
+            exit 0
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          date=$(sed -n "s/^## \[${version}\].*(\([0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\)).*/\1/p" CHANGELOG.md | head -1)
+          if [ -z "$date" ]; then
+            date=$(date -u +%F)
+          fi
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy && chmod 600 ~/.ssh/deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts && chmod 600 ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND='ssh -i ~/.ssh/deploy -o BatchMode=yes'
+          git clone "${HOST}:/srv/git/swamplink-root.git" /tmp/swamplink-root
+          catalog=/tmp/swamplink-root/tools/versions.json
+          if [ ! -f "$catalog" ]; then
+            echo "::error::$catalog not in swamplink-root -- refusing to guess the path"
+            exit 1
+          fi
+          packaging/publish-swamplink-roost.sh --catalog "$catalog" --date "$date"
+          git -C /tmp/swamplink-root config user.name "roost-release-bot"
+          git -C /tmp/swamplink-root config user.email "dev@swamplink.com"
+          git -C /tmp/swamplink-root add tools/versions.json
+          if git -C /tmp/swamplink-root diff --cached --quiet; then
+            echo "catalog already at roost $version"
+            exit 0
+          fi
+          git -C /tmp/swamplink-root commit -m "chore(roost): tools/versions.json $GITHUB_REF_NAME"
+          git -C /tmp/swamplink-root push origin HEAD:master
