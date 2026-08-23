@@ -919,6 +919,43 @@ class TestInfraLine(unittest.TestCase):
         self.assertIn("litellm", out)
         self.assertIn("DOWN", out)
 
+    def test_never_seen_default_port_is_off_not_down(self):
+        """A service that never answered on an untouched default port is most
+        likely absent or elsewhere, not crashed -- red DOWN would send someone
+        chasing an outage that never happened."""
+        out = "\n".join(roost.render_infra(
+            [{"name": "openwebui", "port": 8080, "up": False, "unseen": True,
+              "detail": "never seen on this port"}]))
+        self.assertIn("off?", out)
+        self.assertNotIn("DOWN", out)
+        self.assertIn("ROOST_*_PORT", out)
+
+    def test_off_hint_absent_when_nothing_unseen(self):
+        out = "\n".join(roost.render_infra(
+            [{"name": "litellm", "port": 4000, "up": True, "detail": ""}]))
+        self.assertNotIn("ROOST_*_PORT", out)
+
+    def test_collect_distinguishes_unseen_from_down(self):
+        orig_open = roost.port_open
+        orig_ever = set(roost._INFRA_EVER_UP)
+        orig_conf = dict(roost._PORT_CONFIGURED)
+        try:
+            roost.port_open = lambda port: False
+            roost._INFRA_EVER_UP.clear()
+            roost._PORT_CONFIGURED.update(
+                {"ollama": False, "litellm": True, "openwebui": False})
+            roost._INFRA_EVER_UP.add("openwebui")  # answered earlier this run
+            by_name = {s["name"]: s for s in roost.collect_infra()}
+            self.assertTrue(by_name["ollama"]["unseen"])       # default, never up
+            self.assertFalse(by_name["litellm"]["unseen"])     # user named the port
+            self.assertFalse(by_name["openwebui"]["unseen"])   # up earlier: real outage
+        finally:
+            roost.port_open = orig_open
+            roost._INFRA_EVER_UP.clear()
+            roost._INFRA_EVER_UP.update(orig_ever)
+            roost._PORT_CONFIGURED.clear()
+            roost._PORT_CONFIGURED.update(orig_conf)
+
     def test_no_sessions_still_renders(self):
         self.assertIn("no live agent sessions", "\n".join(roost.render([])))
 
