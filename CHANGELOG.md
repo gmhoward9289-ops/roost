@@ -15,6 +15,19 @@ deliberately no `Unreleased` heading: unreleased work lives in the open release
 PR, and a hand-maintained section would sort below each new generated one and
 drift out of date.
 
+## [0.13.0](https://github.com/gmhoward9289-ops/roost/compare/v0.12.0...v0.13.0) (2026-08-23)
+
+
+### Added
+
+* show off? instead of DOWN for never-seen infra services ([#97](https://github.com/gmhoward9289-ops/roost/issues/97)) ([0c21ff7](https://github.com/gmhoward9289-ops/roost/commit/0c21ff79f2b3f35c1217d7095977ed98e535373e))
+* show session startup context size ([#98](https://github.com/gmhoward9289-ops/roost/issues/98)) ([afc4832](https://github.com/gmhoward9289-ops/roost/commit/afc4832db0be73e576c2ea0136a66730885c6499))
+
+
+### Documentation
+
+* link henhouse schema ([#100](https://github.com/gmhoward9289-ops/roost/issues/100)) ([576b35c](https://github.com/gmhoward9289-ops/roost/commit/576b35ce01172fa6e6f234506187e7b58919e6dd))
+
 ## [0.12.0](https://github.com/gmhoward9289-ops/roost/compare/v0.11.1...v0.12.0) (2026-08-22)
 
 
