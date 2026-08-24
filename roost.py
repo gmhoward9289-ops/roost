@@ -3597,7 +3597,8 @@ def build_parser():
         "i = arm interactive mode   q = quit\n"
         "interactive mode (armed with i):  j/k or arrows move a cursor   "
         "Tab = workers/subagents   Enter = row detail   "
-        "x = stop the session (confirms)   y = copy its sessionId   esc = deselect")
+        "x = stop the session (confirms)   y = copy its sessionId   esc = deselect\n"
+        "source and issues: https://github.com/gmhoward9289-ops/roost")
     return ap
 
 
