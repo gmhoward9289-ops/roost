@@ -1,24 +1,24 @@
 Architectures: all
 Codename: stable
 Components: main
-Date: Sun, 23 Aug 2026 09:45:00 +0000
+Date: Sat, 29 Aug 2026 13:20:30 +0000
 Description: top for Claude Code
 Label: roost
 Origin: roost
 Suite: stable
 MD5Sum:
- d9437da11e5fe74d8184af66f37fb96a              165 Release
- efe7ffb5b500dc62d466c2262bfa9ce8            13432 main/binary-all/Packages
- c02ab68dc8953425f66f39b4b308fd84             3117 main/binary-all/Packages.gz
+ 2902ab21bd9ac6ad3a03cd92c2b10e59              165 Release
+ ff67115b55dee774c791a68d7a42caf5            14417 main/binary-all/Packages
+ 1895ccef31e76b4097860c3d90558483             3297 main/binary-all/Packages.gz
 SHA1:
- cbeed36653e70d787f2050ceeb75ed619ecad1c2              165 Release
- e84a6bda1cebebbd5429cdd5f1f0364221e33158            13432 main/binary-all/Packages
- f59c7f3087b2d98698dc5fee79a04ea801847922             3117 main/binary-all/Packages.gz
+ f7c478a71d6edf87b7f026dd21a7ff066ff064dc              165 Release
+ 90b476297ebde9e10b6bcbb7634c981cc4cdf2f4            14417 main/binary-all/Packages
+ c69f3810484e717efc479e40deb0f159bebeb422             3297 main/binary-all/Packages.gz
 SHA256:
- 2173f7740ed2ec3462751bae6701df16e7ccb98a00bff96a35565bd20809d6d4              165 Release
- 3d354178595927cbd3ac7adb210d601ca56dbdcab7f9ac870ad5863a404e776a            13432 main/binary-all/Packages
- 8d8a7fbcb9432c422de02d9a123ca28d378dc09a8b22aaa089577143b96779d5             3117 main/binary-all/Packages.gz
+ 94ce844874d78cedec866b8d1d58bd125d341c8857e56e75b90603a90f5ae02d              165 Release
+ 4628833b22aa184c4592a70978eeb5a7fa746c60b9025f34842dbb65229c9b96            14417 main/binary-all/Packages
+ 46b13dd14630996ee972fe710b5d8964ecef31e1f9f57578cabd0e2a41f5c367             3297 main/binary-all/Packages.gz
 SHA512:
- 5d7b48926bf194b332f4383c18d77e9920977f171233c6b78b6526f30cbac93532d875ec2e06784aa469d04318195663607a26f1a61ee04fcc3b14bb3613ee42              165 Release
- 03d923307a09d9595c7e5af66d8e55775c1f4e3e5bcaa37cb406b5a954f91225e4038bc1d16e8448bc9d6e6b04492cddd20642583bb7f6351be434dd1dc0744b            13432 main/binary-all/Packages
- ecc02f306077b061987f28a57c24bb1daf07e3566dcbaaacd0ebdeaf3efbd1281b2b2740c07bcc29ba8a1e5e5bb53ae79731153518c4253f3fc106b631d6d5f1             3117 main/binary-all/Packages.gz
+ 82dd38c05648cb286867bcccf90f235c1bdb59c1e234805679f1dc8ac9aa572cde726c00ca65927b0cf0a7bf79856cb61e9989d061b43537b2d0f74a167b8fb1              165 Release
+ 5b60ebcc831f70dccc68147bbc884fd9fbe4f25f66d5ff2509fb862fe0a97e65f8181a9ae9f1368cba5ca60adb52ee646fbfa0ae6d780e929da37a626f33a171            14417 main/binary-all/Packages
+ a1e434dd59e3f90f43f41963841d8f0a03ab114e7c749ede178ff965e1b7fba4a1643b85a6b9733935803d60aabb47bb32f522c95ce7e2c293a9afcb3ad4ef06             3297 main/binary-all/Packages.gz
