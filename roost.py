@@ -2111,7 +2111,8 @@ def collect_gateway():
     now = time.time()
     out = {"litellm_up": port_open(LITELLM_PORT), "runs": [], "jobs": None,
            "last_req_secs": None, "req_per_min": None,
-           "configured": [], "configured_gap": None}
+           "configured": [], "configured_gap": None,
+           "probed_at": now}
 
     configured, gap = collect_gateway_models(None)
     if configured and any(r["kind"] == "local" for r in configured):
@@ -2206,7 +2207,11 @@ def render_gateway(gw):
     """LiteLLM plus everything it has been fed, without asking it anything --
     a DB-less gateway keeps no history, so the batch pipeline's own output
     files carry the progress story."""
-    lines = ["", c("GATEWAY", BOLD)]
+    title = c("GATEWAY", BOLD)
+    probed = gw.get("probed_at")
+    if probed is not None:
+        title += "  " + c("probed " + time.strftime("%H:%M:%S", time.localtime(probed)), DIM)
+    lines = ["", title]
     mark = c("up", GREEN) if gw["litellm_up"] else c("DOWN", BOLD, RED)
     head = "  litellm %s (127.0.0.1:%d)" % (mark, LITELLM_PORT)
     if gw["last_req_secs"] is not None:
@@ -2266,7 +2271,7 @@ def render_gateway(gw):
         ("ETA", lambda r: dur(r["eta_secs"]) if r["eta_secs"]
             else ("done" if r["total"] is not None
                   and r["done"] + r["failed"] >= r["total"] else "-")),
-        ("LAST", lambda r: "-" if r["last_write_secs"] is None
+        ("LAST WRITE", lambda r: "-" if r["last_write_secs"] is None
             else dur(r["last_write_secs"]) + " ago"),
     ]
     table = [[h for h, _ in cols]] + [[f(r) for _, f in cols] for r in gw["runs"]]
@@ -3245,7 +3250,10 @@ HELP_SCREENS = (
     ("GATEWAY", "g",
      "LiteLLM liveliness, the aliases in config.yaml (configured intent, not "
      "whether a backing model will answer), plus batch-run progress from output "
-     "files. Missing config is a labelled gap. Green batch rows are writing."),
+     "files. Missing config is a labelled gap. Green batch rows are writing. "
+     "probed is when roost last listed the batch dir; LAST WRITE is when an "
+     "output file last landed -- a live panel with a days-old LAST WRITE means "
+     "the pipeline stopped, not that roost is stale."),
     ("REMOTE", "r",
      "other machines' roost, over ssh. One row per host in ROOST_REMOTES: workers, "
      "resident models, batch progress, job queue. Fetched on a background thread and "

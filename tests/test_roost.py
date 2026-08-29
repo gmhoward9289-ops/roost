@@ -1622,6 +1622,13 @@ class TestGatewayCollect(unittest.TestCase):
         self.assertEqual(gw["runs"], [])
         self.assertIsNone(gw["last_req_secs"])
 
+    def test_collect_stamps_when_it_probed_the_filesystem(self):
+        before = time.time()
+        gw = roost.collect_gateway()
+        after = time.time()
+        self.assertGreaterEqual(gw["probed_at"], before)
+        self.assertLessEqual(gw["probed_at"], after)
+
     def test_the_proxy_log_is_read_from_beside_the_batch_root(self):
         (self.root.parent / "proxy.log").write_text(
             "INFO %s POST /chat/completions 200\n" % time.strftime(
@@ -1698,6 +1705,16 @@ class TestRenderGateway(unittest.TestCase):
         for line in roost.render_gateway(self.gw(runs=[self.batch()])):
             for ch in line:
                 self.assertLess(ord(ch), 127)
+
+    def test_the_panel_clock_is_not_the_last_write_age(self):
+        probed = time.mktime(time.strptime("2026-08-03 21:04:15",
+                                           "%Y-%m-%d %H:%M:%S"))
+        out = "\n".join(roost.render_gateway(self.gw(
+            probed_at=probed, runs=[self.batch(last_write_secs=117 * 3600)])))
+        self.assertIn("probed 21:04:15", out)
+        self.assertIn("LAST WRITE", out)
+        self.assertIn("117h00m ago", out)
+        self.assertNotRegex(out, r"(?m)^GATEWAY\s+117h")
 
 
 class TestRemoteHosts(unittest.TestCase):
