@@ -15,6 +15,13 @@ deliberately no `Unreleased` heading: unreleased work lives in the open release
 PR, and a hand-maintained section would sort below each new generated one and
 drift out of date.
 
+## [0.14.0](https://github.com/gmhoward9289-ops/roost/compare/v0.13.0...v0.14.0) (2026-08-29)
+
+
+### Added
+
+* stamp the gateway panel with its probe time ([#103](https://github.com/gmhoward9289-ops/roost/issues/103)) ([94d04ed](https://github.com/gmhoward9289-ops/roost/commit/94d04edc0ee8c762304f516df23a96a876508527))
+
 ## [0.13.0](https://github.com/gmhoward9289-ops/roost/compare/v0.12.0...v0.13.0) (2026-08-23)
 
 
