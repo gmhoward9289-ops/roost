@@ -73,13 +73,24 @@ jobs:
           ref: ${{ needs.resolve.outputs.tag }}
           path: src
 
+      - name: Mint a GitHub App token for the tap
+        id: tap-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: gmhoward9289-ops
+          repositories: |
+            roost
+            homebrew-tap
+
       - name: Check out the tap
         uses: actions/checkout@v7
         with:
           repository: gmhoward9289-ops/homebrew-tap
           ref: master
           path: tap
-          token: ${{ secrets.TAP_PUSH_TOKEN }}
+          token: ${{ steps.tap-token.outputs.token }}
 
       - name: Download the release sdist
         env:
