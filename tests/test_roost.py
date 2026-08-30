@@ -914,6 +914,66 @@ class TestFrameClamping(unittest.TestCase):
             self.assertTrue(any(r["name"] in ln for ln in table), r["name"])
 
 
+class TestSnapshotRenderSplit(unittest.TestCase):
+    """A window resize repaints from the cached snapshot. That only works if
+    rendering truly runs no collector and leaves the collect clock alone --
+    otherwise the reflow would drag a full rescan in behind it, or the
+    "updated Ns ago" chip would report paint age instead of data age."""
+
+    PATCHED = ("collect_workers", "collect_infra", "collect_subagents",
+               "collect_local_models")
+
+    def setUp(self):
+        self._saved = {n: getattr(roost, n) for n in self.PATCHED}
+        self._last = roost._LAST_COLLECT
+        self.calls = {"workers": 0, "models": 0}
+
+        def workers():
+            self.calls["workers"] += 1
+            return [worker(idle_secs=5)]
+
+        def models():
+            self.calls["models"] += 1
+            return []
+
+        roost.collect_workers = workers
+        roost.collect_infra = lambda: []
+        roost.collect_subagents = lambda sids: []
+        roost.collect_local_models = models
+
+    def tearDown(self):
+        for name, fn in self._saved.items():
+            setattr(roost, name, fn)
+        roost._LAST_COLLECT = self._last
+
+    def test_render_frame_runs_no_collector(self):
+        snap = roost.collect_snapshot(view="models")
+        self.assertEqual(self.calls, {"workers": 1, "models": 1})
+        for _ in range(3):  # a drag can repaint more than once
+            roost.render_frame(snap, view="models")
+        self.assertEqual(self.calls, {"workers": 1, "models": 1})
+
+    def test_render_frame_leaves_the_collect_clock_alone(self):
+        snap = roost.collect_snapshot()
+        stamp = roost._LAST_COLLECT
+        self.assertIsNotNone(stamp)
+        time.sleep(0.02)
+        roost.render_frame(snap)
+        self.assertEqual(roost._LAST_COLLECT, stamp)
+
+    def test_collect_snapshot_advances_the_clock(self):
+        roost._LAST_COLLECT = None
+        roost.collect_snapshot()
+        self.assertIsNotNone(roost._LAST_COLLECT)
+
+    def test_frame_is_one_collect_plus_one_render(self):
+        """The --once path calls frame(); the split must not change it."""
+        _, rows, sel = roost.frame(sel=0)
+        self.assertEqual(self.calls["workers"], 1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(sel, 0)
+
+
 class TestTerminateGuard(unittest.TestCase):
     def test_refuses_to_stop_its_own_process(self):
         self.assertIn("own process tree", roost.terminate(os.getpid()))

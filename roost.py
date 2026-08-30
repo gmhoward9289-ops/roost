@@ -346,8 +346,9 @@ _CURSOR_HEADERS_OK = False
 # Live mode may paint the first frame before localhost INFRA probes finish.
 _INFRA_ALLOW_DEFER = False
 
-# When frame() last collected -- the header's "updated Ns ago" chip. None
-# until the first collect.
+# When collect_snapshot() last ran -- the header's "updated Ns ago" chip. It
+# deliberately survives render-only repaints (a resize reflows from cache), so
+# the chip reports data age, not paint age. None until the first collect.
 _LAST_COLLECT = None
 
 # sessionId -> {"prev": last ctx_tokens, "t": last sample time, "hist": deque}.
@@ -3327,21 +3328,57 @@ def render_help():
     return lines
 
 
-def frame(view=None, sel=None, focus="workers", detail=None):
-    """Returns (lines, rows, sel). `view` is the open panel: "agents",
+def collect_snapshot(view=None, focus="workers", detail=None):
+    """Run every collector the current view needs and stamp the collect clock.
+
+    Collection and rendering used to be fused in frame(), which meant a window
+    resize could not reflow the display without paying for a full rescan of
+    transcripts and processes. The snapshot is the seam: the watch loop keeps
+    the last one and can re-render it at a new width for free. The view/focus
+    gating is unchanged from the fused version -- panel collectors only run for
+    the panel that is actually open.
+    """
+    workers = collect_workers()
+    live_sids = set(w["session_id"] for w in workers if w.get("session_id"))
+    agents = []
+    if view in ("agents", "detail") or focus == "agents":
+        agents = collect_subagents(live_sids)
+    snap = {"workers": workers, "agents": agents, "infra": infra_cached()}
+    if view == "detail":
+        kids = []
+        if detail and detail.get("session_id"):
+            kids = [a for a in agents if a.get("parent_sid") == detail.get("session_id")]
+            if not kids:
+                kids = collect_subagents({detail["session_id"]})
+        snap["detail_kids"] = kids
+    elif view == "models":
+        snap["models"] = collect_local_models()
+    elif view == "usage":
+        snap["usage"] = collect_usage()
+    elif view == "gateway":
+        snap["gateway"] = collect_gateway()
+    elif view == "remote":
+        snap["remote"] = collect_remote()
+    prune_caches()
+    global _LAST_COLLECT
+    _LAST_COLLECT = time.time()
+    return snap
+
+
+def render_frame(snap, view=None, sel=None, focus="workers", detail=None):
+    """Render a collected snapshot; touches no collector and no clock.
+
+    Returns (lines, rows, sel). `view` is the open panel: "agents",
     "models", "advice", "usage", "help", "detail", or None for the bare worker table.
 
     `rows` is what the cursor indexes for the focused table (workers or
     subagents). `sel` comes back clamped: sessions exit between frames, and a
     cursor left pointing past the end would silently address nothing.
     """
-    workers = collect_workers()
+    workers = snap["workers"]
     shown, _ = arrange(workers, expand_quiet=sel is not None and focus == "workers")
     worker_rows = [w for _, w in shown]
-    live_sids = set(w["session_id"] for w in workers if w.get("session_id"))
-    agents = []
-    if view in ("agents", "detail") or focus == "agents":
-        agents = collect_subagents(live_sids)
+    agents = snap["agents"]
     if focus == "agents":
         rows = agents
     else:
@@ -3350,7 +3387,7 @@ def frame(view=None, sel=None, focus="workers", detail=None):
         sel = min(sel, len(rows) - 1) if rows else None
     # Infra leads because it is a constant: one quiet line you skim past, which
     # is exactly the weight it deserves until something turns red.
-    lines = render_infra(infra_cached())
+    lines = render_infra(snap["infra"])
     win_note = window_config_note()
     if win_note:
         lines.append(c("WINDOW ", BOLD) + win_note)
@@ -3362,30 +3399,28 @@ def frame(view=None, sel=None, focus="workers", detail=None):
         lines.extend(render_subagents(
             agents, sel=sel if focus == "agents" else None))
     elif view == "detail":
-        kids = []
-        if detail and detail.get("session_id"):
-            kids = [a for a in agents if a.get("parent_sid") == detail.get("session_id")]
-            if not kids:
-                kids = collect_subagents({detail["session_id"]})
-        lines.extend(render_detail(detail, children=kids))
+        lines.extend(render_detail(detail, children=snap.get("detail_kids", [])))
     elif view == "models":
-        lines.extend(render_models(collect_local_models()))
+        lines.extend(render_models(snap.get("models")))
     elif view == "usage":
-        lines.extend(render_usage(collect_usage()))
+        lines.extend(render_usage(snap.get("usage")))
     elif view == "gateway":
-        lines.extend(render_gateway(collect_gateway()))
+        lines.extend(render_gateway(snap.get("gateway")))
     elif view == "remote":
-        lines.extend(render_remote(collect_remote()))
+        lines.extend(render_remote(snap.get("remote")))
     elif view == "help":
         lines.extend(render_help())
     elif view == "advice":
         lines.append("")
         lines.extend(advise(workers))
     lines.extend(render(workers, sel if focus == "workers" else None))
-    prune_caches()
-    global _LAST_COLLECT
-    _LAST_COLLECT = time.time()
     return lines, rows, sel
+
+
+def frame(view=None, sel=None, focus="workers", detail=None):
+    """Collect and render in one call -- the shape --once and tests rely on."""
+    snap = collect_snapshot(view, focus=focus, detail=detail)
+    return render_frame(snap, view, sel, focus=focus, detail=detail)
 
 
 def prune_caches():
@@ -3889,10 +3924,17 @@ def main():
     detail = None   # row shown in the DETAIL panel, or None
     pending = None  # the worker row awaiting a y/n answer
     note = None     # result of the last action, cleared by the next keypress
+    snap = None      # last collected snapshot -- a resize re-renders from it
+    collect_due = True  # ticks and keypresses collect; a bare resize does not
+    deadline = 0.0
     try:
         with KeyReader() as keys:
             while True:
-                lines, rows, sel = frame(view, sel, focus=focus, detail=detail)
+                if collect_due or snap is None:
+                    snap = collect_snapshot(view, focus=focus, detail=detail)
+                    deadline = time.time() + interval
+                    collect_due = False
+                lines, rows, sel = render_frame(snap, view, sel, focus=focus, detail=detail)
                 # A session can exit while its confirmation is on screen. Matching
                 # on pid rather than on the row dict is what makes that detectable:
                 # every frame rebuilds the dicts, so identity and equality both
@@ -3918,7 +3960,8 @@ def main():
                     status = note or ""
                 title = (c("roost", BOLD) + "  " + c(socket.gethostname(), CYAN)
                          + "  " + time.strftime("%H:%M:%S"))
-                cols = term_size()[0]
+                painted_size = term_size()
+                cols = painted_size[0]
                 reserve = 0
                 if keys.enabled and interactive:
                     tag = c(" EXPERIMENTAL ", BOLD, REVERSE, YELLOW)
@@ -3956,16 +3999,32 @@ def main():
                 paint(header + lines, vt)
 
                 # Sleep in slices so a keypress lands within ~0.2s rather than at
-                # the end of the tick.
-                deadline = time.time() + interval
+                # the end of the tick. Each idle slice also samples the terminal
+                # size: conhost has no SIGWINCH, so a polled compare is the
+                # portable resize signal. A changed size must hold steady for
+                # one full slice before the repaint fires -- a drag produces one
+                # repaint at the final size, not one per intermediate width --
+                # and the repaint comes from the cached snapshot: no collect
+                # runs and the collect deadline is left where it was, so the
+                # "updated Ns ago" chip keeps telling the truth.
+                resize_seen = None  # a new size waiting to prove it is stable
                 while True:
                     remaining = deadline - time.time()
                     if remaining <= 0:
+                        collect_due = True
                         break
                     key = keys.get(min(0.2, remaining))
                     if key is None:
+                        size = term_size()
+                        if size != painted_size:
+                            if size == resize_seen:
+                                break  # stable for a slice: repaint from cache
+                            resize_seen = size
+                        else:
+                            resize_seen = None
                         continue
                     note = None
+                    collect_due = True  # keypresses repaint from fresh data
 
                     # The confirmation swallows every key: only an explicit y
                     # stops a session, and q here cancels rather than quitting so
