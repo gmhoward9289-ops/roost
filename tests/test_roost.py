@@ -915,9 +915,10 @@ class TestFrameClamping(unittest.TestCase):
 
 
 class TestSnapshotRenderSplit(unittest.TestCase):
-    """A window resize repaints from the cached snapshot. That only works if
-    rendering truly runs no collector and leaves the collect clock alone --
-    otherwise the reflow would drag a full rescan in behind it, or the
+    """A window resize repaints from the cached snapshot -- and now does so
+    repeatedly, live, during a drag. That only works if rendering truly runs
+    no collector and leaves the collect clock alone -- otherwise every
+    mid-drag reflow would drag a full rescan in behind it, or the
     "updated Ns ago" chip would report paint age instead of data age."""
 
     PATCHED = ("collect_workers", "collect_infra", "collect_subagents",
@@ -949,7 +950,7 @@ class TestSnapshotRenderSplit(unittest.TestCase):
     def test_render_frame_runs_no_collector(self):
         snap = roost.collect_snapshot(view="models")
         self.assertEqual(self.calls, {"workers": 1, "models": 1})
-        for _ in range(3):  # a drag can repaint more than once
+        for _ in range(3):  # a drag repaints many times mid-flight now
             roost.render_frame(snap, view="models")
         self.assertEqual(self.calls, {"workers": 1, "models": 1})
 
@@ -972,6 +973,48 @@ class TestSnapshotRenderSplit(unittest.TestCase):
         self.assertEqual(self.calls["workers"], 1)
         self.assertEqual(len(rows), 1)
         self.assertEqual(sel, 0)
+
+
+class TestResizeThrottle(unittest.TestCase):
+    """Mid-drag the loop repaints live from cache, throttled; the settle
+    paint still lands once the drag stops. Driven on a fake clock -- the
+    policy takes `now` -- so a whole drag runs without sleeping."""
+
+    def test_first_change_paints_immediately(self):
+        rt = roost.ResizeThrottle(interval=0.12)
+        self.assertTrue(rt.poll((100, 40), (150, 40), now=10.0))
+
+    def test_mid_drag_paints_are_throttled(self):
+        rt = roost.ResizeThrottle(interval=0.12)
+        self.assertTrue(rt.poll((100, 40), (150, 40), 10.00))
+        # still moving, but inside the throttle window: no paint yet
+        self.assertFalse(rt.poll((99, 40), (100, 40), 10.05))
+        self.assertFalse(rt.poll((98, 40), (100, 40), 10.10))
+        # window elapsed: the next sampled width paints
+        self.assertTrue(rt.poll((97, 40), (100, 40), 10.13))
+
+    def test_settle_paint_lands_after_a_throttled_tail(self):
+        rt = roost.ResizeThrottle(interval=0.12)
+        self.assertTrue(rt.poll((100, 40), (150, 40), 10.00))  # painted at 100
+        self.assertFalse(rt.poll((95, 40), (100, 40), 10.05))  # throttled away
+        # The drag stopped at 95 but the last paint was at 100. The lasting
+        # mismatch buys the final settle paint once the window passes...
+        self.assertTrue(rt.poll((95, 40), (100, 40), 10.20))
+        # ...and a size that matches what was painted never paints again.
+        self.assertFalse(rt.poll((95, 40), (95, 40), 10.40))
+
+    def test_stable_size_never_paints(self):
+        rt = roost.ResizeThrottle()
+        for t in (1.0, 2.0, 3.0):
+            self.assertFalse(rt.poll((150, 40), (150, 40), t))
+
+    def test_slices_shorten_only_while_dragging(self):
+        rt = roost.ResizeThrottle()
+        self.assertEqual(rt.slice_len(10.0), 0.2)  # idle: keypress-latency slice
+        rt.poll((100, 40), (150, 40), 10.0)        # a drag starts
+        # sampling must outpace the throttle or the live paints never land
+        self.assertLess(rt.slice_len(10.1), rt.interval)
+        self.assertEqual(rt.slice_len(11.0), 0.2)  # quiet again: back off
 
 
 class TestTerminateGuard(unittest.TestCase):

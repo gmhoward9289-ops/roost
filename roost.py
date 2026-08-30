@@ -3594,6 +3594,47 @@ def term_size():
     return cols, rows
 
 
+RESIZE_REPAINT_S = 0.12  # minimum gap between live repaints during a drag
+
+
+class ResizeThrottle:
+    """Live repaint policy for a drag-resize.
+
+    The first cut of resize handling waited for the size to hold steady for a
+    full slice before repainting at all -- so mid-drag the terminal rewrapped
+    the stale frame into a jumble that only cleared once the drag stopped.
+    Now a moving size IS the signal: while it keeps changing, the loop
+    repaints from the cached snapshot at the current size, throttled to one
+    paint per RESIZE_REPAINT_S, and the mismatch left behind when the drag
+    stops buys the final paint at the settled size.
+
+    Pure decision logic over an injected clock, so tests can drive a whole
+    drag without sleeping. The loop owns the actual painting, which stays
+    render-from-cache: no collector runs and _LAST_COLLECT stays put.
+    """
+
+    def __init__(self, interval=RESIZE_REPAINT_S):
+        self.interval = interval
+        self._last_paint = 0.0
+        self._last_moving = 0.0
+
+    def poll(self, size, painted_size, now):
+        """True when the loop should repaint from cache at `size` now."""
+        if size == painted_size:
+            return False
+        self._last_moving = now
+        if now - self._last_paint < self.interval:
+            return False  # mid-drag, too soon: a later slice picks it up
+        self._last_paint = now
+        return True
+
+    def slice_len(self, now):
+        """Idle slice length for the key wait: shortened while a drag is in
+        flight so live repaints actually land at ~RESIZE_REPAINT_S cadence,
+        back to the keypress-latency slice once the size has gone quiet."""
+        return 0.05 if now - self._last_moving < 0.5 else 0.2
+
+
 def key_hint(width, interactive=False, view=None):
     """The footer key hint, degraded in a designed order rather than clipped.
 
@@ -3927,6 +3968,7 @@ def main():
     snap = None      # last collected snapshot -- a resize re-renders from it
     collect_due = True  # ticks and keypresses collect; a bare resize does not
     deadline = 0.0
+    resize = ResizeThrottle()  # outlives each frame so a drag stays throttled
     try:
         with KeyReader() as keys:
             while True:
@@ -3998,30 +4040,27 @@ def main():
                 header = [title, status, ""]
                 paint(header + lines, vt)
 
-                # Sleep in slices so a keypress lands within ~0.2s rather than at
-                # the end of the tick. Each idle slice also samples the terminal
-                # size: conhost has no SIGWINCH, so a polled compare is the
-                # portable resize signal. A changed size must hold steady for
-                # one full slice before the repaint fires -- a drag produces one
-                # repaint at the final size, not one per intermediate width --
-                # and the repaint comes from the cached snapshot: no collect
-                # runs and the collect deadline is left where it was, so the
-                # "updated Ns ago" chip keeps telling the truth.
-                resize_seen = None  # a new size waiting to prove it is stable
+                # Sleep in slices so a keypress lands within ~0.2s rather than
+                # at the end of the tick. Each idle slice also samples the
+                # terminal size: conhost has no SIGWINCH, so a polled compare
+                # is the portable resize signal. While a drag keeps the size
+                # moving, the loop repaints live from the cached snapshot --
+                # ResizeThrottle caps that at one paint per ~120ms and
+                # shortens the slices so those paints actually land -- and
+                # the mismatch left behind when the drag stops buys the final
+                # paint at the settled size. Every such repaint is pure
+                # render-from-cache: no collect runs and the collect deadline
+                # is left where it was, so the "updated Ns ago" chip keeps
+                # telling the truth.
                 while True:
                     remaining = deadline - time.time()
                     if remaining <= 0:
                         collect_due = True
                         break
-                    key = keys.get(min(0.2, remaining))
+                    key = keys.get(min(resize.slice_len(time.time()), remaining))
                     if key is None:
-                        size = term_size()
-                        if size != painted_size:
-                            if size == resize_seen:
-                                break  # stable for a slice: repaint from cache
-                            resize_seen = size
-                        else:
-                            resize_seen = None
+                        if resize.poll(term_size(), painted_size, time.time()):
+                            break  # live repaint from cache at the current size
                         continue
                     note = None
                     collect_due = True  # keypresses repaint from fresh data
