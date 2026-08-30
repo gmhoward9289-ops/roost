@@ -232,7 +232,7 @@ def cursor_workspace_storage():
 def cursor_folder_uri_to_path(uri):
     """Decode a workspace.json folder URI to a local path, or None.
 
-    Accepts file:///… only; vscode-remote:// and other schemes are skipped.
+    Accepts file:///... only; vscode-remote:// and other schemes are skipped.
     Windows drive URIs (file:///c%3A/Users/...) decode to a PureWindowsPath
     string on every host -- Path.resolve() on POSIX would otherwise treat
     'C:\\Users\\...' as relative to the runner cwd.
@@ -345,6 +345,10 @@ _CURSOR_HEADERS_OK = False
 
 # Live mode may paint the first frame before localhost INFRA probes finish.
 _INFRA_ALLOW_DEFER = False
+
+# When frame() last collected -- the header's "updated Ns ago" chip. None
+# until the first collect.
+_LAST_COLLECT = None
 
 # sessionId -> {"prev": last ctx_tokens, "t": last sample time, "hist": deque}.
 # In-memory only: the sparkline shows flow since roost started, nothing older.
@@ -604,6 +608,27 @@ BLUE = "\033[34m"
 MAGENTA = "\033[35m"
 CYAN = "\033[36m"
 
+# Selection is the one painted background: black on cyan.
+SEL = "\033[30;46m"
+
+
+def _ident_blue():
+    """The identity colour: bright blue, always paired with BOLD by callers.
+
+    Plain ANSI blue (4) is illegible on common dark palettes, so request
+    xterm-256 index 12 when the terminal reports 256 colours; elsewhere fall
+    back to plain blue and let the mandatory BOLD brighten it on 8-colour
+    terminals.
+    """
+    if ("256" in os.environ.get("TERM", "")
+            or os.environ.get("COLORTERM") in ("truecolor", "24bit")
+            or os.environ.get("WT_SESSION")):
+        return "\033[38;5;12m"
+    return BLUE
+
+
+IDENT_BLUE = _ident_blue()
+
 # Set once in main(), after we know whether the terminal can render escapes.
 COLOR = False
 
@@ -615,15 +640,17 @@ def c(text, *codes):
 
 
 def highlight(line):
-    """Reverse-video a whole line that already contains colour.
+    """Paint a whole line that already contains colour as the selection bar
+    (black on cyan -- the one painted background).
 
-    Every per-cell colour ends in RESET, which clears reverse video along with
-    the colour -- so a naive wrap highlights only up to the first coloured cell.
-    Re-arming after each RESET keeps the bar unbroken across the row.
+    Every per-cell colour ends in RESET, which clears the background along
+    with the colour -- so a naive wrap highlights only up to the first
+    coloured cell. Re-arming after each RESET keeps the bar unbroken across
+    the row.
     """
     if not COLOR:
         return line
-    return REVERSE + line.replace(RESET, RESET + REVERSE) + RESET
+    return SEL + line.replace(RESET, RESET + SEL) + RESET
 
 
 def ascii_safe(s):
@@ -1792,7 +1819,7 @@ def infra_cached():
     the INFRA line, then hands refreshing to a daemon thread. Staleness is
     bounded by INFRA_REFRESH_SECONDS plus one probe.
 
-    Live mode sets _INFRA_ALLOW_DEFER so the first paint can show "…" instead
+    Live mode sets _INFRA_ALLOW_DEFER so the first paint can show loading dots instead
     of waiting on three localhost connects (filtered ports time out on Windows).
     """
     global _INFRA_SNAPSHOT, _INFRA_THREAD
@@ -2691,7 +2718,11 @@ def dur(secs):
         return "%ds" % secs
     if secs < 3600:
         return "%dm" % (secs // 60)
-    return "%dh%02dm" % (secs // 3600, (secs % 3600) // 60)
+    if secs < 48 * 3600:
+        return "%dh%02dm" % (secs // 3600, (secs % 3600) // 60)
+    # Past two days, hours stop meaning anything: three days idle should read
+    # "3d", not "72h00m".
+    return "%dd" % (secs // 86400)
 
 
 def compact(n):
@@ -2865,10 +2896,11 @@ def render(workers, sel=None):
 
     if quiet:
         names = " . ".join(x["name"] for x in quiet[:12])
-        if len(quiet) > 12:
-            names += " . +%d" % (len(quiet) - 12)
+        # Attention colour, not dim: a list cut short must say so loudly
+        # enough to be seen, or the truncation is a lie.
+        tail = c(" . +%d" % (len(quiet) - 12), YELLOW) if len(quiet) > 12 else ""
         lines.append("")
-        lines.append(c("QUIET (%d)  " % len(quiet), BOLD, DIM) + c(names, DIM))
+        lines.append(c("QUIET (%d)  " % len(quiet), BOLD, DIM) + c(names, DIM) + tail)
 
     # Totals, because the per-row numbers do not add up in your head. The one
     # that matters is context held across the fleet: it is what a sweep would
@@ -2897,13 +2929,25 @@ def render(workers, sel=None):
     return lines
 
 
+def loading_dots():
+    """Animated loading marker, derived from the clock.
+
+    A static dim label is indistinguishable from a dead one; deriving the dot
+    count from time gives visible motion for free on interactive paints. This
+    is only ever called on the live path -- one-shot and pipe output never
+    render a loading state, so their bytes stay stable for snapshot tests.
+    Padded to its widest frame so the rest of the line never shifts.
+    """
+    return ("." * (int(time.time() * 2) % 3 + 1)).ljust(3)
+
+
 def render_infra(infra):
     """One horizontal line: it is always present and rarely the thing you need."""
     parts = []
     any_unseen = False
     for s in infra:
         if s["up"] is None:
-            mark = c("…", DIM)
+            mark = c(loading_dots(), DIM)
         elif s["up"]:
             mark = c("up", GREEN)
         elif s.get("unseen"):
@@ -3016,9 +3060,6 @@ def render_usage_caps(usage):
     return [label + "  ".join(parts) + suffix, ""]
 
 
-MODEL_COLORS = {"opus": MAGENTA, "sonnet": BLUE, "fable": CYAN, "haiku": GREEN}
-
-
 def style_cell(header, text, row):
     """Colour one padded cell. Padding is already applied, so widths are fixed."""
     if header == "CTX":
@@ -3035,10 +3076,13 @@ def style_cell(header, text, row):
         # grows, and colouring it would put warning colour on healthy rows and
         # compete with CTX, which is the column that actually says "act on me".
         return c(text, DIM)
+    if header == "WORKER":
+        # The identity role: bright blue, always bold. It used to sit unstyled
+        # while each model family claimed its own colour -- but a colour per
+        # model spends the semantic roles (magenta is divergence, cyan is
+        # chrome, green is ok) on a fact the MODEL column already states.
+        return c(text, BOLD, IDENT_BLUE)
     if header == "MODEL":
-        for family, code in MODEL_COLORS.items():
-            if family in (row["model"] or ""):
-                return c(text, code)
         return c(text, DIM)
     if header == "IDLE":
         # This 1-hour mark only dims the IDLE column for readability. The
@@ -3053,8 +3097,6 @@ def style_cell(header, text, row):
         return text
     if header == "NAME":
         return c(text, BOLD)
-    if header == "FLOW":
-        return c(text, CYAN)
     if header in ("TOKENS", "WIN", "PID"):
         return c(text, DIM)
     return text
@@ -3341,6 +3383,8 @@ def frame(view=None, sel=None, focus="workers", detail=None):
         lines.extend(advise(workers))
     lines.extend(render(workers, sel if focus == "workers" else None))
     prune_caches()
+    global _LAST_COLLECT
+    _LAST_COLLECT = time.time()
     return lines, rows, sel
 
 
@@ -3515,6 +3559,44 @@ def term_size():
     return cols, rows
 
 
+def key_hint(width, interactive=False, view=None):
+    """The footer key hint, degraded in a designed order rather than clipped.
+
+    It used to be one concatenated string ending "... h help | q quit",
+    hard-clipped at the right edge -- so the narrower the window, the sooner
+    q and h were destroyed, and they are the two hints with no other way to
+    be discovered. Now they are emitted first and survive every tier; the
+    optional chips append in a fixed order only while they fit.
+    """
+    def lit(key, on):
+        return c(key, BOLD, GREEN) if on else key
+
+    if interactive:
+        i_tag = c("i", BOLD, GREEN) + " interactive " + c("ARMED", BOLD, GREEN)
+        cur_tag = "j/k Tab Enter x y esc"
+    else:
+        i_tag = c("i", BOLD) + " interactive " + c("off  ", DIM)
+        cur_tag = c("j/k Tab Enter x y esc", DIM)
+    chips = [
+        "space refresh",
+        i_tag,
+        cur_tag,
+        lit("a", view == "advice") + " advice",
+        lit("s", view == "agents") + " agents",
+        lit("m", view == "models") + " models",
+        lit("u", view == "usage") + " usage",
+        lit("g", view == "gateway") + " gateway",
+        lit("r", view == "remote") + " remote",
+    ]
+    out = "q quit | " + lit("h", view == "help") + " help"
+    for chip in chips:
+        cand = out + " | " + chip
+        if visible_len(cand) > width:
+            break
+        out = cand
+    return out
+
+
 def paint(lines, vt):
     """Redraw in place.
 
@@ -3530,8 +3612,10 @@ def paint(lines, vt):
     if len(body) > rows - 1:
         hidden = len(body) - (rows - 2)
         body = body[: rows - 2] + [clip_ansi(
+            # Attention colour, not dim: this is the line that says the frame
+            # is lying about being complete.
             c("... %d more line(s) below -- taller window, or close a panel "
-              "(s/a/m/u/g/r/h)" % hidden, DIM), cols - 1)]
+              "(s/a/m/u/g/r/h)" % hidden, YELLOW), cols - 1)]
 
     # Version, bottom-right. Stamped onto whatever the last visible line turns
     # out to be -- including the overflow notice above -- so it cannot itself be
@@ -3793,7 +3877,7 @@ def main():
         # for many seconds while hundreds of finished transcripts were scanned.
         host = socket.gethostname()
         msg = (c("roost", BOLD) + "  " + c(host, CYAN)
-               + "  " + c("loading…", DIM) + "\n")
+               + "  " + c("loading" + loading_dots(), DIM) + "\n")
         sys.stdout.write("\033[H" + msg)
         sys.stdout.flush()
 
@@ -3808,35 +3892,6 @@ def main():
     try:
         with KeyReader() as keys:
             while True:
-                if not keys.enabled:
-                    hint = "Ctrl-C to stop"
-                else:
-                    # One hint for every state. Its text never changes when
-                    # interactive is armed or a cursor is raised -- only the
-                    # colours do -- so the header cannot reflow underfoot
-                    # ("off" is even padded to ARMED's width). The armed state
-                    # is spelled out, not just tinted: a lone green "i" reads
-                    # as decoration, and the one mode that can end a process
-                    # should never be ambiguous. Cursor keys sit dimmed until
-                    # they can do something.
-                    if interactive:
-                        i_tag = c("i", BOLD, GREEN) + " interactive " + c("ARMED", BOLD, GREEN)
-                        cur_tag = "j/k Tab Enter x y esc"
-                    else:
-                        i_tag = c("i", BOLD) + " interactive " + c("off  ", DIM)
-                        cur_tag = c("j/k Tab Enter x y esc", DIM)
-                    a_tag = c("a", BOLD, GREEN) if view == "advice" else "a"
-                    s_tag = c("s", BOLD, GREEN) if view == "agents" else "s"
-                    m_tag = c("m", BOLD, GREEN) if view == "models" else "m"
-                    u_tag = c("u", BOLD, GREEN) if view == "usage" else "u"
-                    g_tag = c("g", BOLD, GREEN) if view == "gateway" else "g"
-                    r_tag = c("r", BOLD, GREEN) if view == "remote" else "r"
-                    h_tag = c("h", BOLD, GREEN) if view == "help" else "h"
-                    hint = ("space refresh | %s | %s | %s advice | %s agents | "
-                            "%s models | %s usage | %s gateway | %s remote | "
-                            "%s help | q quit") % (
-                        i_tag, cur_tag, a_tag, s_tag, m_tag, u_tag, g_tag,
-                        r_tag, h_tag)
                 lines, rows, sel = frame(view, sel, focus=focus, detail=detail)
                 # A session can exit while its confirmation is on screen. Matching
                 # on pid rather than on the row dict is what makes that detectable:
@@ -3862,15 +3917,40 @@ def main():
                 else:
                     status = note or ""
                 title = (c("roost", BOLD) + "  " + c(socket.gethostname(), CYAN)
-                         + "  " + time.strftime("%H:%M:%S") + "   " + c(hint, DIM))
+                         + "  " + time.strftime("%H:%M:%S"))
+                cols = term_size()[0]
+                reserve = 0
+                if keys.enabled and interactive:
+                    tag = c(" EXPERIMENTAL ", BOLD, REVERSE, YELLOW)
+                    reserve = visible_len(tag) + 1
+                avail = cols - 1 - visible_len(title) - reserve
+                min_hint = len("q quit | h help") + 3
+                # Data age beside the clock. It sheds before the clock, never
+                # after it: the chip drops whole once the surviving hint tier
+                # no longer fits alongside, while the clock never sheds at all.
+                if _LAST_COLLECT is not None:
+                    upd = "updated %s ago" % dur(max(0, time.time() - _LAST_COLLECT))
+                    if avail - (len(upd) + 2) >= min_hint:
+                        title += "  " + c(upd, DIM)
+                        avail -= len(upd) + 2
+                if not keys.enabled:
+                    hint = "Ctrl-C to stop"
+                else:
+                    # The hint's chips never reword when interactive is armed
+                    # or a panel opens -- only the colours change, and "off" is
+                    # padded to ARMED's width -- so the header cannot reflow
+                    # underfoot. The armed state is spelled out, not just
+                    # tinted: the one mode that can end a process should never
+                    # be ambiguous.
+                    hint = key_hint(avail - 3, interactive, view)
+                title += "   " + c(hint, DIM)
                 if keys.enabled and interactive:
                     # Only while interactive mode is armed, because that is the
                     # half that can end a process. Reading the dashboard has
                     # never been the risky part. Pinned top-right so it sits
                     # above the table rather than anywhere the frame can clip
                     # it away.
-                    tag = c(" EXPERIMENTAL ", BOLD, REVERSE, YELLOW)
-                    pad = term_size()[0] - 1 - visible_len(title) - visible_len(tag)
+                    pad = cols - 1 - visible_len(title) - visible_len(tag)
                     title += " " * max(1, pad) + tag
                 header = [title, status, ""]
                 paint(header + lines, vt)

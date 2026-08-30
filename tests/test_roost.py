@@ -203,6 +203,13 @@ class TestDuration(unittest.TestCase):
         self.assertEqual(roost.dur(90), "1m")
         self.assertEqual(roost.dur(3661), "1h01m")
 
+    def test_days_take_over_past_48_hours(self):
+        """Three days idle should read '3d', not '72h00m' -- hours stop
+        meaning anything past the second day."""
+        self.assertEqual(roost.dur(47 * 3600), "47h00m")
+        self.assertEqual(roost.dur(48 * 3600), "2d")
+        self.assertEqual(roost.dur(3 * 86400), "3d")
+
 
 class TestAsciiSafe(unittest.TestCase):
     def test_replaces_non_renderable(self):
@@ -677,16 +684,189 @@ class TestCursor(unittest.TestCase):
             self.assertEqual(roost.visible_len(col), len(p))
 
     def test_highlight_rearms_after_every_reset(self):
-        """A per-cell RESET clears reverse video too, so a naive wrap highlights
-        only as far as the first coloured cell."""
+        """A per-cell RESET clears the selection background too, so a naive
+        wrap highlights only as far as the first coloured cell."""
         roost.COLOR = True
         line = roost.c("aa", roost.RED) + " " + roost.c("bb", roost.GREEN)
         out = roost.highlight(line)
-        self.assertEqual(out.count(roost.REVERSE), line.count(roost.RESET) + 1)
+        self.assertEqual(out.count(roost.SEL), line.count(roost.RESET) + 1)
         self.assertEqual(roost.visible_len(out), roost.visible_len(line))
+
+    def test_highlight_is_the_black_on_cyan_selection_bar(self):
+        """The charter's one painted background -- black on cyan, not bare
+        reverse video."""
+        roost.COLOR = True
+        self.assertEqual(roost.SEL, "\033[30;46m")
+        self.assertTrue(roost.highlight("row").startswith(roost.SEL))
 
     def test_highlight_is_a_noop_without_colour(self):
         self.assertEqual(roost.highlight("plain"), "plain")
+
+
+class TestKeyHint(unittest.TestCase):
+    """q and h have no other way to be discovered, so they survive every width
+    tier instead of being the first thing the right edge destroys."""
+
+    def setUp(self):
+        self._color = roost.COLOR
+        roost.COLOR = False
+
+    def tearDown(self):
+        roost.COLOR = self._color
+
+    def test_quit_and_help_lead_the_hint(self):
+        self.assertTrue(roost.key_hint(500).startswith("q quit | h help"))
+
+    def test_quit_and_help_survive_a_40_column_window(self):
+        hint = roost.key_hint(39)
+        self.assertIn("q quit", hint)
+        self.assertIn("h help", hint)
+        self.assertLessEqual(roost.visible_len(hint), 39)
+
+    def test_narrowest_tier_is_just_quit_and_help(self):
+        self.assertEqual(roost.key_hint(len("q quit | h help")),
+                         "q quit | h help")
+
+    def test_chips_append_in_a_fixed_order(self):
+        full = roost.key_hint(500)
+        order = ["q quit", "h help", "space refresh", "interactive",
+                 "a advice", "s agents", "m models", "u usage",
+                 "g gateway", "r remote"]
+        positions = [full.index(chunk) for chunk in order]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_never_exceeds_the_given_width(self):
+        floor = len("q quit | h help")
+        for w in range(0, 200, 7):
+            self.assertLessEqual(roost.visible_len(roost.key_hint(w)),
+                                 max(w, floor))
+
+    def test_armed_and_off_keep_one_width(self):
+        """The mode chip is fixed-width ('off  ' pads to ARMED) so arming
+        never reflows the header."""
+        roost.COLOR = True
+        on = roost.key_hint(500, interactive=True)
+        off = roost.key_hint(500, interactive=False)
+        self.assertEqual(roost.visible_len(on), roost.visible_len(off))
+
+
+class TestAttentionNotices(unittest.TestCase):
+    """Truncation notices take the attention colour, not dim: a list cut
+    short must say so loudly enough to be seen."""
+
+    def setUp(self):
+        self._color = roost.COLOR
+        roost.COLOR = True
+
+    def tearDown(self):
+        roost.COLOR = self._color
+
+    def test_quiet_overflow_tail_is_yellow(self):
+        rows = [worker(name="q%02d" % i, idle_secs=9000, ctx_tokens=100)
+                for i in range(15)]
+        out = roost.render(rows)
+        quiet_line = next(ln for ln in out if "QUIET" in ln)
+        self.assertIn(roost.YELLOW + " . +3", quiet_line)
+
+    def test_quiet_within_the_cap_has_no_yellow_tail(self):
+        rows = [worker(name="q%02d" % i, idle_secs=9000, ctx_tokens=100)
+                for i in range(12)]
+        out = roost.render(rows)
+        quiet_line = next(ln for ln in out if "QUIET" in ln)
+        self.assertNotIn(roost.YELLOW, quiet_line)
+
+    def test_paint_overflow_notice_is_yellow_not_dim(self):
+        term = roost.term_size
+        roost.term_size = lambda: (100, 12)
+        buf = io.StringIO()
+        stdout = sys.stdout
+        sys.stdout = buf
+        try:
+            roost.paint(["line %d" % i for i in range(40)], vt=False)
+        finally:
+            sys.stdout = stdout
+            roost.term_size = term
+        last = buf.getvalue().splitlines()[-1]
+        self.assertIn("more line(s) below", last)
+        self.assertTrue(last.startswith(roost.YELLOW))
+
+
+class TestSemanticRoles(unittest.TestCase):
+    """Colour is spent by role: identity on the worker name, secondary on the
+    model code, chrome cyan kept for chrome."""
+
+    def setUp(self):
+        self._color = roost.COLOR
+        roost.COLOR = True
+
+    def tearDown(self):
+        roost.COLOR = self._color
+
+    def test_worker_name_takes_the_identity_role(self):
+        cell = roost.style_cell("WORKER", "demo-a1", worker())
+        self.assertTrue(cell.startswith(roost.BOLD + roost.IDENT_BLUE))
+
+    def test_model_code_is_secondary_for_every_family(self):
+        for m in ("claude-opus-5", "claude-sonnet-5", "claude-fable-5",
+                  "claude-haiku-4"):
+            cell = roost.style_cell("MODEL", m, worker(model=m))
+            self.assertEqual(cell, roost.DIM + m + roost.RESET)
+
+    def test_flow_is_not_chrome_cyan(self):
+        cell = roost.style_cell("FLOW", "..:-=+", worker())
+        self.assertNotIn(roost.CYAN, cell)
+
+    def test_identity_blue_upgrades_on_256_colour_terminals(self):
+        saved = {k: os.environ.get(k) for k in ("TERM", "COLORTERM", "WT_SESSION")}
+        try:
+            os.environ["TERM"] = "xterm-256color"
+            os.environ.pop("COLORTERM", None)
+            os.environ.pop("WT_SESSION", None)
+            self.assertEqual(roost._ident_blue(), "\033[38;5;12m")
+            os.environ["TERM"] = "vt100"
+            self.assertEqual(roost._ident_blue(), roost.BLUE)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
+class TestLoadingDots(unittest.TestCase):
+    """Loading animates on the interactive path: a static dim label is
+    indistinguishable from a dead one."""
+
+    def test_dots_animate_with_the_clock(self):
+        real = roost.time.time
+        seen = set()
+        try:
+            for t in (0.0, 0.5, 1.0, 1.5):
+                roost.time.time = lambda t=t: t
+                seen.add(roost.loading_dots())
+        finally:
+            roost.time.time = real
+        self.assertEqual(seen, {".  ", ".. ", "..."})
+
+    def test_dots_are_fixed_width_so_the_line_never_shifts(self):
+        real = roost.time.time
+        try:
+            for t in (0.0, 0.5, 1.0):
+                roost.time.time = lambda t=t: t
+                self.assertEqual(len(roost.loading_dots()), 3)
+        finally:
+            roost.time.time = real
+
+    def test_deferred_infra_marker_stays_ascii(self):
+        """The file is ASCII-dialect by stance; no lone ellipsis codepoint."""
+        color = roost.COLOR
+        roost.COLOR = False
+        try:
+            line = roost.render_infra(
+                [{"name": "ollama", "port": 11434, "up": None, "detail": ""}])[0]
+        finally:
+            roost.COLOR = color
+        self.assertTrue(all(ord(ch) < 128 for ch in line), line)
 
 
 class TestFrameClamping(unittest.TestCase):
@@ -1713,8 +1893,8 @@ class TestRenderGateway(unittest.TestCase):
             probed_at=probed, runs=[self.batch(last_write_secs=117 * 3600)])))
         self.assertIn("probed 21:04:15", out)
         self.assertIn("LAST WRITE", out)
-        self.assertIn("117h00m ago", out)
-        self.assertNotRegex(out, r"(?m)^GATEWAY\s+117h")
+        self.assertIn("4d ago", out)  # 117h -- past 48h, ages read in days
+        self.assertNotRegex(out, r"(?m)^GATEWAY\s+4d")
 
 
 class TestRemoteHosts(unittest.TestCase):
