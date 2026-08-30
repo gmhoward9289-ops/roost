@@ -139,6 +139,18 @@ Disable colour. Colour is also suppressed when
 .B NO_COLOR
 is set in the environment or when output is not a terminal.
 .TP
+.B \-\-ascii
+Force the ASCII glyph dialect. By default an interactive UTF\-8 terminal
+gets the Unicode tier \(em rounded frames around the panels, liveness dots,
+check/cross marks, real ellipses \(em while a legacy\-codepage console,
+pipes,
+.BR \-\-once ,
+and
+.B \-\-json
+always render ASCII.
+.B ROOST_ASCII=1
+in the environment does the same.
+.TP
 .B \-\-no\-log
 Do not record stopped sessions. See
 .B LOGGING
@@ -278,6 +290,10 @@ exits 0 unless it could not parse its arguments.
 If set to any value, colour output is disabled. See
 .UR https://no-color.org
 .UE .
+.TP
+.B ROOST_ASCII
+If set to any value, forces the ASCII glyph dialect \(em same as
+.BR \-\-ascii .
 .TP
 .B ROOST_OLLAMA_PORT
 Ollama port for the INFRA panel, default 11434. A CLI flag of the same shape

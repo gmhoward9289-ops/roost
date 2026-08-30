@@ -2930,5 +2930,175 @@ class TestShellCompletion(unittest.TestCase):
         self.assertIn("--gateway", out)
 
 
+class _FakeStdout(object):
+    def __init__(self, tty=True, encoding="utf-8"):
+        self._tty = tty
+        self.encoding = encoding
+
+    def isatty(self):
+        return self._tty
+
+
+def _agent(**kw):
+    base = {"state": "working", "agent_type": "Explore", "agent_id": "abc123def0",
+            "parent_sid": "sid-1", "model": "claude-opus-5", "ctx_tokens": 48000,
+            "ctx_pct": 24.0, "window": "200k", "idle_secs": 5.0, "task": "scout"}
+    base.update(kw)
+    return base
+
+
+class TestGlyphDialects(unittest.TestCase):
+    """Two dialects, one vocabulary -- chosen by the terminal, not the product.
+
+    The Unicode tier (frames, dots, checks, real ellipses) may only appear on
+    an interactive UTF-8 stdout; the ASCII tier is the fallback and always the
+    dialect of pipe-safe output. The ASCII bytes are load-bearing: every other
+    test in this file asserts against them, so these tests also pin that the
+    module default stays ASCII and that Unicode never leaks into a pipe."""
+
+    def setUp(self):
+        roost.COLOR = False
+        self._env = os.environ.pop(roost.ASCII_ENV, None)
+
+    def tearDown(self):
+        roost.set_dialect(False)
+        if self._env is not None:
+            os.environ[roost.ASCII_ENV] = self._env
+        else:
+            os.environ.pop(roost.ASCII_ENV, None)
+
+    # ---- the probe, forced both ways ----------------------------------------
+
+    def test_utf8_tty_probes_unicode(self):
+        self.assertTrue(roost.probe_unicode(_FakeStdout(tty=True, encoding="utf-8")))
+        self.assertTrue(roost.probe_unicode(_FakeStdout(tty=True, encoding="UTF-8")))
+        self.assertTrue(roost.probe_unicode(_FakeStdout(tty=True, encoding="cp65001")))
+
+    def test_legacy_codepage_tty_stays_ascii(self):
+        self.assertFalse(roost.probe_unicode(_FakeStdout(tty=True, encoding="cp1252")))
+
+    def test_pipe_stays_ascii_whatever_it_claims_to_encode(self):
+        self.assertFalse(roost.probe_unicode(_FakeStdout(tty=False, encoding="utf-8")))
+
+    def test_env_override_forces_ascii_on_a_capable_terminal(self):
+        os.environ[roost.ASCII_ENV] = "1"
+        self.assertFalse(roost.probe_unicode(_FakeStdout(tty=True, encoding="utf-8")))
+
+    def test_pipe_safe_modes_never_consult_the_terminal(self):
+        # --once and --json pin ASCII even on a UTF-8 tty.
+        tty = _FakeStdout(tty=True, encoding="utf-8")
+        self.assertFalse(roost.choose_dialect(True, False, stdout=tty))
+        self.assertFalse(roost.choose_dialect(False, True, stdout=tty))
+        self.assertTrue(roost.choose_dialect(False, False, stdout=tty))
+
+    def test_module_default_is_ascii(self):
+        # Import-time callers (tests, --json before main wires anything) must
+        # land on the historical bytes without any setup call.
+        self.assertFalse(roost.UNICODE)
+        self.assertIs(roost.GLYPHS, roost._GLYPHS_ASCII)
+
+    # ---- Unicode tier rendering ---------------------------------------------
+
+    def test_unicode_frames_the_subagents_panel(self):
+        roost.set_dialect(True)
+        lines = roost.render_subagents([_agent()])
+        self.assertEqual(lines[0], "")
+        self.assertTrue(lines[1].startswith("╭─ SUBAGENTS ─"), repr(lines[1]))
+        self.assertTrue(lines[1].endswith("╮"))
+        self.assertTrue(lines[-1].startswith("╰"))
+        self.assertTrue(lines[-1].endswith("╯"))
+        for body in lines[2:-1]:
+            self.assertTrue(body.startswith("│") and body.endswith("│"),
+                            repr(body))
+
+    def test_liveness_dots_in_the_state_slot(self):
+        roost.set_dialect(True)
+        out = "\n".join(roost.render_subagents(
+            [_agent(state="working"), _agent(state="idle", agent_id="ffff000000")]))
+        self.assertIn("● working", out)
+        self.assertIn("○ idle", out)
+
+    def test_infra_marks_gain_check_and_cross_but_off_stays_textual(self):
+        roost.set_dialect(True)
+        out = "\n".join(roost.render_infra([
+            {"name": "ollama", "port": 11434, "up": True, "detail": ""},
+            {"name": "litellm", "port": 4000, "up": False, "detail": ""},
+            {"name": "openwebui", "port": 8080, "up": False, "unseen": True,
+             "detail": ""}]))
+        self.assertIn("✓ up", out)
+        self.assertIn("✗ DOWN", out)
+        self.assertIn("off?", out)
+        self.assertNotIn("✓ off", out)
+        self.assertNotIn("✗ off", out)
+        self.assertTrue(out.splitlines()[0].startswith("╭─ INFRA ─"))
+
+    def test_quiet_joiner_and_overflow_ellipsis(self):
+        roost.set_dialect(True)
+        quiet = [worker(name="q%d" % i, idle_secs=7200.0, ctx_tokens=1000,
+                        ctx_pct=1.0, session_id="s%d" % i) for i in range(3)]
+        out = "\n".join(roost.render(quiet))
+        self.assertIn(" · ", out)
+        self.assertNotIn(" . ", out)
+        # The context bar stays ASCII in both dialects.
+        self.assertIn("[", "\n".join(roost.render([worker(idle_secs=5.0)])))
+
+    def test_frame_respects_forty_columns(self):
+        roost.set_dialect(True)
+        lines = roost.frame_panel("GATEWAY", ["x" * 100, "short"], cols=40)
+        for ln in lines:
+            self.assertLessEqual(roost.visible_len(ln), 39, repr(ln))
+
+    def test_no_mixed_frames(self):
+        # Every glyph inside a Unicode frame comes from the Unicode table:
+        # no "..." elision or " . " joiner may appear in framed output.
+        roost.set_dialect(True)
+        rows = [_agent()] + [_agent(agent_id="%010d" % i) for i in range(2)]
+        out = "\n".join(roost.render_subagents(rows))
+        self.assertNotIn("...", out)
+
+    # ---- ASCII byte-identity ------------------------------------------------
+
+    def _snapshot(self):
+        return {"workers": [worker(idle_secs=5.0)],
+                "agents": [_agent()],
+                "infra": [{"name": "ollama", "port": 11434, "up": True,
+                           "detail": "1 model"},
+                          {"name": "litellm", "port": 4000, "up": False,
+                           "detail": ""}]}
+
+    def test_ascii_frame_is_pure_ascii(self):
+        # The --once path renders exactly this with the module-default dialect:
+        # no dialect glyph may leak into pipe output.
+        lines, _, _ = roost.render_frame(self._snapshot(), view="agents")
+        for ln in lines:
+            for ch in ln:
+                self.assertLess(ord(ch), 127, repr(ln))
+
+    def test_ascii_bytes_unchanged_by_dialect_machinery(self):
+        # Render once with the machinery in its default state, then flip to
+        # Unicode and back: the ASCII output must be byte-identical, because
+        # --once/--json snapshots and every other test assert on those bytes.
+        before, _, _ = roost.render_frame(self._snapshot(), view="agents")
+        roost.set_dialect(True)
+        roost.set_dialect(False)
+        after, _, _ = roost.render_frame(self._snapshot(), view="agents")
+        self.assertEqual(before, after)
+        joined = "\n".join(before)
+        self.assertIn("INFRA  ", joined)
+        self.assertIn("SUBAGENTS", joined)
+        self.assertIn("DOWN", joined)
+        self.assertNotIn("╭", joined)
+
+    def test_unicode_render_frame_frames_every_panel(self):
+        roost.set_dialect(True)
+        lines, _, _ = roost.render_frame(self._snapshot(), view="agents")
+        joined = "\n".join(lines)
+        self.assertIn("╭─ INFRA ─", joined)
+        self.assertIn("╭─ SUBAGENTS ─", joined)
+        # The worker table itself stays unframed: its bucket gutter, cursor
+        # marker, and QUIET collapse line are a layout of their own.
+        self.assertIn("WORKER", joined)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -172,6 +172,7 @@ roost --json       joined records, for piping
 | `-1`, `--once` | print one frame and exit |
 | `--json` | emit workers, subagents, and infra as JSON, then exit — for piping |
 | `--no-color` | disable colour (also off when `NO_COLOR` is set or stdout is not a tty) |
+| `--ascii` | force the ASCII glyph dialect (also `ROOST_ASCII=1`); an interactive UTF-8 terminal otherwise gets rounded panel frames and Unicode glyphs, while pipes, `--once` and `--json` are always ASCII |
 | `--advise` | start with the ADVICE panel open (toggle live with `a`) |
 | `--no-agents` | start with the SUBAGENTS panel closed (toggle live with `s`) |
 | `--models` | start with the LOCAL MODELS panel open (toggle live with `m`) |

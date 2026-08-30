@@ -659,6 +659,10 @@ def ascii_safe(s):
 
     Task text is free-form prose and often carries em dashes and smart quotes;
     the Windows console codepage turns those into replacement blobs mid-table.
+    Deliberately dialect-independent: transcript *data* is stripped even in
+    the Unicode dialect (it can contain anything, including width-breaking
+    characters), while the dialect table's own glyphs are added by the render
+    layer around this gate and never pass through it.
     """
     if not s:
         return ""
@@ -706,6 +710,128 @@ def clip_ansi(s, width):
     if COLOR:
         out.append(RESET)
     return "".join(out)
+
+
+# ---- glyph dialects ---------------------------------------------------------
+# Two dialects, one vocabulary -- chosen by the terminal, not the product
+# (docs/design-language.md in leghorn). The Unicode tier is the preferred
+# rendering wherever it can display: rounded frames around the panels, liveness
+# dots, check/cross marks, real ellipses and middle-dot separators. The ASCII
+# tier is the fallback and *always* the dialect of pipe-safe output: pipes,
+# --once, and --json keep their historical bytes exactly. Every glyph comes
+# from the active table -- a frame must never mix dialects.
+#
+# The [###---] context bars stay ASCII in both dialects on purpose: they are a
+# data texture, not vocabulary, and the hash bar is legible everywhere.
+
+ASCII_ENV = "ROOST_ASCII"
+
+# Marker entries carry their own trailing space so the ASCII entry can be the
+# empty string without leaving a stray gap in front of the word it decorates.
+_GLYPHS_UNICODE = {
+    "ok": "✓ ",        # check mark before a green "up"
+    "fail": "✗ ",      # cross before a bold-red DOWN (the word stays)
+    "working": "● ",   # liveness dot: working
+    "idle": "○ ",      # liveness dot: idle / parked
+    "ell": "…",        # elision
+    "sep": "·",        # list separator (the QUIET joiner)
+    "tl": "╭", "tr": "╮", "bl": "╰", "br": "╯",
+    "h": "─", "v": "│",
+}
+_GLYPHS_ASCII = {
+    "ok": "", "fail": "", "working": "", "idle": "",
+    "ell": "...", "sep": ".",
+    # No frame entries: the ASCII dialect draws bold bare titles, never boxes.
+}
+
+# Module default is ASCII, which keeps every import-time caller (tests, --json,
+# --once) on the historical byte-identical output. Only main()'s live path may
+# switch, once, after probing the terminal.
+UNICODE = False
+GLYPHS = _GLYPHS_ASCII
+
+
+def set_dialect(unicode_on):
+    """Select the glyph table once for the whole session."""
+    global UNICODE, GLYPHS
+    UNICODE = bool(unicode_on)
+    GLYPHS = _GLYPHS_UNICODE if UNICODE else _GLYPHS_ASCII
+
+
+def probe_unicode(stdout=None):
+    """True when stdout is an interactive terminal that speaks UTF-8.
+
+    The legacy-codepage Windows console fails the encoding check and keeps
+    ASCII; Windows Terminal (and every modern Unix terminal) passes. A pipe is
+    never interactive, so redirected output can never pick up the Unicode
+    tier no matter what encoding it reports. ROOST_ASCII=1 forces the ASCII
+    dialect regardless -- the escape hatch for a terminal that lies.
+    """
+    if os.environ.get(ASCII_ENV):
+        return False
+    out = stdout if stdout is not None else sys.stdout
+    try:
+        if not out.isatty():
+            return False
+    except (AttributeError, ValueError):
+        return False
+    enc = (getattr(out, "encoding", "") or "").replace("-", "").replace("_", "").lower()
+    return enc in ("utf8", "cp65001")
+
+
+def choose_dialect(pipe_safe, force_ascii, stdout=None):
+    """The startup decision: pipe-safe modes (--once, --json) and an explicit
+    --ascii both pin the ASCII dialect before the terminal is even consulted."""
+    if pipe_safe or force_ascii:
+        return False
+    return probe_unicode(stdout)
+
+
+def frame_panel(title, body, cols=None):
+    """Wrap rendered panel lines in a rounded frame -- Unicode dialect only.
+
+    Chrome cyan at dim weight, uppercase title inset two columns and painted
+    bold, matching leghorn's Pane.frame. Width hugs the widest body line but
+    never reaches the terminal's last column (a glyph in the final cell wraps
+    onto the next row and persists). The ASCII dialect never calls this: its
+    panels keep their bold bare titles, byte-identical to the historical
+    output.
+    """
+    if cols is None:
+        cols = term_size()[0]
+    label = " %s " % title
+    inner = max([visible_len(ln) for ln in body] + [len(label) + 4])
+    inner = min(inner, cols - 3)
+    label = label[: max(0, inner - 2)]
+    top = (c(GLYPHS["tl"] + GLYPHS["h"], CYAN, DIM)
+           + c(label, BOLD, CYAN)
+           + c(GLYPHS["h"] * max(0, inner - 1 - len(label)) + GLYPHS["tr"],
+               CYAN, DIM))
+    edge = c(GLYPHS["v"], CYAN, DIM)
+    out = [top]
+    for ln in body:
+        clipped = clip_ansi(ln, inner)
+        out.append(edge + clipped + " " * (inner - visible_len(clipped)) + edge)
+    out.append(c(GLYPHS["bl"] + GLYPHS["h"] * inner + GLYPHS["br"], CYAN, DIM))
+    return out
+
+
+def panel(title, body, extra=None):
+    """Assemble one titled panel in the active dialect.
+
+    Unicode: a rounded frame with the title inset on the top border. ASCII:
+    the historical bold bare title line, byte-identical to what it always
+    printed. `extra` is the dim annotation the ASCII title line carries after
+    the name (e.g. DETAIL's "esc returns"); in the Unicode dialect the title
+    lives on the border, so the annotation becomes the first body line.
+    """
+    if UNICODE:
+        inner = ([c("  " + extra, DIM)] if extra else []) + body
+        return [""] + frame_panel(title, inner)
+    head = c(title, BOLD)
+    if extra:
+        head += "  " + c(extra, DIM)
+    return ["", head] + body
 
 
 def alive(pid):
@@ -2235,12 +2361,12 @@ def render_gateway(gw):
     """LiteLLM plus everything it has been fed, without asking it anything --
     a DB-less gateway keeps no history, so the batch pipeline's own output
     files carry the progress story."""
-    title = c("GATEWAY", BOLD)
     probed = gw.get("probed_at")
-    if probed is not None:
-        title += "  " + c("probed " + time.strftime("%H:%M:%S", time.localtime(probed)), DIM)
-    lines = ["", title]
-    mark = c("up", GREEN) if gw["litellm_up"] else c("DOWN", BOLD, RED)
+    extra = ("probed " + time.strftime("%H:%M:%S", time.localtime(probed))
+             if probed is not None else None)
+    lines = []
+    mark = (c(GLYPHS["ok"] + "up", GREEN) if gw["litellm_up"]
+            else c(GLYPHS["fail"] + "DOWN", BOLD, RED))
     head = "  litellm %s (127.0.0.1:%d)" % (mark, LITELLM_PORT)
     if gw["last_req_secs"] is not None:
         head += "   last request %s ago" % dur(gw["last_req_secs"])
@@ -2287,7 +2413,7 @@ def render_gateway(gw):
 
     if not gw["runs"]:
         lines.append(c("  no batch runs found", DIM))
-        return lines
+        return panel("GATEWAY", lines, extra=extra)
 
     cols = [
         ("BATCH RUN", lambda r: r["name"]),
@@ -2314,7 +2440,7 @@ def render_gateway(gw):
         lines.append(c(line, GREEN) if r["active"] else c(line, DIM))
     active = sum(1 for r in gw["runs"] if r["active"])
     lines.append("  " + c("%d run(s), %d active" % (len(gw["runs"]), active), DIM))
-    return lines
+    return panel("GATEWAY", lines, extra=extra)
 
 
 # host -> {"data", "t", "err", "thread"}. Fetches run on daemon threads so a
@@ -2386,10 +2512,10 @@ def render_remote(remotes):
     """One summary row per remote host, rendered from that host's own
     `roost --json` over ssh. Data is cached: a host that stops answering keeps
     its last good row with the age saying how old it is."""
-    lines = ["", c("REMOTE", BOLD)]
     if not remotes:
-        lines.append(c("  set %s (comma-separated ssh aliases)" % REMOTES_ENV, DIM))
-        return lines
+        return panel("REMOTE", [
+            c("  set %s (comma-separated ssh aliases)" % REMOTES_ENV, DIM)])
+    lines = []
 
     cols = [
         ("HOST", lambda r: r["host"]),
@@ -2406,7 +2532,7 @@ def render_remote(remotes):
         if d is None:
             view.append({"host": r["host"], "nworkers": "-", "working": "-",
                          "resident": "-", "batch": "-", "jobs": "-",
-                         "age": "fetching..." if r["fetching"]
+                         "age": "fetching" + GLYPHS["ell"] if r["fetching"]
                                 else (r["err"] or "-"), "stale": True})
             continue
         workers = d.get("workers") or []
@@ -2453,7 +2579,7 @@ def render_remote(remotes):
             else:
                 cells.append(txt)
         lines.append("  " + "  ".join(cells))
-    return lines
+    return panel("REMOTE", lines)
 
 
 def parse_budget(s):
@@ -2557,15 +2683,15 @@ def collect_usage():
 
 
 def render_usage(days):
-    lines = ["", c("USAGE", BOLD) + "  "
-             + c("observed transcript tokens (input+output) -- an estimate, "
-                 "not the Anthropic meter", DIM)]
+    extra = ("observed transcript tokens (input+output) -- an estimate, "
+             "not the Anthropic meter")
+    lines = []
     # Day keys come from transcript timestamps, which are UTC -- so the day
     # boundary is UTC too. Keep only the window and newest first.
     recent = sorted(days, reverse=True)[:USAGE_DAYS]
     if not recent:
         lines.append(c("  nothing recorded in the last %d days" % USAGE_DAYS, DIM))
-        return lines
+        return panel("USAGE", lines, extra=extra)
 
     today = time.strftime("%Y-%m-%d", time.gmtime())
     rows = []
@@ -2607,7 +2733,7 @@ def render_usage(days):
         lines.append("  " + c("set %s (e.g. 60M) to measure against your plan -- "
                               "calibrate the number from /usage once" % USAGE_BUDGET_ENV,
                               DIM))
-    return lines
+    return panel("USAGE", lines, extra=extra)
 
 
 # ---- advisory thresholds ----------------------------------------------------
@@ -2642,7 +2768,8 @@ def advise(workers):
         # abandon, "migrate the database" is not.
         task = ascii_safe(r.get("task") or "")
         if len(task) > ADVICE_TASK_WIDTH:
-            task = task[:ADVICE_TASK_WIDTH - 3] + "..."
+            ell = GLYPHS["ell"]
+            task = task[:ADVICE_TASK_WIDTH - len(ell)] + ell
         saving = tok - TYPICAL_BASELINE
 
         if tok >= EXPENSIVE_TOKENS and idle_h >= PARKED_IDLE_HOURS:
@@ -2671,10 +2798,11 @@ def advise(workers):
                         "idle %.1fh at %.0f%%. Costs nothing while it sits, but it hides "
                         "the sessions that matter -- close it." % (idle_h, pct)))
 
-    lines = [c("ADVICE", BOLD)]
     if not out:
-        lines.append("  nothing to act on -- no parked, oversized, or stale sessions")
-        return lines
+        return panel(
+            "ADVICE",
+            ["  nothing to act on -- no parked, oversized, or stale sessions"])
+    lines = []
     for _, label, tag, task, text in sorted(out, key=lambda x: -x[0]):
         head = "  %s  %s" % (label, c(tag, BOLD))
         if task:
@@ -2690,7 +2818,7 @@ def advise(workers):
                      "same %d sessions started fresh would cost %s -- a %.1fx difference."
                      % (len(workers), c("{:,}".format(total), BOLD), len(workers),
                         "{:,}".format(ideal), total / float(ideal)))
-    return lines
+    return panel("ADVICE", lines)
 
 
 def growth(history):
@@ -2765,7 +2893,9 @@ def bar(pct):
 
     Carries what a WIN column used to: a short bar beside a large token count
     reads as "big window, room to spare" without a separate column saying so.
-    ASCII only -- block-drawing characters mojibake in the Windows console.
+    ASCII in both dialects on purpose: the bar is a data texture, not glyph
+    vocabulary, and [###---] is legible everywhere including the
+    legacy-codepage Windows console.
     """
     if pct is None:
         return "[" + " " * BAR_WIDTH + "]"
@@ -2896,10 +3026,11 @@ def render(workers, sel=None):
         lines.append(highlight(line) if i == sel else line)
 
     if quiet:
-        names = " . ".join(x["name"] for x in quiet[:12])
+        names = (" %s " % GLYPHS["sep"]).join(x["name"] for x in quiet[:12])
         # Attention colour, not dim: a list cut short must say so loudly
         # enough to be seen, or the truncation is a lie.
-        tail = c(" . +%d" % (len(quiet) - 12), YELLOW) if len(quiet) > 12 else ""
+        tail = (c(" %s +%d" % (GLYPHS["sep"], len(quiet) - 12), YELLOW)
+                if len(quiet) > 12 else "")
         lines.append("")
         lines.append(c("QUIET (%d)  " % len(quiet), BOLD, DIM) + c(names, DIM) + tail)
 
@@ -2950,22 +3081,26 @@ def render_infra(infra):
         if s["up"] is None:
             mark = c(loading_dots(), DIM)
         elif s["up"]:
-            mark = c("up", GREEN)
+            mark = c(GLYPHS["ok"] + "up", GREEN)
         elif s.get("unseen"):
             # Never answered on an untouched default port: probably not a
             # crashed service but a port we were never told about, so no red.
+            # Stays textual in both dialects -- off? is the unseen state, and
+            # it must not read like either the check or the cross.
             mark = c("off?", DIM)
             any_unseen = True
         else:
-            mark = c("DOWN", BOLD, RED)
+            mark = c(GLYPHS["fail"] + "DOWN", BOLD, RED)
         extra = ""
         if s["up"] and s["detail"]:
             extra = " " + c(s["detail"], CYAN)
         parts.append("%s:%d %s%s" % (c(s["name"], BOLD), s["port"], mark, extra))
-    line = c("INFRA  ", BOLD) + "   ".join(parts)
+    body = "   ".join(parts)
     if any_unseen:
-        line += "   " + c("off? = never up here; set ROOST_*_PORT if it runs elsewhere", DIM)
-    return [line, ""]
+        body += "   " + c("off? = never up here; set ROOST_*_PORT if it runs elsewhere", DIM)
+    if UNICODE:
+        return frame_panel("INFRA", [" " + body]) + [""]
+    return [c("INFRA  ", BOLD) + body, ""]
 
 
 def _pct_color(pct):
@@ -3106,13 +3241,17 @@ def style_cell(header, text, row):
 def render_subagents(agents, sel=None):
     """Subagents are the work a session farmed out -- and they are invisible in
     any pid-based view, since they share the parent's process."""
-    lines = ["", c("SUBAGENTS", BOLD)]
     if not agents:
-        lines.append(c("  none running", DIM))
-        return lines
+        return panel("SUBAGENTS", [c("  none running", DIM)])
+    lines = []
 
     cols = [
-        ("STATE", lambda r: r["state"]),
+        # The STATE cell is the one marker slot this table has, so it carries
+        # the liveness dot in the Unicode dialect (empty-string glyphs in
+        # ASCII): filled while working, hollow otherwise. The word stays --
+        # the dot is reinforcement, not replacement.
+        ("STATE", lambda r: (GLYPHS["working"] if r["state"] == "working"
+                             else GLYPHS["idle"]) + r["state"]),
         # The agent type is the readable name, but the parent only records it in
         # the tool result -- a still-running agent has no type yet, so the hex id
         # is kept as a suffix (and the whole label while running) to stay unique.
@@ -3151,15 +3290,14 @@ def render_subagents(agents, sel=None):
 
     working = sum(1 for r in agents if r["state"] == "working")
     lines.append("  " + c("%d subagent(s), %d working" % (len(agents), working), DIM))
-    return lines
+    return panel("SUBAGENTS", lines)
 
 
 def render_detail(row, children=None):
     """Read-only row detail. Replaces the panel slot; esc returns."""
-    lines = ["", c("DETAIL", BOLD) + "  " + c("esc returns", DIM)]
     if not row:
-        lines.append(c("  no row selected", DIM))
-        return lines
+        return panel("DETAIL", [c("  no row selected", DIM)], extra="esc returns")
+    lines = []
     is_agent = "agent_id" in row and "parent_sid" in row
     lines.append("  " + c("subagent" if is_agent else "worker", BOLD))
 
@@ -3212,7 +3350,7 @@ def render_detail(row, children=None):
                 label = a.get("agent_type") or (a.get("agent_id") or "")[:10]
                 lines.append("    %s  %s  %s" % (
                     a.get("state", "-"), label, ascii_safe(a.get("task") or "")))
-    return lines
+    return panel("DETAIL", lines, extra="esc returns")
 
 
 def tab_table_focus(focus, view):
@@ -3227,10 +3365,10 @@ def render_models(models):
     model that is installed but idle drops out of it entirely. This is the
     full inventory: everything `ollama list` knows about, with residency and
     VRAM called out for whichever happen to be loaded."""
-    lines = ["", c("LOCAL MODELS", BOLD)]
     if not models:
-        lines.append(c("  none installed (or ollama not running)", DIM))
-        return lines
+        return panel("LOCAL MODELS",
+                     [c("  none installed (or ollama not running)", DIM)])
+    lines = []
 
     cols = [
         ("MODEL", lambda m: m["name"]),
@@ -3256,7 +3394,7 @@ def render_models(models):
 
     resident = sum(1 for m in models if m["resident"])
     lines.append("  " + c("%d installed, %d resident" % (len(models), resident), DIM))
-    return lines
+    return panel("LOCAL MODELS", lines)
 
 
 # name, key, what it shows. Not a keybinding reference -- the footer hint
@@ -3313,9 +3451,11 @@ def render_help():
     # Same gutter shape as the worker table: label beside its text, not above
     # it. That halves the panel's height, and the text wraps to the window
     # instead of running off the right edge as one clipped line.
-    body = max(20, shutil.get_terminal_size((150, 40)).columns - lw - 5)
+    # The frame borders and their padding cost four more columns in Unicode.
+    body = max(20, shutil.get_terminal_size((150, 40)).columns - lw
+               - (9 if UNICODE else 5))
 
-    lines = ["", c("HELP", BOLD)]
+    lines = []
     for label, (_, _, text) in zip(labels, HELP_SCREENS):
         wrapped = textwrap.wrap(text, body) or [""]
         for i, part in enumerate(wrapped):
@@ -3325,7 +3465,7 @@ def render_help():
     lines.append("  " + c("interactive mode (i) arms the cursor: j/k select, Tab "
                           "switches tables, Enter opens a row, x stop, "
                           "y copy sessionId, esc deselect.", DIM))
-    return lines
+    return panel("HELP", lines)
 
 
 def collect_snapshot(view=None, focus="workers", detail=None):
@@ -3411,7 +3551,7 @@ def render_frame(snap, view=None, sel=None, focus="workers", detail=None):
     elif view == "help":
         lines.extend(render_help())
     elif view == "advice":
-        lines.append("")
+        # advise() carries its own leading blank via panel().
         lines.extend(advise(workers))
     lines.extend(render(workers, sel if focus == "workers" else None))
     return lines, rows, sel
@@ -3690,8 +3830,8 @@ def paint(lines, vt):
         body = body[: rows - 2] + [clip_ansi(
             # Attention colour, not dim: this is the line that says the frame
             # is lying about being complete.
-            c("... %d more line(s) below -- taller window, or close a panel "
-              "(s/a/m/u/g/r/h)" % hidden, YELLOW), cols - 1)]
+            c("%s %d more line(s) below -- taller window, or close a panel "
+              "(s/a/m/u/g/r/h)" % (GLYPHS["ell"], hidden), YELLOW), cols - 1)]
 
     # Version, bottom-right. Stamped onto whatever the last visible line turns
     # out to be -- including the overflow notice above -- so it cannot itself be
@@ -3726,6 +3866,11 @@ def build_parser():
     ap.add_argument("--version", action="version", version="roost " + __version__)
     ap.add_argument("--json", action="store_true", help="emit records as JSON and exit")
     ap.add_argument("--no-color", action="store_true", help="disable colour output")
+    ap.add_argument("--ascii", action="store_true",
+                    help="force the ASCII glyph dialect (also %s=1); an interactive "
+                         "UTF-8 terminal otherwise gets rounded frames and Unicode "
+                         "glyphs, while pipes, --once and --json are always ASCII"
+                         % ASCII_ENV)
     ap.add_argument("--advise", action="store_true",
                     help="start with the ADVICE panel open (toggle live with 'a')")
     ap.add_argument("--no-agents", action="store_true",
@@ -3815,6 +3960,7 @@ _arguments -S -C \\
   '(-1 --once)'{-1,--once}'[print a single frame and exit]' \\
   '--json[emit records as JSON and exit]' \\
   '--no-color[disable colour output]' \\
+  '--ascii[force the ASCII glyph dialect]' \\
   '--advise[start with the ADVICE panel open]' \\
   '--no-agents[start with the SUBAGENTS panel closed]' \\
   '--models[start with the LOCAL MODELS panel open]' \\
@@ -3869,6 +4015,10 @@ def main():
         return
 
     LOGGING = not args.no_log
+    # Dialect is decided once, up front: pipe-safe modes and --ascii pin the
+    # ASCII tier before the terminal is consulted, so --once/--json output
+    # stays byte-identical whatever the terminal can render.
+    set_dialect(choose_dialect(args.once or args.json, args.ascii))
     if args.ollama_port is not None:
         OLLAMA_PORT = args.ollama_port
         _PORT_CONFIGURED["ollama"] = True
