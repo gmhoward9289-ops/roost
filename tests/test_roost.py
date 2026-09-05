@@ -1043,7 +1043,9 @@ class TestLoadingDots(unittest.TestCase):
             roost.time.time = real
 
     def test_deferred_infra_marker_stays_ascii(self):
-        """The file is ASCII-dialect by stance; no lone ellipsis codepoint."""
+        """In the ASCII dialect (the module default, and always the dialect
+        of pipe-safe output) the deferred marker is plain dots -- no lone
+        ellipsis codepoint leaks in from the Unicode table."""
         color = roost.COLOR
         roost.COLOR = False
         try:
