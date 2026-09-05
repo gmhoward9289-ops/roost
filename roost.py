@@ -758,16 +758,25 @@ def set_dialect(unicode_on):
     GLYPHS = _GLYPHS_UNICODE if UNICODE else _GLYPHS_ASCII
 
 
-def probe_unicode(stdout=None):
-    """True when stdout is an interactive terminal that speaks UTF-8.
+def probe_unicode(stdout=None, windows=None, env=None):
+    """True when stdout is an interactive UTF-8 terminal that can draw glyphs.
 
-    The legacy-codepage Windows console fails the encoding check and keeps
-    ASCII; Windows Terminal (and every modern Unix terminal) passes. A pipe is
-    never interactive, so redirected output can never pick up the Unicode
-    tier no matter what encoding it reports. ROOST_ASCII=1 forces the ASCII
-    dialect regardless -- the escape hatch for a terminal that lies.
+    Three gates, all required: stdout is a tty (a pipe never gets the Unicode
+    tier whatever encoding it reports), Python's stdout encoding is UTF-8, and
+    -- on Windows only -- WT_SESSION is set. That last gate is the one that
+    actually excludes legacy conhost: since PEP 528 (Python 3.6) every Windows
+    console reports utf-8 regardless of its code page, so the encoding check
+    alone cannot tell Windows Terminal from a conhost window whose raster font
+    has no box-drawing glyphs. WT_SESSION is set by Windows Terminal and
+    nothing else. On POSIX the tty's encoding is the whole story.
+    ROOST_ASCII=1 forces the ASCII dialect regardless -- the escape hatch for
+    a terminal that lies.
+
+    `windows` and `env` are injectable for tests; the defaults read the real
+    platform and environment.
     """
-    if os.environ.get(ASCII_ENV):
+    env = os.environ if env is None else env
+    if env.get(ASCII_ENV):
         return False
     out = stdout if stdout is not None else sys.stdout
     try:
@@ -776,15 +785,22 @@ def probe_unicode(stdout=None):
     except (AttributeError, ValueError):
         return False
     enc = (getattr(out, "encoding", "") or "").replace("-", "").replace("_", "").lower()
-    return enc in ("utf8", "cp65001")
+    if enc not in ("utf8", "cp65001"):
+        return False
+    if windows is None:
+        windows = os.name == "nt"
+    if windows and not env.get("WT_SESSION"):
+        return False
+    return True
 
 
-def choose_dialect(pipe_safe, force_ascii, stdout=None):
+def choose_dialect(pipe_safe, force_ascii, stdout=None, **probe):
     """The startup decision: pipe-safe modes (--once, --json) and an explicit
-    --ascii both pin the ASCII dialect before the terminal is even consulted."""
+    --ascii both pin the ASCII dialect before the terminal is even consulted.
+    Extra keywords pass through to probe_unicode (tests inject the platform)."""
     if pipe_safe or force_ascii:
         return False
-    return probe_unicode(stdout)
+    return probe_unicode(stdout, **probe)
 
 
 def frame_panel(title, body, cols=None):

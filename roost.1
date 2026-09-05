@@ -140,10 +140,13 @@ Disable colour. Colour is also suppressed when
 is set in the environment or when output is not a terminal.
 .TP
 .B \-\-ascii
-Force the ASCII glyph dialect. By default an interactive UTF\-8 terminal
-gets the Unicode tier \(em rounded frames around the panels, liveness dots,
-check/cross marks, real ellipses \(em while a legacy\-codepage console,
-pipes,
+Force the ASCII glyph dialect. By default the Unicode tier \(em rounded
+frames around the panels, liveness dots, check/cross marks, real ellipses
+\(em is drawn when standard output is a terminal, its encoding is UTF\-8,
+and, on Windows, the session is Windows Terminal
+.RB ( WT_SESSION
+is set; every Windows console reports UTF\-8 since Python 3.6, so the
+encoding alone cannot exclude legacy conhost). Pipes,
 .BR \-\-once ,
 and
 .B \-\-json

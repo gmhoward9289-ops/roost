@@ -2974,27 +2974,59 @@ class TestGlyphDialects(unittest.TestCase):
 
     # ---- the probe, forced both ways ----------------------------------------
 
-    def test_utf8_tty_probes_unicode(self):
-        self.assertTrue(roost.probe_unicode(_FakeStdout(tty=True, encoding="utf-8")))
-        self.assertTrue(roost.probe_unicode(_FakeStdout(tty=True, encoding="UTF-8")))
-        self.assertTrue(roost.probe_unicode(_FakeStdout(tty=True, encoding="cp65001")))
+    def test_posix_utf8_tty_probes_unicode(self):
+        for enc in ("utf-8", "UTF-8", "utf8", "cp65001"):
+            self.assertTrue(roost.probe_unicode(
+                _FakeStdout(tty=True, encoding=enc), windows=False, env={}), enc)
 
-    def test_legacy_codepage_tty_stays_ascii(self):
-        self.assertFalse(roost.probe_unicode(_FakeStdout(tty=True, encoding="cp1252")))
+    def test_posix_non_utf8_tty_stays_ascii(self):
+        self.assertFalse(roost.probe_unicode(
+            _FakeStdout(tty=True, encoding="latin-1"), windows=False, env={}))
+
+    def test_windows_utf8_tty_without_windows_terminal_stays_ascii(self):
+        """Since PEP 528 every Windows console reports utf-8 regardless of
+        its code page, so the encoding check cannot exclude legacy conhost.
+        Only Windows Terminal's own WT_SESSION marker can."""
+        self.assertFalse(roost.probe_unicode(
+            _FakeStdout(tty=True, encoding="utf-8"), windows=True, env={}))
+
+    def test_windows_terminal_probes_unicode(self):
+        self.assertTrue(roost.probe_unicode(
+            _FakeStdout(tty=True, encoding="utf-8"), windows=True,
+            env={"WT_SESSION": "8f2c1a0e-0000-4000-8000-000000000000"}))
+
+    def test_windows_terminal_pipe_still_stays_ascii(self):
+        self.assertFalse(roost.probe_unicode(
+            _FakeStdout(tty=False, encoding="utf-8"), windows=True,
+            env={"WT_SESSION": "x"}))
 
     def test_pipe_stays_ascii_whatever_it_claims_to_encode(self):
-        self.assertFalse(roost.probe_unicode(_FakeStdout(tty=False, encoding="utf-8")))
+        self.assertFalse(roost.probe_unicode(
+            _FakeStdout(tty=False, encoding="utf-8"), windows=False, env={}))
 
     def test_env_override_forces_ascii_on_a_capable_terminal(self):
-        os.environ[roost.ASCII_ENV] = "1"
-        self.assertFalse(roost.probe_unicode(_FakeStdout(tty=True, encoding="utf-8")))
+        self.assertFalse(roost.probe_unicode(
+            _FakeStdout(tty=True, encoding="utf-8"), windows=False,
+            env={roost.ASCII_ENV: "1"}))
+        self.assertFalse(roost.probe_unicode(
+            _FakeStdout(tty=True, encoding="utf-8"), windows=True,
+            env={roost.ASCII_ENV: "1", "WT_SESSION": "x"}))
+
+    def test_probe_defaults_read_the_real_platform(self):
+        # The injectable knobs default to os.name / os.environ, so main()'s
+        # bare call sees the actual machine. Pin that the default path does
+        # not blow up and agrees with the explicit one.
+        tty = _FakeStdout(tty=True, encoding="utf-8")
+        explicit = roost.probe_unicode(tty, windows=(os.name == "nt"), env=os.environ)
+        self.assertEqual(roost.probe_unicode(tty), explicit)
 
     def test_pipe_safe_modes_never_consult_the_terminal(self):
         # --once and --json pin ASCII even on a UTF-8 tty.
         tty = _FakeStdout(tty=True, encoding="utf-8")
-        self.assertFalse(roost.choose_dialect(True, False, stdout=tty))
-        self.assertFalse(roost.choose_dialect(False, True, stdout=tty))
-        self.assertTrue(roost.choose_dialect(False, False, stdout=tty))
+        posix = dict(stdout=tty, windows=False, env={})
+        self.assertFalse(roost.choose_dialect(True, False, **posix))
+        self.assertFalse(roost.choose_dialect(False, True, **posix))
+        self.assertTrue(roost.choose_dialect(False, False, **posix))
 
     def test_module_default_is_ascii(self):
         # Import-time callers (tests, --json before main wires anything) must
