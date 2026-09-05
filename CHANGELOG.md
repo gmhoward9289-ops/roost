@@ -15,6 +15,13 @@ deliberately no `Unreleased` heading: unreleased work lives in the open release
 PR, and a hand-maintained section would sort below each new generated one and
 drift out of date.
 
+## [0.15.0](https://github.com/gmhoward9289-ops/roost/compare/v0.14.0...v0.15.0) (2026-09-05)
+
+
+### Added
+
+* conform to the leghorn design language ([#105](https://github.com/gmhoward9289-ops/roost/issues/105)) ([12590a5](https://github.com/gmhoward9289-ops/roost/commit/12590a536747535ce331d9f3062e5f40ad9489c3))
+
 ## [0.14.0](https://github.com/gmhoward9289-ops/roost/compare/v0.13.0...v0.14.0) (2026-08-29)
 
 
