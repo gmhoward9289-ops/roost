@@ -806,10 +806,125 @@ class TestKeyHint(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
 
     def test_never_exceeds_the_given_width(self):
-        floor = len("q quit | h help")
-        for w in range(0, 200, 7):
-            self.assertLessEqual(roost.visible_len(roost.key_hint(w)),
-                                 max(w, floor))
+        """Below the floor the hint keeps shrinking rather than overflowing,
+        so the header can trust the width it handed out."""
+        for w in range(0, 200):
+            self.assertLessEqual(roost.visible_len(roost.key_hint(w)), w)
+
+    def test_below_the_floor_q_is_the_last_letter_standing(self):
+        self.assertEqual(roost.key_hint(len("q quit | h help") - 1), "q quit")
+        self.assertEqual(roost.key_hint(6), "q quit")
+        self.assertEqual(roost.key_hint(5), "q")
+        self.assertEqual(roost.key_hint(1), "q")
+        self.assertEqual(roost.key_hint(0), "")
+
+
+class TestHeaderTitle(unittest.TestCase):
+    """The real title line, assembled at real widths. The EXPERIMENTAL tag
+    is the one marker saying x can end a process, so it must never be what
+    the right edge clips; the clock is the last data element shed."""
+
+    HOST = "cooper"
+    CLOCK = "12:34:56"
+
+    def setUp(self):
+        self._color = roost.COLOR
+        roost.COLOR = True
+
+    def tearDown(self):
+        roost.COLOR = self._color
+
+    def title(self, cols, **kw):
+        kw.setdefault("age_secs", 7)
+        return roost.header_title(cols, self.HOST, self.CLOCK, **kw)
+
+    def test_fits_paint_budget_at_every_width_interactive_or_not(self):
+        for cols in range(20, 200):
+            for tagged in (False, True):
+                t = self.title(cols, interactive=tagged, tagged=tagged)
+                self.assertLessEqual(roost.visible_len(t), cols - 1, (cols, tagged))
+
+    def test_40_columns_armed_keeps_the_tag_intact(self):
+        t = self.title(40, interactive=True, tagged=True)
+        self.assertLessEqual(roost.visible_len(t), 39)
+        # Intact means the whole tag survives paint()'s clip, unchanged.
+        clipped = roost.clip_ansi(t, 39)
+        self.assertEqual(clipped, t)
+        self.assertIn(roost.EXPERIMENTAL_TAG, clipped)
+        self.assertIn(self.CLOCK, t)
+        self.assertIn(roost.DIM + "q quit" + roost.RESET, t)
+
+    def test_40_columns_unarmed_keeps_quit_help_and_the_clock(self):
+        t = self.title(40, interactive=False, tagged=False)
+        self.assertLessEqual(roost.visible_len(t), 39)
+        self.assertIn(self.CLOCK, t)
+        self.assertIn("q quit | h help", t)
+        self.assertNotIn(roost.EXPERIMENTAL_TAG, t)
+
+    def test_tag_survives_intact_down_to_the_narrowest_terminal(self):
+        """term_size() floors at 20 columns. There the tag outranks even the
+        name and the clock -- it is the one thing that must never clip."""
+        for cols in range(20, 60):
+            t = self.title(cols, interactive=True, tagged=True)
+            self.assertEqual(roost.clip_ansi(t, cols - 1), t, cols)
+            self.assertIn(roost.EXPERIMENTAL_TAG, t, cols)
+        # 8 (clock) + 1 + 14 (tag) = 23 visible: the clock is back from 24 on,
+        # the name from 31 (5 + 2 + 8 + 15 = 30 <= cols - 1).
+        self.assertNotIn(self.CLOCK, self.title(23, interactive=True, tagged=True))
+        self.assertIn(self.CLOCK, self.title(24, interactive=True, tagged=True))
+        self.assertNotIn("roost", self.title(30, interactive=True, tagged=True))
+        self.assertIn("roost", self.title(31, interactive=True, tagged=True))
+
+    def test_tag_only_when_armed(self):
+        self.assertIn(roost.EXPERIMENTAL_TAG, self.title(150, interactive=True, tagged=True))
+        self.assertNotIn(roost.EXPERIMENTAL_TAG, self.title(150, interactive=False))
+
+    def test_tag_sits_in_the_true_corner(self):
+        for cols in (40, 80, 150):
+            t = self.title(cols, interactive=True, tagged=True)
+            self.assertEqual(roost.visible_len(t), cols - 1, cols)
+            self.assertTrue(t.endswith(roost.EXPERIMENTAL_TAG + roost.RESET))
+
+    NEEDLES = (("chips", "space refresh"), ("age", "updated"), ("host", HOST),
+               ("floor", "h help"), ("name", "roost"), ("clock", CLOCK))
+
+    def test_shed_order_chips_age_host_floor_name_clock(self):
+        """Walk the width down and record the first width at which each
+        field disappears. The hint's optional chips thin first, the age chip
+        goes next, the host after that, then the q/h floor, then the product
+        name -- and the clock is the last data element to go (only the safety
+        tag outranks it, and only below 24 columns)."""
+        wide = self.title(200, interactive=True, tagged=True)
+        for _, needle in self.NEEDLES:
+            self.assertIn(needle, wide)
+        gone = {}
+        for cols in range(200, 19, -1):
+            t = self.title(cols, interactive=True, tagged=True)
+            for key, needle in self.NEEDLES:
+                if key not in gone and needle not in t:
+                    gone[key] = cols
+        self.assertEqual(sorted(gone, key=gone.get, reverse=True),
+                         ["chips", "age", "host", "floor", "name", "clock"])
+        # Once gone, a field stays gone: no field flickers back at a narrower
+        # width, which is what makes the order above a real order.
+        for key, needle in self.NEEDLES:
+            for cols in range(gone[key], 19, -1):
+                self.assertNotIn(needle, self.title(cols, interactive=True, tagged=True),
+                                 (key, cols))
+
+    def test_unarmed_clock_never_sheds(self):
+        for cols in range(20, 200):
+            self.assertIn(self.CLOCK, self.title(cols), cols)
+
+    def test_age_chip_reads_the_data_age(self):
+        t = self.title(150, age_secs=42)
+        self.assertIn("updated 42s ago", t)
+        self.assertNotIn("updated", self.title(150, age_secs=None))
+
+    def test_ctrl_c_hint_when_keys_are_unavailable(self):
+        t = self.title(150, keys_enabled=False)
+        self.assertIn("Ctrl-C to stop", t)
+        self.assertNotIn("q quit", t)
 
     def test_armed_and_off_keep_one_width(self):
         """The mode chip is fixed-width ('off  ' pads to ARMED) so arming

@@ -3859,12 +3859,84 @@ def key_hint(width, interactive=False, view=None):
         lit("r", view == "remote") + " remote",
     ]
     out = "q quit | " + lit("h", view == "help") + " help"
+    if visible_len(out) > width:
+        # Below the floor the hint keeps shrinking rather than overflowing:
+        # the header owns the width budget and must be able to trust that
+        # what it asked for is what it gets, or the safety tag to its right
+        # is what the edge clips. q is the last letter standing.
+        for short in ("q quit", "q"):
+            if len(short) <= width:
+                return short
+        return ""
     for chip in chips:
         cand = out + " | " + chip
         if visible_len(cand) > width:
             break
         out = cand
     return out
+
+
+EXPERIMENTAL_TAG = " EXPERIMENTAL "
+
+
+def header_title(cols, host, clock, age_secs=None, keys_enabled=True,
+                 interactive=False, view=None, tagged=False):
+    """Assemble the header's title line to fit `cols - 1` visible columns.
+
+    Fields shed in a fixed order under width pressure, least important first:
+    the key hint's optional chips, then the "updated Ns ago" age chip, then
+    the hostname, then the hint's floor ("q quit | h help" thins to "q quit",
+    then "q" -- q and h have no other way to be discovered, so they outrank
+    the chips that describe them). The product name and the clock come after
+    everything else -- a wall display must always answer "when did this last
+    update" -- and the clock is the last data element to go. When interactive
+    mode is armed the EXPERIMENTAL safety tag is reserved before any field is
+    even considered: the one marker that says "x can end a process" is never
+    what the right edge clips, even at the 20-column minimum, where it
+    outranks the name and finally the clock. paint() clips at cols - 1, so
+    the budget here is the same number.
+    """
+    budget = cols - 1
+    tag = c(EXPERIMENTAL_TAG, BOLD, REVERSE, YELLOW) if tagged else ""
+    reserve = visible_len(tag) + 1 if tagged else 0   # tag plus one gap
+    name = c("roost", BOLD)
+    parts = [name, clock]
+    used = visible_len(name) + 2 + len(clock)
+    if used + reserve > budget:
+        # Only below ~31 columns with the tag up: the name yields first, and
+        # the clock only if even it cannot share the row with the tag.
+        parts = [clock] if len(clock) + reserve <= budget else []
+        used = len(clock) if parts else 0
+    avail = budget - reserve - used
+    floor = (len("q quit | h help") if keys_enabled else len("Ctrl-C to stop")) + 3
+    optional = avail - floor  # room beyond the hint floor for host and age
+    if host and len(host) + 2 <= optional:
+        parts.insert(max(0, len(parts) - 1), c(host, CYAN))  # before the clock
+        avail -= len(host) + 2
+        optional -= len(host) + 2
+    title = "  ".join(parts)
+    if age_secs is not None:
+        upd = "updated %s ago" % dur(max(0, age_secs))
+        if len(upd) + 2 <= optional:
+            title += "  " + c(upd, DIM)
+            avail -= len(upd) + 2
+    if not keys_enabled:
+        hint = "Ctrl-C to stop" if len("Ctrl-C to stop") + 3 <= avail else ""
+    else:
+        # The hint's chips never reword when interactive is armed or a panel
+        # opens -- only the colours change, and "off" is padded to ARMED's
+        # width -- so the header cannot reflow underfoot. The armed state is
+        # spelled out, not just tinted: the one mode that can end a process
+        # should never be ambiguous.
+        hint = key_hint(avail - 3, interactive, view)
+    if hint:
+        title += ("   " if title else "") + c(hint, DIM)
+    if tagged:
+        # Pinned top-right so it sits above the table rather than anywhere
+        # the frame can clip it away; the reserve above guarantees the room.
+        pad = budget - visible_len(title) - visible_len(tag)
+        title += " " * max(1 if title else 0, pad) + tag
+    return title
 
 
 def paint(lines, vt):
@@ -4204,43 +4276,18 @@ def main():
                             pending["name"],), BOLD, RED)
                 else:
                     status = note or ""
-                title = (c("roost", BOLD) + "  " + c(socket.gethostname(), CYAN)
-                         + "  " + time.strftime("%H:%M:%S"))
                 painted_size = term_size()
-                cols = painted_size[0]
-                reserve = 0
-                if keys.enabled and interactive:
-                    tag = c(" EXPERIMENTAL ", BOLD, REVERSE, YELLOW)
-                    reserve = visible_len(tag) + 1
-                avail = cols - 1 - visible_len(title) - reserve
-                min_hint = len("q quit | h help") + 3
-                # Data age beside the clock. It sheds before the clock, never
-                # after it: the chip drops whole once the surviving hint tier
-                # no longer fits alongside, while the clock never sheds at all.
-                if _LAST_COLLECT is not None:
-                    upd = "updated %s ago" % dur(max(0, time.time() - _LAST_COLLECT))
-                    if avail - (len(upd) + 2) >= min_hint:
-                        title += "  " + c(upd, DIM)
-                        avail -= len(upd) + 2
-                if not keys.enabled:
-                    hint = "Ctrl-C to stop"
-                else:
-                    # The hint's chips never reword when interactive is armed
-                    # or a panel opens -- only the colours change, and "off" is
-                    # padded to ARMED's width -- so the header cannot reflow
-                    # underfoot. The armed state is spelled out, not just
-                    # tinted: the one mode that can end a process should never
-                    # be ambiguous.
-                    hint = key_hint(avail - 3, interactive, view)
-                title += "   " + c(hint, DIM)
-                if keys.enabled and interactive:
-                    # Only while interactive mode is armed, because that is the
-                    # half that can end a process. Reading the dashboard has
-                    # never been the risky part. Pinned top-right so it sits
-                    # above the table rather than anywhere the frame can clip
-                    # it away.
-                    pad = cols - 1 - visible_len(title) - visible_len(tag)
-                    title += " " * max(1, pad) + tag
+                # The EXPERIMENTAL tag only while interactive mode is armed,
+                # because that is the half that can end a process; reading
+                # the dashboard has never been the risky part. header_title
+                # owns the shed order (hint, then age chip, then host; the
+                # clock and the tag never).
+                title = header_title(
+                    painted_size[0], socket.gethostname(), time.strftime("%H:%M:%S"),
+                    age_secs=(None if _LAST_COLLECT is None
+                              else time.time() - _LAST_COLLECT),
+                    keys_enabled=keys.enabled, interactive=interactive, view=view,
+                    tagged=keys.enabled and interactive)
                 header = [title, status, ""]
                 paint(header + lines, vt)
 
