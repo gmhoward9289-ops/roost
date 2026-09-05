@@ -201,7 +201,19 @@ class TestDuration(unittest.TestCase):
         self.assertEqual(roost.dur(None), "-")
         self.assertEqual(roost.dur(45), "45s")
         self.assertEqual(roost.dur(90), "1m")
-        self.assertEqual(roost.dur(3661), "1h01m")
+        self.assertEqual(roost.dur(3661), "1h")
+
+    def test_one_unit_only(self):
+        """The charter's 45s/12m/3h/2d: the largest unit that fits, truncated,
+        never a two-unit form like 47h59m and never a cliff between tiers."""
+        self.assertEqual(roost.dur(12 * 60 + 59), "12m")
+        self.assertEqual(roost.dur(3 * 3600 + 59 * 60), "3h")
+        self.assertEqual(roost.dur(23 * 3600 + 59 * 60), "23h")
+        self.assertEqual(roost.dur(24 * 3600), "1d")
+        self.assertEqual(roost.dur(47 * 3600), "1d")
+        self.assertEqual(roost.dur(3 * 86400), "3d")
+        for secs in (0, 59, 60, 3599, 3600, 86399, 86400, 10 * 86400):
+            self.assertRegex(roost.dur(secs), r"^\d+[smhd]$")
 
 
 class TestAsciiSafe(unittest.TestCase):
@@ -677,16 +689,371 @@ class TestCursor(unittest.TestCase):
             self.assertEqual(roost.visible_len(col), len(p))
 
     def test_highlight_rearms_after_every_reset(self):
-        """A per-cell RESET clears reverse video too, so a naive wrap highlights
-        only as far as the first coloured cell."""
+        """A per-cell RESET clears the selection background too, so a naive
+        wrap highlights only as far as the first coloured cell."""
         roost.COLOR = True
         line = roost.c("aa", roost.RED) + " " + roost.c("bb", roost.GREEN)
         out = roost.highlight(line)
-        self.assertEqual(out.count(roost.REVERSE), line.count(roost.RESET) + 1)
+        self.assertEqual(out.count(roost.SEL), line.count(roost.RESET) + 1)
         self.assertEqual(roost.visible_len(out), roost.visible_len(line))
+
+    def test_highlight_is_the_black_on_cyan_selection_bar(self):
+        """The charter's one painted background -- black on cyan, not bare
+        reverse video."""
+        roost.COLOR = True
+        self.assertEqual(roost.SEL, "\033[30;46m")
+        self.assertTrue(roost.highlight("row").startswith(roost.SEL))
+
+    @staticmethod
+    def _sgr_cells(s):
+        """Interpret SGR the way a terminal does: (char, fg, bg, bold) per
+        visible cell. Enough of the state machine to check a colour pair."""
+        fg = bg = None
+        bold = False
+        cells = []
+        i = 0
+        while i < len(s):
+            if s[i] == "\033":
+                j = s.index("m", i)
+                params = s[i + 2:j].split(";") if s[i + 2:j] else ["0"]
+                k = 0
+                while k < len(params):
+                    p = int(params[k] or 0)
+                    if p == 0:
+                        fg = bg = None
+                        bold = False
+                    elif p == 1:
+                        bold = True
+                    elif 30 <= p <= 37 or 90 <= p <= 97:
+                        fg = p
+                    elif p == 38:
+                        fg = ("ext", params[k + 1:k + 3 if params[k + 1] == "5" else k + 5])
+                        k += 2 if params[k + 1] == "5" else 4
+                    elif 40 <= p <= 47:
+                        bg = p
+                    k += 1
+                i = j + 1
+                continue
+            cells.append((s[i], fg, bg, bold))
+            i += 1
+        return cells
+
+    def test_highlight_blackens_every_inner_foreground(self):
+        """Per-cell foregrounds (bright-blue WORKER, yellow CTX, bucket
+        colours) must not survive inside the bar: blue-on-cyan and
+        yellow-on-cyan are illegible. Every visible cell of a highlighted
+        row is fg black / bg cyan; BOLD is kept so weight still carries."""
+        roost.COLOR = True
+        line = ("> " + roost.c("demo-a1", roost.BOLD, "\033[38;5;12m") + "  "
+                + roost.c("85%", roost.BOLD, roost.YELLOW) + "  "
+                + roost.c("DOWN", roost.BOLD, roost.RED) + "  "
+                + roost.c("opus-5", roost.DIM) + " "
+                + roost.c("rgb", "\033[38;2;10;20;30m") + " task")
+        out = roost.highlight(line)
+        cells = self._sgr_cells(out)
+        self.assertEqual("".join(ch for ch, _, _, _ in cells),
+                         "> demo-a1  85%  DOWN  opus-5 rgb task")
+        for ch, fg, bg, _ in cells:
+            self.assertEqual((fg, bg), (30, 46), repr((ch, fg, bg)))
+        self.assertTrue(any(bold for ch, _, _, bold in cells if ch in "demo-a1"))
+        self.assertNotIn("\033[38;5;12m", out)
+        self.assertNotIn(roost.YELLOW, out)
+
+    def test_highlighted_worker_row_is_uniformly_black_on_cyan(self):
+        """End to end through render(): the real cursor row, with its real
+        identity/attention colours, comes out one colour pair."""
+        roost.COLOR = True
+        rows = [worker(name="a", ctx_pct=85.0), worker(name="b", idle_secs=5)]
+        out = roost.render(rows, 0)
+        bar = next(ln for ln in out if ln.startswith(roost.SEL))
+        for ch, fg, bg, _ in self._sgr_cells(bar):
+            self.assertEqual((fg, bg), (30, 46), repr((ch, fg, bg)))
 
     def test_highlight_is_a_noop_without_colour(self):
         self.assertEqual(roost.highlight("plain"), "plain")
+
+
+class TestKeyHint(unittest.TestCase):
+    """q and h have no other way to be discovered, so they survive every width
+    tier instead of being the first thing the right edge destroys."""
+
+    def setUp(self):
+        self._color = roost.COLOR
+        roost.COLOR = False
+
+    def tearDown(self):
+        roost.COLOR = self._color
+
+    def test_quit_and_help_lead_the_hint(self):
+        self.assertTrue(roost.key_hint(500).startswith("q quit | h help"))
+
+    def test_quit_and_help_survive_a_40_column_window(self):
+        hint = roost.key_hint(39)
+        self.assertIn("q quit", hint)
+        self.assertIn("h help", hint)
+        self.assertLessEqual(roost.visible_len(hint), 39)
+
+    def test_narrowest_tier_is_just_quit_and_help(self):
+        self.assertEqual(roost.key_hint(len("q quit | h help")),
+                         "q quit | h help")
+
+    def test_chips_append_in_a_fixed_order(self):
+        full = roost.key_hint(500)
+        order = ["q quit", "h help", "space refresh", "interactive",
+                 "a advice", "s agents", "m models", "u usage",
+                 "g gateway", "r remote"]
+        positions = [full.index(chunk) for chunk in order]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_never_exceeds_the_given_width(self):
+        """Below the floor the hint keeps shrinking rather than overflowing,
+        so the header can trust the width it handed out."""
+        for w in range(0, 200):
+            self.assertLessEqual(roost.visible_len(roost.key_hint(w)), w)
+
+    def test_below_the_floor_q_is_the_last_letter_standing(self):
+        self.assertEqual(roost.key_hint(len("q quit | h help") - 1), "q quit")
+        self.assertEqual(roost.key_hint(6), "q quit")
+        self.assertEqual(roost.key_hint(5), "q")
+        self.assertEqual(roost.key_hint(1), "q")
+        self.assertEqual(roost.key_hint(0), "")
+
+
+class TestHeaderTitle(unittest.TestCase):
+    """The real title line, assembled at real widths. The EXPERIMENTAL tag
+    is the one marker saying x can end a process, so it must never be what
+    the right edge clips; the clock is the last data element shed."""
+
+    HOST = "cooper"
+    CLOCK = "12:34:56"
+
+    def setUp(self):
+        self._color = roost.COLOR
+        roost.COLOR = True
+
+    def tearDown(self):
+        roost.COLOR = self._color
+
+    def title(self, cols, **kw):
+        kw.setdefault("age_secs", 7)
+        return roost.header_title(cols, self.HOST, self.CLOCK, **kw)
+
+    def test_fits_paint_budget_at_every_width_interactive_or_not(self):
+        for cols in range(20, 200):
+            for tagged in (False, True):
+                t = self.title(cols, interactive=tagged, tagged=tagged)
+                self.assertLessEqual(roost.visible_len(t), cols - 1, (cols, tagged))
+
+    def test_40_columns_armed_keeps_the_tag_intact(self):
+        t = self.title(40, interactive=True, tagged=True)
+        self.assertLessEqual(roost.visible_len(t), 39)
+        # Intact means the whole tag survives paint()'s clip, unchanged.
+        clipped = roost.clip_ansi(t, 39)
+        self.assertEqual(clipped, t)
+        self.assertIn(roost.EXPERIMENTAL_TAG, clipped)
+        self.assertIn(self.CLOCK, t)
+        self.assertIn(roost.DIM + "q quit" + roost.RESET, t)
+
+    def test_40_columns_unarmed_keeps_quit_help_and_the_clock(self):
+        t = self.title(40, interactive=False, tagged=False)
+        self.assertLessEqual(roost.visible_len(t), 39)
+        self.assertIn(self.CLOCK, t)
+        self.assertIn("q quit | h help", t)
+        self.assertNotIn(roost.EXPERIMENTAL_TAG, t)
+
+    def test_tag_survives_intact_down_to_the_narrowest_terminal(self):
+        """term_size() floors at 20 columns. There the tag outranks even the
+        name and the clock -- it is the one thing that must never clip."""
+        for cols in range(20, 60):
+            t = self.title(cols, interactive=True, tagged=True)
+            self.assertEqual(roost.clip_ansi(t, cols - 1), t, cols)
+            self.assertIn(roost.EXPERIMENTAL_TAG, t, cols)
+        # 8 (clock) + 1 + 14 (tag) = 23 visible: the clock is back from 24 on,
+        # the name from 31 (5 + 2 + 8 + 15 = 30 <= cols - 1).
+        self.assertNotIn(self.CLOCK, self.title(23, interactive=True, tagged=True))
+        self.assertIn(self.CLOCK, self.title(24, interactive=True, tagged=True))
+        self.assertNotIn("roost", self.title(30, interactive=True, tagged=True))
+        self.assertIn("roost", self.title(31, interactive=True, tagged=True))
+
+    def test_tag_only_when_armed(self):
+        self.assertIn(roost.EXPERIMENTAL_TAG, self.title(150, interactive=True, tagged=True))
+        self.assertNotIn(roost.EXPERIMENTAL_TAG, self.title(150, interactive=False))
+
+    def test_tag_sits_in_the_true_corner(self):
+        for cols in (40, 80, 150):
+            t = self.title(cols, interactive=True, tagged=True)
+            self.assertEqual(roost.visible_len(t), cols - 1, cols)
+            self.assertTrue(t.endswith(roost.EXPERIMENTAL_TAG + roost.RESET))
+
+    NEEDLES = (("chips", "space refresh"), ("age", "updated"), ("host", HOST),
+               ("floor", "h help"), ("name", "roost"), ("clock", CLOCK))
+
+    def test_shed_order_chips_age_host_floor_name_clock(self):
+        """Walk the width down and record the first width at which each
+        field disappears. The hint's optional chips thin first, the age chip
+        goes next, the host after that, then the q/h floor, then the product
+        name -- and the clock is the last data element to go (only the safety
+        tag outranks it, and only below 24 columns)."""
+        wide = self.title(200, interactive=True, tagged=True)
+        for _, needle in self.NEEDLES:
+            self.assertIn(needle, wide)
+        gone = {}
+        for cols in range(200, 19, -1):
+            t = self.title(cols, interactive=True, tagged=True)
+            for key, needle in self.NEEDLES:
+                if key not in gone and needle not in t:
+                    gone[key] = cols
+        self.assertEqual(sorted(gone, key=gone.get, reverse=True),
+                         ["chips", "age", "host", "floor", "name", "clock"])
+        # Once gone, a field stays gone: no field flickers back at a narrower
+        # width, which is what makes the order above a real order.
+        for key, needle in self.NEEDLES:
+            for cols in range(gone[key], 19, -1):
+                self.assertNotIn(needle, self.title(cols, interactive=True, tagged=True),
+                                 (key, cols))
+
+    def test_unarmed_clock_never_sheds(self):
+        for cols in range(20, 200):
+            self.assertIn(self.CLOCK, self.title(cols), cols)
+
+    def test_age_chip_reads_the_data_age(self):
+        t = self.title(150, age_secs=42)
+        self.assertIn("updated 42s ago", t)
+        self.assertNotIn("updated", self.title(150, age_secs=None))
+
+    def test_ctrl_c_hint_when_keys_are_unavailable(self):
+        t = self.title(150, keys_enabled=False)
+        self.assertIn("Ctrl-C to stop", t)
+        self.assertNotIn("q quit", t)
+
+    def test_armed_and_off_keep_one_width(self):
+        """The mode chip is fixed-width ('off  ' pads to ARMED) so arming
+        never reflows the header."""
+        roost.COLOR = True
+        on = roost.key_hint(500, interactive=True)
+        off = roost.key_hint(500, interactive=False)
+        self.assertEqual(roost.visible_len(on), roost.visible_len(off))
+
+
+class TestAttentionNotices(unittest.TestCase):
+    """Truncation notices take the attention colour, not dim: a list cut
+    short must say so loudly enough to be seen."""
+
+    def setUp(self):
+        self._color = roost.COLOR
+        roost.COLOR = True
+
+    def tearDown(self):
+        roost.COLOR = self._color
+
+    def test_quiet_overflow_tail_is_yellow(self):
+        rows = [worker(name="q%02d" % i, idle_secs=9000, ctx_tokens=100)
+                for i in range(15)]
+        out = roost.render(rows)
+        quiet_line = next(ln for ln in out if "QUIET" in ln)
+        self.assertIn(roost.YELLOW + " . +3", quiet_line)
+
+    def test_quiet_within_the_cap_has_no_yellow_tail(self):
+        rows = [worker(name="q%02d" % i, idle_secs=9000, ctx_tokens=100)
+                for i in range(12)]
+        out = roost.render(rows)
+        quiet_line = next(ln for ln in out if "QUIET" in ln)
+        self.assertNotIn(roost.YELLOW, quiet_line)
+
+    def test_paint_overflow_notice_is_yellow_not_dim(self):
+        term = roost.term_size
+        roost.term_size = lambda: (100, 12)
+        buf = io.StringIO()
+        stdout = sys.stdout
+        sys.stdout = buf
+        try:
+            roost.paint(["line %d" % i for i in range(40)], vt=False)
+        finally:
+            sys.stdout = stdout
+            roost.term_size = term
+        last = buf.getvalue().splitlines()[-1]
+        self.assertIn("more line(s) below", last)
+        self.assertTrue(last.startswith(roost.YELLOW))
+
+
+class TestSemanticRoles(unittest.TestCase):
+    """Colour is spent by role: identity on the worker name, secondary on the
+    model code, chrome cyan kept for chrome."""
+
+    def setUp(self):
+        self._color = roost.COLOR
+        roost.COLOR = True
+
+    def tearDown(self):
+        roost.COLOR = self._color
+
+    def test_worker_name_takes_the_identity_role(self):
+        cell = roost.style_cell("WORKER", "demo-a1", worker())
+        self.assertTrue(cell.startswith(roost.BOLD + roost.IDENT_BLUE))
+
+    def test_model_code_is_secondary_for_every_family(self):
+        for m in ("claude-opus-5", "claude-sonnet-5", "claude-fable-5",
+                  "claude-haiku-4"):
+            cell = roost.style_cell("MODEL", m, worker(model=m))
+            self.assertEqual(cell, roost.DIM + m + roost.RESET)
+
+    def test_flow_is_not_chrome_cyan(self):
+        cell = roost.style_cell("FLOW", "..:-=+", worker())
+        self.assertNotIn(roost.CYAN, cell)
+
+    def test_identity_blue_upgrades_on_256_colour_terminals(self):
+        saved = {k: os.environ.get(k) for k in ("TERM", "COLORTERM", "WT_SESSION")}
+        try:
+            os.environ["TERM"] = "xterm-256color"
+            os.environ.pop("COLORTERM", None)
+            os.environ.pop("WT_SESSION", None)
+            self.assertEqual(roost._ident_blue(), "\033[38;5;12m")
+            os.environ["TERM"] = "vt100"
+            self.assertEqual(roost._ident_blue(), roost.BLUE)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
+class TestLoadingDots(unittest.TestCase):
+    """Loading animates on the interactive path: a static dim label is
+    indistinguishable from a dead one."""
+
+    def test_dots_animate_with_the_clock(self):
+        real = roost.time.time
+        seen = set()
+        try:
+            for t in (0.0, 0.5, 1.0, 1.5):
+                roost.time.time = lambda t=t: t
+                seen.add(roost.loading_dots())
+        finally:
+            roost.time.time = real
+        self.assertEqual(seen, {".  ", ".. ", "..."})
+
+    def test_dots_are_fixed_width_so_the_line_never_shifts(self):
+        real = roost.time.time
+        try:
+            for t in (0.0, 0.5, 1.0):
+                roost.time.time = lambda t=t: t
+                self.assertEqual(len(roost.loading_dots()), 3)
+        finally:
+            roost.time.time = real
+
+    def test_deferred_infra_marker_stays_ascii(self):
+        """In the ASCII dialect (the module default, and always the dialect
+        of pipe-safe output) the deferred marker is plain dots -- no lone
+        ellipsis codepoint leaks in from the Unicode table."""
+        color = roost.COLOR
+        roost.COLOR = False
+        try:
+            line = roost.render_infra(
+                [{"name": "ollama", "port": 11434, "up": None, "detail": ""}])[0]
+        finally:
+            roost.COLOR = color
+        self.assertTrue(all(ord(ch) < 128 for ch in line), line)
 
 
 class TestFrameClamping(unittest.TestCase):
@@ -732,6 +1099,191 @@ class TestFrameClamping(unittest.TestCase):
         self.assertEqual(len(rows), 2)  # quiet expanded under the cursor
         for r in rows:
             self.assertTrue(any(r["name"] in ln for ln in table), r["name"])
+
+
+class TestSnapshotRenderSplit(unittest.TestCase):
+    """A window resize repaints from the cached snapshot -- and now does so
+    repeatedly, live, during a drag. That only works if rendering truly runs
+    no collector and leaves the collect clock alone -- otherwise every
+    mid-drag reflow would drag a full rescan in behind it, or the
+    "updated Ns ago" chip would report paint age instead of data age."""
+
+    PATCHED = ("collect_workers", "collect_infra", "collect_subagents",
+               "collect_local_models")
+
+    def setUp(self):
+        self._saved = {n: getattr(roost, n) for n in self.PATCHED}
+        self._last = roost._LAST_COLLECT
+        self.calls = {"workers": 0, "models": 0}
+
+        def workers():
+            self.calls["workers"] += 1
+            return [worker(idle_secs=5)]
+
+        def models():
+            self.calls["models"] += 1
+            return []
+
+        roost.collect_workers = workers
+        roost.collect_infra = lambda: []
+        roost.collect_subagents = lambda sids: []
+        roost.collect_local_models = models
+
+    def tearDown(self):
+        for name, fn in self._saved.items():
+            setattr(roost, name, fn)
+        roost._LAST_COLLECT = self._last
+
+    def test_render_frame_runs_no_collector(self):
+        snap = roost.collect_snapshot(view="models")
+        self.assertEqual(self.calls, {"workers": 1, "models": 1})
+        for _ in range(3):  # a drag repaints many times mid-flight now
+            roost.render_frame(snap, view="models")
+        self.assertEqual(self.calls, {"workers": 1, "models": 1})
+
+    def test_render_frame_leaves_the_collect_clock_alone(self):
+        snap = roost.collect_snapshot()
+        stamp = roost._LAST_COLLECT
+        self.assertIsNotNone(stamp)
+        time.sleep(0.02)
+        roost.render_frame(snap)
+        self.assertEqual(roost._LAST_COLLECT, stamp)
+
+    def test_collect_snapshot_advances_the_clock(self):
+        roost._LAST_COLLECT = None
+        roost.collect_snapshot()
+        self.assertIsNotNone(roost._LAST_COLLECT)
+
+    def test_frame_is_one_collect_plus_one_render(self):
+        """The --once path calls frame(); the split must not change it."""
+        _, rows, sel = roost.frame(sel=0)
+        self.assertEqual(self.calls["workers"], 1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(sel, 0)
+
+
+class TestRepaintTick(unittest.TestCase):
+    """Between collects the frame repaints from cache once a second, so the
+    clock, the "updated Ns ago" chip and the loading dots actually move.
+    The policy takes `now`, so a whole tick runs on a fake clock."""
+
+    PATCHED = ("collect_workers", "collect_infra", "collect_subagents")
+
+    def setUp(self):
+        self._saved = {n: getattr(roost, n) for n in self.PATCHED}
+        self._last = roost._LAST_COLLECT
+        self.collects = 0
+
+        def workers():
+            self.collects += 1
+            return [worker(idle_secs=5)]
+
+        roost.collect_workers = workers
+        roost.collect_infra = lambda: []
+        roost.collect_subagents = lambda sids: []
+
+    def tearDown(self):
+        for name, fn in self._saved.items():
+            setattr(roost, name, fn)
+        roost._LAST_COLLECT = self._last
+
+    def test_nothing_is_due_inside_the_first_second(self):
+        self.assertIsNone(roost.tick_action(now=10.5, deadline=20.0, painted_at=10.0))
+
+    def test_repaint_is_due_after_a_second_without_a_collect(self):
+        self.assertEqual(roost.tick_action(now=11.0, deadline=20.0, painted_at=10.0),
+                         "repaint")
+
+    def test_collect_deadline_outranks_the_repaint_tick(self):
+        self.assertEqual(roost.tick_action(now=20.0, deadline=20.0, painted_at=10.0),
+                         "collect")
+
+    def test_wait_slice_stops_at_the_earliest_event(self):
+        # resize slice is the nearest
+        self.assertAlmostEqual(roost.wait_slice(10.0, 20.0, 10.0, 0.2), 0.2)
+        # repaint tick is the nearest
+        self.assertAlmostEqual(roost.wait_slice(10.9, 20.0, 10.0, 0.2), 0.1)
+        # collect deadline is the nearest
+        self.assertAlmostEqual(roost.wait_slice(19.95, 20.0, 19.5, 0.2), 0.05)
+        # never negative, even when a tick is already overdue
+        self.assertEqual(roost.wait_slice(12.0, 20.0, 10.0, 0.2), 0.0)
+
+    def test_a_slice_tick_repaints_without_collecting(self):
+        """Drive the loop's decision on a fake clock: the tick says repaint,
+        the repaint renders the cached snapshot, and no collector runs and
+        the collect clock does not move -- so the age chip that the repaint
+        paints reports data age, and a larger number than before."""
+        snap = roost.collect_snapshot()
+        stamp = roost._LAST_COLLECT
+        self.assertEqual(self.collects, 1)
+        painted_at = stamp
+        deadline = stamp + 10.0  # as with --watch 10
+        ages = []
+        for tick in (1, 2, 3):
+            now = stamp + tick * roost.REPAINT_SECONDS
+            self.assertEqual(roost.tick_action(now, deadline, painted_at), "repaint")
+            roost.render_frame(snap)   # what the loop does on "repaint"
+            ages.append(roost.header_title(150, "h", "12:00:00",
+                                           age_secs=now - roost._LAST_COLLECT))
+            painted_at = now
+        self.assertEqual(self.collects, 1)
+        self.assertEqual(roost._LAST_COLLECT, stamp)
+        self.assertIn("updated 1s ago", ages[0])
+        self.assertIn("updated 2s ago", ages[1])
+        self.assertIn("updated 3s ago", ages[2])
+
+    def test_loading_dots_move_across_repaint_ticks(self):
+        real = roost.time.time
+        seen = []
+        try:
+            for tick in range(4):
+                roost.time.time = lambda t=100.0 + tick * roost.REPAINT_SECONDS: t
+                seen.append(roost.loading_dots())
+        finally:
+            roost.time.time = real
+        self.assertGreater(len(set(seen)), 1)
+
+
+class TestResizeThrottle(unittest.TestCase):
+    """Mid-drag the loop repaints live from cache, throttled; the settle
+    paint still lands once the drag stops. Driven on a fake clock -- the
+    policy takes `now` -- so a whole drag runs without sleeping."""
+
+    def test_first_change_paints_immediately(self):
+        rt = roost.ResizeThrottle(interval=0.12)
+        self.assertTrue(rt.poll((100, 40), (150, 40), now=10.0))
+
+    def test_mid_drag_paints_are_throttled(self):
+        rt = roost.ResizeThrottle(interval=0.12)
+        self.assertTrue(rt.poll((100, 40), (150, 40), 10.00))
+        # still moving, but inside the throttle window: no paint yet
+        self.assertFalse(rt.poll((99, 40), (100, 40), 10.05))
+        self.assertFalse(rt.poll((98, 40), (100, 40), 10.10))
+        # window elapsed: the next sampled width paints
+        self.assertTrue(rt.poll((97, 40), (100, 40), 10.13))
+
+    def test_settle_paint_lands_after_a_throttled_tail(self):
+        rt = roost.ResizeThrottle(interval=0.12)
+        self.assertTrue(rt.poll((100, 40), (150, 40), 10.00))  # painted at 100
+        self.assertFalse(rt.poll((95, 40), (100, 40), 10.05))  # throttled away
+        # The drag stopped at 95 but the last paint was at 100. The lasting
+        # mismatch buys the final settle paint once the window passes...
+        self.assertTrue(rt.poll((95, 40), (100, 40), 10.20))
+        # ...and a size that matches what was painted never paints again.
+        self.assertFalse(rt.poll((95, 40), (95, 40), 10.40))
+
+    def test_stable_size_never_paints(self):
+        rt = roost.ResizeThrottle()
+        for t in (1.0, 2.0, 3.0):
+            self.assertFalse(rt.poll((150, 40), (150, 40), t))
+
+    def test_slices_shorten_only_while_dragging(self):
+        rt = roost.ResizeThrottle()
+        self.assertEqual(rt.slice_len(10.0), 0.2)  # idle: keypress-latency slice
+        rt.poll((100, 40), (150, 40), 10.0)        # a drag starts
+        # sampling must outpace the throttle or the live paints never land
+        self.assertLess(rt.slice_len(10.1), rt.interval)
+        self.assertEqual(rt.slice_len(11.0), 0.2)  # quiet again: back off
 
 
 class TestTerminateGuard(unittest.TestCase):
@@ -1713,8 +2265,8 @@ class TestRenderGateway(unittest.TestCase):
             probed_at=probed, runs=[self.batch(last_write_secs=117 * 3600)])))
         self.assertIn("probed 21:04:15", out)
         self.assertIn("LAST WRITE", out)
-        self.assertIn("117h00m ago", out)
-        self.assertNotRegex(out, r"(?m)^GATEWAY\s+117h")
+        self.assertIn("4d ago", out)  # 117h -- past 48h, ages read in days
+        self.assertNotRegex(out, r"(?m)^GATEWAY\s+4d")
 
 
 class TestRemoteHosts(unittest.TestCase):
@@ -2645,6 +3197,208 @@ class TestShellCompletion(unittest.TestCase):
             sys.argv, sys.stdout = argv, stdout
         self.assertIn("complete -F _roost roost", out)
         self.assertIn("--gateway", out)
+
+
+class _FakeStdout(object):
+    def __init__(self, tty=True, encoding="utf-8"):
+        self._tty = tty
+        self.encoding = encoding
+
+    def isatty(self):
+        return self._tty
+
+
+def _agent(**kw):
+    base = {"state": "working", "agent_type": "Explore", "agent_id": "abc123def0",
+            "parent_sid": "sid-1", "model": "claude-opus-5", "ctx_tokens": 48000,
+            "ctx_pct": 24.0, "window": "200k", "idle_secs": 5.0, "task": "scout"}
+    base.update(kw)
+    return base
+
+
+class TestGlyphDialects(unittest.TestCase):
+    """Two dialects, one vocabulary -- chosen by the terminal, not the product.
+
+    The Unicode tier (frames, dots, checks, real ellipses) may only appear on
+    an interactive UTF-8 stdout; the ASCII tier is the fallback and always the
+    dialect of pipe-safe output. The ASCII bytes are load-bearing: every other
+    test in this file asserts against them, so these tests also pin that the
+    module default stays ASCII and that Unicode never leaks into a pipe."""
+
+    def setUp(self):
+        roost.COLOR = False
+        self._env = os.environ.pop(roost.ASCII_ENV, None)
+
+    def tearDown(self):
+        roost.set_dialect(False)
+        if self._env is not None:
+            os.environ[roost.ASCII_ENV] = self._env
+        else:
+            os.environ.pop(roost.ASCII_ENV, None)
+
+    # ---- the probe, forced both ways ----------------------------------------
+
+    def test_posix_utf8_tty_probes_unicode(self):
+        for enc in ("utf-8", "UTF-8", "utf8", "cp65001"):
+            self.assertTrue(roost.probe_unicode(
+                _FakeStdout(tty=True, encoding=enc), windows=False, env={}), enc)
+
+    def test_posix_non_utf8_tty_stays_ascii(self):
+        self.assertFalse(roost.probe_unicode(
+            _FakeStdout(tty=True, encoding="latin-1"), windows=False, env={}))
+
+    def test_windows_utf8_tty_without_windows_terminal_stays_ascii(self):
+        """Since PEP 528 every Windows console reports utf-8 regardless of
+        its code page, so the encoding check cannot exclude legacy conhost.
+        Only Windows Terminal's own WT_SESSION marker can."""
+        self.assertFalse(roost.probe_unicode(
+            _FakeStdout(tty=True, encoding="utf-8"), windows=True, env={}))
+
+    def test_windows_terminal_probes_unicode(self):
+        self.assertTrue(roost.probe_unicode(
+            _FakeStdout(tty=True, encoding="utf-8"), windows=True,
+            env={"WT_SESSION": "8f2c1a0e-0000-4000-8000-000000000000"}))
+
+    def test_windows_terminal_pipe_still_stays_ascii(self):
+        self.assertFalse(roost.probe_unicode(
+            _FakeStdout(tty=False, encoding="utf-8"), windows=True,
+            env={"WT_SESSION": "x"}))
+
+    def test_pipe_stays_ascii_whatever_it_claims_to_encode(self):
+        self.assertFalse(roost.probe_unicode(
+            _FakeStdout(tty=False, encoding="utf-8"), windows=False, env={}))
+
+    def test_env_override_forces_ascii_on_a_capable_terminal(self):
+        self.assertFalse(roost.probe_unicode(
+            _FakeStdout(tty=True, encoding="utf-8"), windows=False,
+            env={roost.ASCII_ENV: "1"}))
+        self.assertFalse(roost.probe_unicode(
+            _FakeStdout(tty=True, encoding="utf-8"), windows=True,
+            env={roost.ASCII_ENV: "1", "WT_SESSION": "x"}))
+
+    def test_probe_defaults_read_the_real_platform(self):
+        # The injectable knobs default to os.name / os.environ, so main()'s
+        # bare call sees the actual machine. Pin that the default path does
+        # not blow up and agrees with the explicit one.
+        tty = _FakeStdout(tty=True, encoding="utf-8")
+        explicit = roost.probe_unicode(tty, windows=(os.name == "nt"), env=os.environ)
+        self.assertEqual(roost.probe_unicode(tty), explicit)
+
+    def test_pipe_safe_modes_never_consult_the_terminal(self):
+        # --once and --json pin ASCII even on a UTF-8 tty.
+        tty = _FakeStdout(tty=True, encoding="utf-8")
+        posix = dict(stdout=tty, windows=False, env={})
+        self.assertFalse(roost.choose_dialect(True, False, **posix))
+        self.assertFalse(roost.choose_dialect(False, True, **posix))
+        self.assertTrue(roost.choose_dialect(False, False, **posix))
+
+    def test_module_default_is_ascii(self):
+        # Import-time callers (tests, --json before main wires anything) must
+        # land on the historical bytes without any setup call.
+        self.assertFalse(roost.UNICODE)
+        self.assertIs(roost.GLYPHS, roost._GLYPHS_ASCII)
+
+    # ---- Unicode tier rendering ---------------------------------------------
+
+    def test_unicode_frames_the_subagents_panel(self):
+        roost.set_dialect(True)
+        lines = roost.render_subagents([_agent()])
+        self.assertEqual(lines[0], "")
+        self.assertTrue(lines[1].startswith("╭─ SUBAGENTS ─"), repr(lines[1]))
+        self.assertTrue(lines[1].endswith("╮"))
+        self.assertTrue(lines[-1].startswith("╰"))
+        self.assertTrue(lines[-1].endswith("╯"))
+        for body in lines[2:-1]:
+            self.assertTrue(body.startswith("│") and body.endswith("│"),
+                            repr(body))
+
+    def test_liveness_dots_in_the_state_slot(self):
+        roost.set_dialect(True)
+        out = "\n".join(roost.render_subagents(
+            [_agent(state="working"), _agent(state="idle", agent_id="ffff000000")]))
+        self.assertIn("● working", out)
+        self.assertIn("○ idle", out)
+
+    def test_infra_marks_gain_check_and_cross_but_off_stays_textual(self):
+        roost.set_dialect(True)
+        out = "\n".join(roost.render_infra([
+            {"name": "ollama", "port": 11434, "up": True, "detail": ""},
+            {"name": "litellm", "port": 4000, "up": False, "detail": ""},
+            {"name": "openwebui", "port": 8080, "up": False, "unseen": True,
+             "detail": ""}]))
+        self.assertIn("✓ up", out)
+        self.assertIn("✗ DOWN", out)
+        self.assertIn("off?", out)
+        self.assertNotIn("✓ off", out)
+        self.assertNotIn("✗ off", out)
+        self.assertTrue(out.splitlines()[0].startswith("╭─ INFRA ─"))
+
+    def test_quiet_joiner_and_overflow_ellipsis(self):
+        roost.set_dialect(True)
+        quiet = [worker(name="q%d" % i, idle_secs=7200.0, ctx_tokens=1000,
+                        ctx_pct=1.0, session_id="s%d" % i) for i in range(3)]
+        out = "\n".join(roost.render(quiet))
+        self.assertIn(" · ", out)
+        self.assertNotIn(" . ", out)
+        # The context bar stays ASCII in both dialects.
+        self.assertIn("[", "\n".join(roost.render([worker(idle_secs=5.0)])))
+
+    def test_frame_respects_forty_columns(self):
+        roost.set_dialect(True)
+        lines = roost.frame_panel("GATEWAY", ["x" * 100, "short"], cols=40)
+        for ln in lines:
+            self.assertLessEqual(roost.visible_len(ln), 39, repr(ln))
+
+    def test_no_mixed_frames(self):
+        # Every glyph inside a Unicode frame comes from the Unicode table:
+        # no "..." elision or " . " joiner may appear in framed output.
+        roost.set_dialect(True)
+        rows = [_agent()] + [_agent(agent_id="%010d" % i) for i in range(2)]
+        out = "\n".join(roost.render_subagents(rows))
+        self.assertNotIn("...", out)
+
+    # ---- ASCII byte-identity ------------------------------------------------
+
+    def _snapshot(self):
+        return {"workers": [worker(idle_secs=5.0)],
+                "agents": [_agent()],
+                "infra": [{"name": "ollama", "port": 11434, "up": True,
+                           "detail": "1 model"},
+                          {"name": "litellm", "port": 4000, "up": False,
+                           "detail": ""}]}
+
+    def test_ascii_frame_is_pure_ascii(self):
+        # The --once path renders exactly this with the module-default dialect:
+        # no dialect glyph may leak into pipe output.
+        lines, _, _ = roost.render_frame(self._snapshot(), view="agents")
+        for ln in lines:
+            for ch in ln:
+                self.assertLess(ord(ch), 127, repr(ln))
+
+    def test_ascii_bytes_unchanged_by_dialect_machinery(self):
+        # Render once with the machinery in its default state, then flip to
+        # Unicode and back: the ASCII output must be byte-identical, because
+        # --once/--json snapshots and every other test assert on those bytes.
+        before, _, _ = roost.render_frame(self._snapshot(), view="agents")
+        roost.set_dialect(True)
+        roost.set_dialect(False)
+        after, _, _ = roost.render_frame(self._snapshot(), view="agents")
+        self.assertEqual(before, after)
+        joined = "\n".join(before)
+        self.assertIn("INFRA  ", joined)
+        self.assertIn("SUBAGENTS", joined)
+        self.assertIn("DOWN", joined)
+        self.assertNotIn("╭", joined)
+
+    def test_unicode_render_frame_frames_every_panel(self):
+        roost.set_dialect(True)
+        lines, _, _ = roost.render_frame(self._snapshot(), view="agents")
+        joined = "\n".join(lines)
+        self.assertIn("╭─ INFRA ─", joined)
+        self.assertIn("╭─ SUBAGENTS ─", joined)
+        # The worker table itself stays unframed: its bucket gutter, cursor
+        # marker, and QUIET collapse line are a layout of their own.
+        self.assertIn("WORKER", joined)
 
 
 if __name__ == "__main__":

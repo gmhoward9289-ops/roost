@@ -232,7 +232,7 @@ def cursor_workspace_storage():
 def cursor_folder_uri_to_path(uri):
     """Decode a workspace.json folder URI to a local path, or None.
 
-    Accepts file:///… only; vscode-remote:// and other schemes are skipped.
+    Accepts file:///... only; vscode-remote:// and other schemes are skipped.
     Windows drive URIs (file:///c%3A/Users/...) decode to a PureWindowsPath
     string on every host -- Path.resolve() on POSIX would otherwise treat
     'C:\\Users\\...' as relative to the runner cwd.
@@ -345,6 +345,11 @@ _CURSOR_HEADERS_OK = False
 
 # Live mode may paint the first frame before localhost INFRA probes finish.
 _INFRA_ALLOW_DEFER = False
+
+# When collect_snapshot() last ran -- the header's "updated Ns ago" chip. It
+# deliberately survives render-only repaints (a resize reflows from cache), so
+# the chip reports data age, not paint age. None until the first collect.
+_LAST_COLLECT = None
 
 # sessionId -> {"prev": last ctx_tokens, "t": last sample time, "hist": deque}.
 # In-memory only: the sparkline shows flow since roost started, nothing older.
@@ -604,6 +609,27 @@ BLUE = "\033[34m"
 MAGENTA = "\033[35m"
 CYAN = "\033[36m"
 
+# Selection is the one painted background: black on cyan.
+SEL = "\033[30;46m"
+
+
+def _ident_blue():
+    """The identity colour: bright blue, always paired with BOLD by callers.
+
+    Plain ANSI blue (4) is illegible on common dark palettes, so request
+    xterm-256 index 12 when the terminal reports 256 colours; elsewhere fall
+    back to plain blue and let the mandatory BOLD brighten it on 8-colour
+    terminals.
+    """
+    if ("256" in os.environ.get("TERM", "")
+            or os.environ.get("COLORTERM") in ("truecolor", "24bit")
+            or os.environ.get("WT_SESSION")):
+        return "\033[38;5;12m"
+    return BLUE
+
+
+IDENT_BLUE = _ident_blue()
+
 # Set once in main(), after we know whether the terminal can render escapes.
 COLOR = False
 
@@ -614,16 +640,52 @@ def c(text, *codes):
     return "".join(codes) + text + RESET
 
 
-def highlight(line):
-    """Reverse-video a whole line that already contains colour.
+_SGR_RE = re.compile(r"\033\[([0-9;]*)m")
 
-    Every per-cell colour ends in RESET, which clears reverse video along with
-    the colour -- so a naive wrap highlights only up to the first coloured cell.
-    Re-arming after each RESET keeps the bar unbroken across the row.
+
+def _blacken_fg(params):
+    """Rewrite the foreground colour in one SGR parameter list to black (30),
+    keeping every non-colour attribute (bold, dim, reverse, reset) as it was.
+
+    Handles the three foreground forms: 30-37 and 90-97, 38;5;N (256-colour,
+    which IDENT_BLUE uses), and 38;2;R;G;B (truecolour).
+    """
+    out = []
+    parts = params.split(";") if params else [""]
+    i = 0
+    while i < len(parts):
+        p = parts[i]
+        if p.isdigit() and (30 <= int(p) <= 37 or 90 <= int(p) <= 97):
+            out.append("30")
+        elif p == "38" and i + 1 < len(parts) and parts[i + 1] == "5":
+            out.append("30")
+            i += 2
+        elif p == "38" and i + 1 < len(parts) and parts[i + 1] == "2":
+            out.append("30")
+            i += 4
+        else:
+            out.append(p)
+        i += 1
+    return ";".join(out)
+
+
+def highlight(line):
+    """Paint a whole line that already contains colour as the selection bar
+    (black on cyan -- the one painted background, uniformly).
+
+    Two things would otherwise break the bar. Every per-cell colour ends in
+    RESET, which clears the background along with the colour -- so a naive
+    wrap highlights only up to the first coloured cell; re-arming after each
+    RESET keeps the bar unbroken. And the cells keep their own foregrounds
+    (bright-blue WORKER, yellow/red CTX, bucket colours), which on a cyan
+    background read as blue-on-cyan and yellow-on-cyan mud; every inner
+    foreground is rewritten to black while BOLD/DIM survive, so weight still
+    carries the row's emphasis and the bar is one colour pair end to end.
     """
     if not COLOR:
         return line
-    return REVERSE + line.replace(RESET, RESET + REVERSE) + RESET
+    inner = _SGR_RE.sub(lambda m: "\033[" + _blacken_fg(m.group(1)) + "m", line)
+    return SEL + inner.replace(RESET, RESET + SEL) + RESET
 
 
 def ascii_safe(s):
@@ -631,6 +693,10 @@ def ascii_safe(s):
 
     Task text is free-form prose and often carries em dashes and smart quotes;
     the Windows console codepage turns those into replacement blobs mid-table.
+    Deliberately dialect-independent: transcript *data* is stripped even in
+    the Unicode dialect (it can contain anything, including width-breaking
+    characters), while the dialect table's own glyphs are added by the render
+    layer around this gate and never pass through it.
     """
     if not s:
         return ""
@@ -678,6 +744,144 @@ def clip_ansi(s, width):
     if COLOR:
         out.append(RESET)
     return "".join(out)
+
+
+# ---- glyph dialects ---------------------------------------------------------
+# Two dialects, one vocabulary -- chosen by the terminal, not the product
+# (docs/design-language.md in leghorn). The Unicode tier is the preferred
+# rendering wherever it can display: rounded frames around the panels, liveness
+# dots, check/cross marks, real ellipses and middle-dot separators. The ASCII
+# tier is the fallback and *always* the dialect of pipe-safe output: pipes,
+# --once, and --json keep their historical bytes exactly. Every glyph comes
+# from the active table -- a frame must never mix dialects.
+#
+# The [###---] context bars stay ASCII in both dialects on purpose: they are a
+# data texture, not vocabulary, and the hash bar is legible everywhere.
+
+ASCII_ENV = "ROOST_ASCII"
+
+# Marker entries carry their own trailing space so the ASCII entry can be the
+# empty string without leaving a stray gap in front of the word it decorates.
+_GLYPHS_UNICODE = {
+    "ok": "✓ ",        # check mark before a green "up"
+    "fail": "✗ ",      # cross before a bold-red DOWN (the word stays)
+    "working": "● ",   # liveness dot: working
+    "idle": "○ ",      # liveness dot: idle / parked
+    "ell": "…",        # elision
+    "sep": "·",        # list separator (the QUIET joiner)
+    "tl": "╭", "tr": "╮", "bl": "╰", "br": "╯",
+    "h": "─", "v": "│",
+}
+_GLYPHS_ASCII = {
+    "ok": "", "fail": "", "working": "", "idle": "",
+    "ell": "...", "sep": ".",
+    # No frame entries: the ASCII dialect draws bold bare titles, never boxes.
+}
+
+# Module default is ASCII, which keeps every import-time caller (tests, --json,
+# --once) on the historical byte-identical output. Only main()'s live path may
+# switch, once, after probing the terminal.
+UNICODE = False
+GLYPHS = _GLYPHS_ASCII
+
+
+def set_dialect(unicode_on):
+    """Select the glyph table once for the whole session."""
+    global UNICODE, GLYPHS
+    UNICODE = bool(unicode_on)
+    GLYPHS = _GLYPHS_UNICODE if UNICODE else _GLYPHS_ASCII
+
+
+def probe_unicode(stdout=None, windows=None, env=None):
+    """True when stdout is an interactive UTF-8 terminal that can draw glyphs.
+
+    Three gates, all required: stdout is a tty (a pipe never gets the Unicode
+    tier whatever encoding it reports), Python's stdout encoding is UTF-8, and
+    -- on Windows only -- WT_SESSION is set. That last gate is the one that
+    actually excludes legacy conhost: since PEP 528 (Python 3.6) every Windows
+    console reports utf-8 regardless of its code page, so the encoding check
+    alone cannot tell Windows Terminal from a conhost window whose raster font
+    has no box-drawing glyphs. WT_SESSION is set by Windows Terminal and
+    nothing else. On POSIX the tty's encoding is the whole story.
+    ROOST_ASCII=1 forces the ASCII dialect regardless -- the escape hatch for
+    a terminal that lies.
+
+    `windows` and `env` are injectable for tests; the defaults read the real
+    platform and environment.
+    """
+    env = os.environ if env is None else env
+    if env.get(ASCII_ENV):
+        return False
+    out = stdout if stdout is not None else sys.stdout
+    try:
+        if not out.isatty():
+            return False
+    except (AttributeError, ValueError):
+        return False
+    enc = (getattr(out, "encoding", "") or "").replace("-", "").replace("_", "").lower()
+    if enc not in ("utf8", "cp65001"):
+        return False
+    if windows is None:
+        windows = os.name == "nt"
+    if windows and not env.get("WT_SESSION"):
+        return False
+    return True
+
+
+def choose_dialect(pipe_safe, force_ascii, stdout=None, **probe):
+    """The startup decision: pipe-safe modes (--once, --json) and an explicit
+    --ascii both pin the ASCII dialect before the terminal is even consulted.
+    Extra keywords pass through to probe_unicode (tests inject the platform)."""
+    if pipe_safe or force_ascii:
+        return False
+    return probe_unicode(stdout, **probe)
+
+
+def frame_panel(title, body, cols=None):
+    """Wrap rendered panel lines in a rounded frame -- Unicode dialect only.
+
+    Chrome cyan at dim weight, uppercase title inset two columns and painted
+    bold, matching leghorn's Pane.frame. Width hugs the widest body line but
+    never reaches the terminal's last column (a glyph in the final cell wraps
+    onto the next row and persists). The ASCII dialect never calls this: its
+    panels keep their bold bare titles, byte-identical to the historical
+    output.
+    """
+    if cols is None:
+        cols = term_size()[0]
+    label = " %s " % title
+    inner = max([visible_len(ln) for ln in body] + [len(label) + 4])
+    inner = min(inner, cols - 3)
+    label = label[: max(0, inner - 2)]
+    top = (c(GLYPHS["tl"] + GLYPHS["h"], CYAN, DIM)
+           + c(label, BOLD, CYAN)
+           + c(GLYPHS["h"] * max(0, inner - 1 - len(label)) + GLYPHS["tr"],
+               CYAN, DIM))
+    edge = c(GLYPHS["v"], CYAN, DIM)
+    out = [top]
+    for ln in body:
+        clipped = clip_ansi(ln, inner)
+        out.append(edge + clipped + " " * (inner - visible_len(clipped)) + edge)
+    out.append(c(GLYPHS["bl"] + GLYPHS["h"] * inner + GLYPHS["br"], CYAN, DIM))
+    return out
+
+
+def panel(title, body, extra=None):
+    """Assemble one titled panel in the active dialect.
+
+    Unicode: a rounded frame with the title inset on the top border. ASCII:
+    the historical bold bare title line, byte-identical to what it always
+    printed. `extra` is the dim annotation the ASCII title line carries after
+    the name (e.g. DETAIL's "esc returns"); in the Unicode dialect the title
+    lives on the border, so the annotation becomes the first body line.
+    """
+    if UNICODE:
+        inner = ([c("  " + extra, DIM)] if extra else []) + body
+        return [""] + frame_panel(title, inner)
+    head = c(title, BOLD)
+    if extra:
+        head += "  " + c(extra, DIM)
+    return ["", head] + body
 
 
 def alive(pid):
@@ -1792,7 +1996,7 @@ def infra_cached():
     the INFRA line, then hands refreshing to a daemon thread. Staleness is
     bounded by INFRA_REFRESH_SECONDS plus one probe.
 
-    Live mode sets _INFRA_ALLOW_DEFER so the first paint can show "…" instead
+    Live mode sets _INFRA_ALLOW_DEFER so the first paint can show loading dots instead
     of waiting on three localhost connects (filtered ports time out on Windows).
     """
     global _INFRA_SNAPSHOT, _INFRA_THREAD
@@ -2207,12 +2411,12 @@ def render_gateway(gw):
     """LiteLLM plus everything it has been fed, without asking it anything --
     a DB-less gateway keeps no history, so the batch pipeline's own output
     files carry the progress story."""
-    title = c("GATEWAY", BOLD)
     probed = gw.get("probed_at")
-    if probed is not None:
-        title += "  " + c("probed " + time.strftime("%H:%M:%S", time.localtime(probed)), DIM)
-    lines = ["", title]
-    mark = c("up", GREEN) if gw["litellm_up"] else c("DOWN", BOLD, RED)
+    extra = ("probed " + time.strftime("%H:%M:%S", time.localtime(probed))
+             if probed is not None else None)
+    lines = []
+    mark = (c(GLYPHS["ok"] + "up", GREEN) if gw["litellm_up"]
+            else c(GLYPHS["fail"] + "DOWN", BOLD, RED))
     head = "  litellm %s (127.0.0.1:%d)" % (mark, LITELLM_PORT)
     if gw["last_req_secs"] is not None:
         head += "   last request %s ago" % dur(gw["last_req_secs"])
@@ -2259,7 +2463,7 @@ def render_gateway(gw):
 
     if not gw["runs"]:
         lines.append(c("  no batch runs found", DIM))
-        return lines
+        return panel("GATEWAY", lines, extra=extra)
 
     cols = [
         ("BATCH RUN", lambda r: r["name"]),
@@ -2286,7 +2490,7 @@ def render_gateway(gw):
         lines.append(c(line, GREEN) if r["active"] else c(line, DIM))
     active = sum(1 for r in gw["runs"] if r["active"])
     lines.append("  " + c("%d run(s), %d active" % (len(gw["runs"]), active), DIM))
-    return lines
+    return panel("GATEWAY", lines, extra=extra)
 
 
 # host -> {"data", "t", "err", "thread"}. Fetches run on daemon threads so a
@@ -2358,10 +2562,10 @@ def render_remote(remotes):
     """One summary row per remote host, rendered from that host's own
     `roost --json` over ssh. Data is cached: a host that stops answering keeps
     its last good row with the age saying how old it is."""
-    lines = ["", c("REMOTE", BOLD)]
     if not remotes:
-        lines.append(c("  set %s (comma-separated ssh aliases)" % REMOTES_ENV, DIM))
-        return lines
+        return panel("REMOTE", [
+            c("  set %s (comma-separated ssh aliases)" % REMOTES_ENV, DIM)])
+    lines = []
 
     cols = [
         ("HOST", lambda r: r["host"]),
@@ -2378,7 +2582,7 @@ def render_remote(remotes):
         if d is None:
             view.append({"host": r["host"], "nworkers": "-", "working": "-",
                          "resident": "-", "batch": "-", "jobs": "-",
-                         "age": "fetching..." if r["fetching"]
+                         "age": "fetching" + GLYPHS["ell"] if r["fetching"]
                                 else (r["err"] or "-"), "stale": True})
             continue
         workers = d.get("workers") or []
@@ -2425,7 +2629,7 @@ def render_remote(remotes):
             else:
                 cells.append(txt)
         lines.append("  " + "  ".join(cells))
-    return lines
+    return panel("REMOTE", lines)
 
 
 def parse_budget(s):
@@ -2529,15 +2733,15 @@ def collect_usage():
 
 
 def render_usage(days):
-    lines = ["", c("USAGE", BOLD) + "  "
-             + c("observed transcript tokens (input+output) -- an estimate, "
-                 "not the Anthropic meter", DIM)]
+    extra = ("observed transcript tokens (input+output) -- an estimate, "
+             "not the Anthropic meter")
+    lines = []
     # Day keys come from transcript timestamps, which are UTC -- so the day
     # boundary is UTC too. Keep only the window and newest first.
     recent = sorted(days, reverse=True)[:USAGE_DAYS]
     if not recent:
         lines.append(c("  nothing recorded in the last %d days" % USAGE_DAYS, DIM))
-        return lines
+        return panel("USAGE", lines, extra=extra)
 
     today = time.strftime("%Y-%m-%d", time.gmtime())
     rows = []
@@ -2579,7 +2783,7 @@ def render_usage(days):
         lines.append("  " + c("set %s (e.g. 60M) to measure against your plan -- "
                               "calibrate the number from /usage once" % USAGE_BUDGET_ENV,
                               DIM))
-    return lines
+    return panel("USAGE", lines, extra=extra)
 
 
 # ---- advisory thresholds ----------------------------------------------------
@@ -2614,7 +2818,8 @@ def advise(workers):
         # abandon, "migrate the database" is not.
         task = ascii_safe(r.get("task") or "")
         if len(task) > ADVICE_TASK_WIDTH:
-            task = task[:ADVICE_TASK_WIDTH - 3] + "..."
+            ell = GLYPHS["ell"]
+            task = task[:ADVICE_TASK_WIDTH - len(ell)] + ell
         saving = tok - TYPICAL_BASELINE
 
         if tok >= EXPENSIVE_TOKENS and idle_h >= PARKED_IDLE_HOURS:
@@ -2643,10 +2848,11 @@ def advise(workers):
                         "idle %.1fh at %.0f%%. Costs nothing while it sits, but it hides "
                         "the sessions that matter -- close it." % (idle_h, pct)))
 
-    lines = [c("ADVICE", BOLD)]
     if not out:
-        lines.append("  nothing to act on -- no parked, oversized, or stale sessions")
-        return lines
+        return panel(
+            "ADVICE",
+            ["  nothing to act on -- no parked, oversized, or stale sessions"])
+    lines = []
     for _, label, tag, task, text in sorted(out, key=lambda x: -x[0]):
         head = "  %s  %s" % (label, c(tag, BOLD))
         if task:
@@ -2662,7 +2868,7 @@ def advise(workers):
                      "same %d sessions started fresh would cost %s -- a %.1fx difference."
                      % (len(workers), c("{:,}".format(total), BOLD), len(workers),
                         "{:,}".format(ideal), total / float(ideal)))
-    return lines
+    return panel("ADVICE", lines)
 
 
 def growth(history):
@@ -2684,6 +2890,12 @@ def growth(history):
 
 
 def dur(secs):
+    """One-unit age: 45s, 12m, 3h, 2d (the charter's text convention).
+
+    The largest unit that fits, truncated -- 90 seconds is "1m", 47 hours is
+    "1d". Two-unit forms like "47h59m" bought false precision at the cost of
+    width and a visible cliff where they gave way to days.
+    """
     if secs is None:
         return "-"
     secs = int(secs)
@@ -2691,7 +2903,9 @@ def dur(secs):
         return "%ds" % secs
     if secs < 3600:
         return "%dm" % (secs // 60)
-    return "%dh%02dm" % (secs // 3600, (secs % 3600) // 60)
+    if secs < 86400:
+        return "%dh" % (secs // 3600)
+    return "%dd" % (secs // 86400)
 
 
 def compact(n):
@@ -2733,7 +2947,9 @@ def bar(pct):
 
     Carries what a WIN column used to: a short bar beside a large token count
     reads as "big window, room to spare" without a separate column saying so.
-    ASCII only -- block-drawing characters mojibake in the Windows console.
+    ASCII in both dialects on purpose: the bar is a data texture, not glyph
+    vocabulary, and [###---] is legible everywhere including the
+    legacy-codepage Windows console.
     """
     if pct is None:
         return "[" + " " * BAR_WIDTH + "]"
@@ -2864,11 +3080,13 @@ def render(workers, sel=None):
         lines.append(highlight(line) if i == sel else line)
 
     if quiet:
-        names = " . ".join(x["name"] for x in quiet[:12])
-        if len(quiet) > 12:
-            names += " . +%d" % (len(quiet) - 12)
+        names = (" %s " % GLYPHS["sep"]).join(x["name"] for x in quiet[:12])
+        # Attention colour, not dim: a list cut short must say so loudly
+        # enough to be seen, or the truncation is a lie.
+        tail = (c(" %s +%d" % (GLYPHS["sep"], len(quiet) - 12), YELLOW)
+                if len(quiet) > 12 else "")
         lines.append("")
-        lines.append(c("QUIET (%d)  " % len(quiet), BOLD, DIM) + c(names, DIM))
+        lines.append(c("QUIET (%d)  " % len(quiet), BOLD, DIM) + c(names, DIM) + tail)
 
     # Totals, because the per-row numbers do not add up in your head. The one
     # that matters is context held across the fleet: it is what a sweep would
@@ -2897,30 +3115,48 @@ def render(workers, sel=None):
     return lines
 
 
+def loading_dots():
+    """Animated loading marker, derived from the clock.
+
+    A static dim label is indistinguishable from a dead one; deriving the dot
+    count from time gives visible motion for free on interactive paints, and
+    the watch loop's once-a-second repaint tick (tick_action) is what makes
+    those paints happen between collects. This is only ever called on the
+    live path -- one-shot and pipe output never render a loading state, so
+    their bytes stay stable for snapshot tests. Padded to its widest frame so
+    the rest of the line never shifts.
+    """
+    return ("." * (int(time.time() * 2) % 3 + 1)).ljust(3)
+
+
 def render_infra(infra):
     """One horizontal line: it is always present and rarely the thing you need."""
     parts = []
     any_unseen = False
     for s in infra:
         if s["up"] is None:
-            mark = c("…", DIM)
+            mark = c(loading_dots(), DIM)
         elif s["up"]:
-            mark = c("up", GREEN)
+            mark = c(GLYPHS["ok"] + "up", GREEN)
         elif s.get("unseen"):
             # Never answered on an untouched default port: probably not a
             # crashed service but a port we were never told about, so no red.
+            # Stays textual in both dialects -- off? is the unseen state, and
+            # it must not read like either the check or the cross.
             mark = c("off?", DIM)
             any_unseen = True
         else:
-            mark = c("DOWN", BOLD, RED)
+            mark = c(GLYPHS["fail"] + "DOWN", BOLD, RED)
         extra = ""
         if s["up"] and s["detail"]:
             extra = " " + c(s["detail"], CYAN)
         parts.append("%s:%d %s%s" % (c(s["name"], BOLD), s["port"], mark, extra))
-    line = c("INFRA  ", BOLD) + "   ".join(parts)
+    body = "   ".join(parts)
     if any_unseen:
-        line += "   " + c("off? = never up here; set ROOST_*_PORT if it runs elsewhere", DIM)
-    return [line, ""]
+        body += "   " + c("off? = never up here; set ROOST_*_PORT if it runs elsewhere", DIM)
+    if UNICODE:
+        return frame_panel("INFRA", [" " + body]) + [""]
+    return [c("INFRA  ", BOLD) + body, ""]
 
 
 def _pct_color(pct):
@@ -3016,9 +3252,6 @@ def render_usage_caps(usage):
     return [label + "  ".join(parts) + suffix, ""]
 
 
-MODEL_COLORS = {"opus": MAGENTA, "sonnet": BLUE, "fable": CYAN, "haiku": GREEN}
-
-
 def style_cell(header, text, row):
     """Colour one padded cell. Padding is already applied, so widths are fixed."""
     if header == "CTX":
@@ -3035,10 +3268,13 @@ def style_cell(header, text, row):
         # grows, and colouring it would put warning colour on healthy rows and
         # compete with CTX, which is the column that actually says "act on me".
         return c(text, DIM)
+    if header == "WORKER":
+        # The identity role: bright blue, always bold. It used to sit unstyled
+        # while each model family claimed its own colour -- but a colour per
+        # model spends the semantic roles (magenta is divergence, cyan is
+        # chrome, green is ok) on a fact the MODEL column already states.
+        return c(text, BOLD, IDENT_BLUE)
     if header == "MODEL":
-        for family, code in MODEL_COLORS.items():
-            if family in (row["model"] or ""):
-                return c(text, code)
         return c(text, DIM)
     if header == "IDLE":
         # This 1-hour mark only dims the IDLE column for readability. The
@@ -3053,8 +3289,6 @@ def style_cell(header, text, row):
         return text
     if header == "NAME":
         return c(text, BOLD)
-    if header == "FLOW":
-        return c(text, CYAN)
     if header in ("TOKENS", "WIN", "PID"):
         return c(text, DIM)
     return text
@@ -3063,13 +3297,17 @@ def style_cell(header, text, row):
 def render_subagents(agents, sel=None):
     """Subagents are the work a session farmed out -- and they are invisible in
     any pid-based view, since they share the parent's process."""
-    lines = ["", c("SUBAGENTS", BOLD)]
     if not agents:
-        lines.append(c("  none running", DIM))
-        return lines
+        return panel("SUBAGENTS", [c("  none running", DIM)])
+    lines = []
 
     cols = [
-        ("STATE", lambda r: r["state"]),
+        # The STATE cell is the one marker slot this table has, so it carries
+        # the liveness dot in the Unicode dialect (empty-string glyphs in
+        # ASCII): filled while working, hollow otherwise. The word stays --
+        # the dot is reinforcement, not replacement.
+        ("STATE", lambda r: (GLYPHS["working"] if r["state"] == "working"
+                             else GLYPHS["idle"]) + r["state"]),
         # The agent type is the readable name, but the parent only records it in
         # the tool result -- a still-running agent has no type yet, so the hex id
         # is kept as a suffix (and the whole label while running) to stay unique.
@@ -3108,15 +3346,14 @@ def render_subagents(agents, sel=None):
 
     working = sum(1 for r in agents if r["state"] == "working")
     lines.append("  " + c("%d subagent(s), %d working" % (len(agents), working), DIM))
-    return lines
+    return panel("SUBAGENTS", lines)
 
 
 def render_detail(row, children=None):
     """Read-only row detail. Replaces the panel slot; esc returns."""
-    lines = ["", c("DETAIL", BOLD) + "  " + c("esc returns", DIM)]
     if not row:
-        lines.append(c("  no row selected", DIM))
-        return lines
+        return panel("DETAIL", [c("  no row selected", DIM)], extra="esc returns")
+    lines = []
     is_agent = "agent_id" in row and "parent_sid" in row
     lines.append("  " + c("subagent" if is_agent else "worker", BOLD))
 
@@ -3169,7 +3406,7 @@ def render_detail(row, children=None):
                 label = a.get("agent_type") or (a.get("agent_id") or "")[:10]
                 lines.append("    %s  %s  %s" % (
                     a.get("state", "-"), label, ascii_safe(a.get("task") or "")))
-    return lines
+    return panel("DETAIL", lines, extra="esc returns")
 
 
 def tab_table_focus(focus, view):
@@ -3184,10 +3421,10 @@ def render_models(models):
     model that is installed but idle drops out of it entirely. This is the
     full inventory: everything `ollama list` knows about, with residency and
     VRAM called out for whichever happen to be loaded."""
-    lines = ["", c("LOCAL MODELS", BOLD)]
     if not models:
-        lines.append(c("  none installed (or ollama not running)", DIM))
-        return lines
+        return panel("LOCAL MODELS",
+                     [c("  none installed (or ollama not running)", DIM)])
+    lines = []
 
     cols = [
         ("MODEL", lambda m: m["name"]),
@@ -3213,7 +3450,7 @@ def render_models(models):
 
     resident = sum(1 for m in models if m["resident"])
     lines.append("  " + c("%d installed, %d resident" % (len(models), resident), DIM))
-    return lines
+    return panel("LOCAL MODELS", lines)
 
 
 # name, key, what it shows. Not a keybinding reference -- the footer hint
@@ -3270,9 +3507,11 @@ def render_help():
     # Same gutter shape as the worker table: label beside its text, not above
     # it. That halves the panel's height, and the text wraps to the window
     # instead of running off the right edge as one clipped line.
-    body = max(20, shutil.get_terminal_size((150, 40)).columns - lw - 5)
+    # The frame borders and their padding cost four more columns in Unicode.
+    body = max(20, shutil.get_terminal_size((150, 40)).columns - lw
+               - (9 if UNICODE else 5))
 
-    lines = ["", c("HELP", BOLD)]
+    lines = []
     for label, (_, _, text) in zip(labels, HELP_SCREENS):
         wrapped = textwrap.wrap(text, body) or [""]
         for i, part in enumerate(wrapped):
@@ -3282,24 +3521,60 @@ def render_help():
     lines.append("  " + c("interactive mode (i) arms the cursor: j/k select, Tab "
                           "switches tables, Enter opens a row, x stop, "
                           "y copy sessionId, esc deselect.", DIM))
-    return lines
+    return panel("HELP", lines)
 
 
-def frame(view=None, sel=None, focus="workers", detail=None):
-    """Returns (lines, rows, sel). `view` is the open panel: "agents",
+def collect_snapshot(view=None, focus="workers", detail=None):
+    """Run every collector the current view needs and stamp the collect clock.
+
+    Collection and rendering used to be fused in frame(), which meant a window
+    resize could not reflow the display without paying for a full rescan of
+    transcripts and processes. The snapshot is the seam: the watch loop keeps
+    the last one and can re-render it at a new width for free. The view/focus
+    gating is unchanged from the fused version -- panel collectors only run for
+    the panel that is actually open.
+    """
+    workers = collect_workers()
+    live_sids = set(w["session_id"] for w in workers if w.get("session_id"))
+    agents = []
+    if view in ("agents", "detail") or focus == "agents":
+        agents = collect_subagents(live_sids)
+    snap = {"workers": workers, "agents": agents, "infra": infra_cached()}
+    if view == "detail":
+        kids = []
+        if detail and detail.get("session_id"):
+            kids = [a for a in agents if a.get("parent_sid") == detail.get("session_id")]
+            if not kids:
+                kids = collect_subagents({detail["session_id"]})
+        snap["detail_kids"] = kids
+    elif view == "models":
+        snap["models"] = collect_local_models()
+    elif view == "usage":
+        snap["usage"] = collect_usage()
+    elif view == "gateway":
+        snap["gateway"] = collect_gateway()
+    elif view == "remote":
+        snap["remote"] = collect_remote()
+    prune_caches()
+    global _LAST_COLLECT
+    _LAST_COLLECT = time.time()
+    return snap
+
+
+def render_frame(snap, view=None, sel=None, focus="workers", detail=None):
+    """Render a collected snapshot; touches no collector and no clock.
+
+    Returns (lines, rows, sel). `view` is the open panel: "agents",
     "models", "advice", "usage", "help", "detail", or None for the bare worker table.
 
     `rows` is what the cursor indexes for the focused table (workers or
     subagents). `sel` comes back clamped: sessions exit between frames, and a
     cursor left pointing past the end would silently address nothing.
     """
-    workers = collect_workers()
+    workers = snap["workers"]
     shown, _ = arrange(workers, expand_quiet=sel is not None and focus == "workers")
     worker_rows = [w for _, w in shown]
-    live_sids = set(w["session_id"] for w in workers if w.get("session_id"))
-    agents = []
-    if view in ("agents", "detail") or focus == "agents":
-        agents = collect_subagents(live_sids)
+    agents = snap["agents"]
     if focus == "agents":
         rows = agents
     else:
@@ -3308,7 +3583,7 @@ def frame(view=None, sel=None, focus="workers", detail=None):
         sel = min(sel, len(rows) - 1) if rows else None
     # Infra leads because it is a constant: one quiet line you skim past, which
     # is exactly the weight it deserves until something turns red.
-    lines = render_infra(infra_cached())
+    lines = render_infra(snap["infra"])
     win_note = window_config_note()
     if win_note:
         lines.append(c("WINDOW ", BOLD) + win_note)
@@ -3320,28 +3595,28 @@ def frame(view=None, sel=None, focus="workers", detail=None):
         lines.extend(render_subagents(
             agents, sel=sel if focus == "agents" else None))
     elif view == "detail":
-        kids = []
-        if detail and detail.get("session_id"):
-            kids = [a for a in agents if a.get("parent_sid") == detail.get("session_id")]
-            if not kids:
-                kids = collect_subagents({detail["session_id"]})
-        lines.extend(render_detail(detail, children=kids))
+        lines.extend(render_detail(detail, children=snap.get("detail_kids", [])))
     elif view == "models":
-        lines.extend(render_models(collect_local_models()))
+        lines.extend(render_models(snap.get("models")))
     elif view == "usage":
-        lines.extend(render_usage(collect_usage()))
+        lines.extend(render_usage(snap.get("usage")))
     elif view == "gateway":
-        lines.extend(render_gateway(collect_gateway()))
+        lines.extend(render_gateway(snap.get("gateway")))
     elif view == "remote":
-        lines.extend(render_remote(collect_remote()))
+        lines.extend(render_remote(snap.get("remote")))
     elif view == "help":
         lines.extend(render_help())
     elif view == "advice":
-        lines.append("")
+        # advise() carries its own leading blank via panel().
         lines.extend(advise(workers))
     lines.extend(render(workers, sel if focus == "workers" else None))
-    prune_caches()
     return lines, rows, sel
+
+
+def frame(view=None, sel=None, focus="workers", detail=None):
+    """Collect and render in one call -- the shape --once and tests rely on."""
+    snap = collect_snapshot(view, focus=focus, detail=detail)
+    return render_frame(snap, view, sel, focus=focus, detail=detail)
 
 
 def prune_caches():
@@ -3515,6 +3790,186 @@ def term_size():
     return cols, rows
 
 
+RESIZE_REPAINT_S = 0.12  # minimum gap between live repaints during a drag
+
+
+class ResizeThrottle:
+    """Live repaint policy for a drag-resize.
+
+    The first cut of resize handling waited for the size to hold steady for a
+    full slice before repainting at all -- so mid-drag the terminal rewrapped
+    the stale frame into a jumble that only cleared once the drag stopped.
+    Now a moving size IS the signal: while it keeps changing, the loop
+    repaints from the cached snapshot at the current size, throttled to one
+    paint per RESIZE_REPAINT_S, and the mismatch left behind when the drag
+    stops buys the final paint at the settled size.
+
+    Pure decision logic over an injected clock, so tests can drive a whole
+    drag without sleeping. The loop owns the actual painting, which stays
+    render-from-cache: no collector runs and _LAST_COLLECT stays put.
+    """
+
+    def __init__(self, interval=RESIZE_REPAINT_S):
+        self.interval = interval
+        self._last_paint = 0.0
+        self._last_moving = 0.0
+
+    def poll(self, size, painted_size, now):
+        """True when the loop should repaint from cache at `size` now."""
+        if size == painted_size:
+            return False
+        self._last_moving = now
+        if now - self._last_paint < self.interval:
+            return False  # mid-drag, too soon: a later slice picks it up
+        self._last_paint = now
+        return True
+
+    def slice_len(self, now):
+        """Idle slice length for the key wait: shortened while a drag is in
+        flight so live repaints actually land at ~RESIZE_REPAINT_S cadence,
+        back to the keypress-latency slice once the size has gone quiet."""
+        return 0.05 if now - self._last_moving < 0.5 else 0.2
+
+
+REPAINT_SECONDS = 1.0  # render-from-cache cadence between collects
+
+
+def tick_action(now, deadline, painted_at):
+    """What an idle slice owes the frame.
+
+    "collect" once the collect deadline has passed; "repaint" once a whole
+    REPAINT_SECONDS has elapsed since the last paint; None to keep waiting.
+    Collection keeps its own (much longer) deadline. Between collects the frame
+    is repainted from the cached snapshot once a second so the clock, the
+    "updated Ns ago" chip and the loading dots visibly move -- before this
+    tick, repaints only followed collects, so the chip almost always read "0s"
+    and the dots never animated. A repaint runs no collector and leaves
+    _LAST_COLLECT alone, so the chip keeps reporting data age.
+    """
+    if now >= deadline:
+        return "collect"
+    if now - painted_at >= REPAINT_SECONDS:
+        return "repaint"
+    return None
+
+
+def wait_slice(now, deadline, painted_at, slice_len):
+    """How long the key wait may block before the loop needs control back:
+    the collect deadline, the next repaint tick, or the resize-poll slice,
+    whichever comes first. Never negative."""
+    return max(0.0, min(slice_len, deadline - now, painted_at + REPAINT_SECONDS - now))
+
+
+def key_hint(width, interactive=False, view=None):
+    """The footer key hint, degraded in a designed order rather than clipped.
+
+    It used to be one concatenated string ending "... h help | q quit",
+    hard-clipped at the right edge -- so the narrower the window, the sooner
+    q and h were destroyed, and they are the two hints with no other way to
+    be discovered. Now they are emitted first and survive every tier; the
+    optional chips append in a fixed order only while they fit.
+    """
+    def lit(key, on):
+        return c(key, BOLD, GREEN) if on else key
+
+    if interactive:
+        i_tag = c("i", BOLD, GREEN) + " interactive " + c("ARMED", BOLD, GREEN)
+        cur_tag = "j/k Tab Enter x y esc"
+    else:
+        i_tag = c("i", BOLD) + " interactive " + c("off  ", DIM)
+        cur_tag = c("j/k Tab Enter x y esc", DIM)
+    chips = [
+        "space refresh",
+        i_tag,
+        cur_tag,
+        lit("a", view == "advice") + " advice",
+        lit("s", view == "agents") + " agents",
+        lit("m", view == "models") + " models",
+        lit("u", view == "usage") + " usage",
+        lit("g", view == "gateway") + " gateway",
+        lit("r", view == "remote") + " remote",
+    ]
+    out = "q quit | " + lit("h", view == "help") + " help"
+    if visible_len(out) > width:
+        # Below the floor the hint keeps shrinking rather than overflowing:
+        # the header owns the width budget and must be able to trust that
+        # what it asked for is what it gets, or the safety tag to its right
+        # is what the edge clips. q is the last letter standing.
+        for short in ("q quit", "q"):
+            if len(short) <= width:
+                return short
+        return ""
+    for chip in chips:
+        cand = out + " | " + chip
+        if visible_len(cand) > width:
+            break
+        out = cand
+    return out
+
+
+EXPERIMENTAL_TAG = " EXPERIMENTAL "
+
+
+def header_title(cols, host, clock, age_secs=None, keys_enabled=True,
+                 interactive=False, view=None, tagged=False):
+    """Assemble the header's title line to fit `cols - 1` visible columns.
+
+    Fields shed in a fixed order under width pressure, least important first:
+    the key hint's optional chips, then the "updated Ns ago" age chip, then
+    the hostname, then the hint's floor ("q quit | h help" thins to "q quit",
+    then "q" -- q and h have no other way to be discovered, so they outrank
+    the chips that describe them). The product name and the clock come after
+    everything else -- a wall display must always answer "when did this last
+    update" -- and the clock is the last data element to go. When interactive
+    mode is armed the EXPERIMENTAL safety tag is reserved before any field is
+    even considered: the one marker that says "x can end a process" is never
+    what the right edge clips, even at the 20-column minimum, where it
+    outranks the name and finally the clock. paint() clips at cols - 1, so
+    the budget here is the same number.
+    """
+    budget = cols - 1
+    tag = c(EXPERIMENTAL_TAG, BOLD, REVERSE, YELLOW) if tagged else ""
+    reserve = visible_len(tag) + 1 if tagged else 0   # tag plus one gap
+    name = c("roost", BOLD)
+    parts = [name, clock]
+    used = visible_len(name) + 2 + len(clock)
+    if used + reserve > budget:
+        # Only below ~31 columns with the tag up: the name yields first, and
+        # the clock only if even it cannot share the row with the tag.
+        parts = [clock] if len(clock) + reserve <= budget else []
+        used = len(clock) if parts else 0
+    avail = budget - reserve - used
+    floor = (len("q quit | h help") if keys_enabled else len("Ctrl-C to stop")) + 3
+    optional = avail - floor  # room beyond the hint floor for host and age
+    if host and len(host) + 2 <= optional:
+        parts.insert(max(0, len(parts) - 1), c(host, CYAN))  # before the clock
+        avail -= len(host) + 2
+        optional -= len(host) + 2
+    title = "  ".join(parts)
+    if age_secs is not None:
+        upd = "updated %s ago" % dur(max(0, age_secs))
+        if len(upd) + 2 <= optional:
+            title += "  " + c(upd, DIM)
+            avail -= len(upd) + 2
+    if not keys_enabled:
+        hint = "Ctrl-C to stop" if len("Ctrl-C to stop") + 3 <= avail else ""
+    else:
+        # The hint's chips never reword when interactive is armed or a panel
+        # opens -- only the colours change, and "off" is padded to ARMED's
+        # width -- so the header cannot reflow underfoot. The armed state is
+        # spelled out, not just tinted: the one mode that can end a process
+        # should never be ambiguous.
+        hint = key_hint(avail - 3, interactive, view)
+    if hint:
+        title += ("   " if title else "") + c(hint, DIM)
+    if tagged:
+        # Pinned top-right so it sits above the table rather than anywhere
+        # the frame can clip it away; the reserve above guarantees the room.
+        pad = budget - visible_len(title) - visible_len(tag)
+        title += " " * max(1 if title else 0, pad) + tag
+    return title
+
+
 def paint(lines, vt):
     """Redraw in place.
 
@@ -3530,8 +3985,10 @@ def paint(lines, vt):
     if len(body) > rows - 1:
         hidden = len(body) - (rows - 2)
         body = body[: rows - 2] + [clip_ansi(
-            c("... %d more line(s) below -- taller window, or close a panel "
-              "(s/a/m/u/g/r/h)" % hidden, DIM), cols - 1)]
+            # Attention colour, not dim: this is the line that says the frame
+            # is lying about being complete.
+            c("%s %d more line(s) below -- taller window, or close a panel "
+              "(s/a/m/u/g/r/h)" % (GLYPHS["ell"], hidden), YELLOW), cols - 1)]
 
     # Version, bottom-right. Stamped onto whatever the last visible line turns
     # out to be -- including the overflow notice above -- so it cannot itself be
@@ -3566,6 +4023,11 @@ def build_parser():
     ap.add_argument("--version", action="version", version="roost " + __version__)
     ap.add_argument("--json", action="store_true", help="emit records as JSON and exit")
     ap.add_argument("--no-color", action="store_true", help="disable colour output")
+    ap.add_argument("--ascii", action="store_true",
+                    help="force the ASCII glyph dialect (also %s=1); an interactive "
+                         "UTF-8 terminal otherwise gets rounded frames and Unicode "
+                         "glyphs, while pipes, --once and --json are always ASCII"
+                         % ASCII_ENV)
     ap.add_argument("--advise", action="store_true",
                     help="start with the ADVICE panel open (toggle live with 'a')")
     ap.add_argument("--no-agents", action="store_true",
@@ -3655,6 +4117,7 @@ _arguments -S -C \\
   '(-1 --once)'{-1,--once}'[print a single frame and exit]' \\
   '--json[emit records as JSON and exit]' \\
   '--no-color[disable colour output]' \\
+  '--ascii[force the ASCII glyph dialect]' \\
   '--advise[start with the ADVICE panel open]' \\
   '--no-agents[start with the SUBAGENTS panel closed]' \\
   '--models[start with the LOCAL MODELS panel open]' \\
@@ -3709,6 +4172,10 @@ def main():
         return
 
     LOGGING = not args.no_log
+    # Dialect is decided once, up front: pipe-safe modes and --ascii pin the
+    # ASCII tier before the terminal is consulted, so --once/--json output
+    # stays byte-identical whatever the terminal can render.
+    set_dialect(choose_dialect(args.once or args.json, args.ascii))
     if args.ollama_port is not None:
         OLLAMA_PORT = args.ollama_port
         _PORT_CONFIGURED["ollama"] = True
@@ -3793,7 +4260,7 @@ def main():
         # for many seconds while hundreds of finished transcripts were scanned.
         host = socket.gethostname()
         msg = (c("roost", BOLD) + "  " + c(host, CYAN)
-               + "  " + c("loading…", DIM) + "\n")
+               + "  " + c("loading" + loading_dots(), DIM) + "\n")
         sys.stdout.write("\033[H" + msg)
         sys.stdout.flush()
 
@@ -3805,39 +4272,18 @@ def main():
     detail = None   # row shown in the DETAIL panel, or None
     pending = None  # the worker row awaiting a y/n answer
     note = None     # result of the last action, cleared by the next keypress
+    snap = None      # last collected snapshot -- a resize re-renders from it
+    collect_due = True  # ticks and keypresses collect; a bare resize does not
+    deadline = 0.0
+    resize = ResizeThrottle()  # outlives each frame so a drag stays throttled
     try:
         with KeyReader() as keys:
             while True:
-                if not keys.enabled:
-                    hint = "Ctrl-C to stop"
-                else:
-                    # One hint for every state. Its text never changes when
-                    # interactive is armed or a cursor is raised -- only the
-                    # colours do -- so the header cannot reflow underfoot
-                    # ("off" is even padded to ARMED's width). The armed state
-                    # is spelled out, not just tinted: a lone green "i" reads
-                    # as decoration, and the one mode that can end a process
-                    # should never be ambiguous. Cursor keys sit dimmed until
-                    # they can do something.
-                    if interactive:
-                        i_tag = c("i", BOLD, GREEN) + " interactive " + c("ARMED", BOLD, GREEN)
-                        cur_tag = "j/k Tab Enter x y esc"
-                    else:
-                        i_tag = c("i", BOLD) + " interactive " + c("off  ", DIM)
-                        cur_tag = c("j/k Tab Enter x y esc", DIM)
-                    a_tag = c("a", BOLD, GREEN) if view == "advice" else "a"
-                    s_tag = c("s", BOLD, GREEN) if view == "agents" else "s"
-                    m_tag = c("m", BOLD, GREEN) if view == "models" else "m"
-                    u_tag = c("u", BOLD, GREEN) if view == "usage" else "u"
-                    g_tag = c("g", BOLD, GREEN) if view == "gateway" else "g"
-                    r_tag = c("r", BOLD, GREEN) if view == "remote" else "r"
-                    h_tag = c("h", BOLD, GREEN) if view == "help" else "h"
-                    hint = ("space refresh | %s | %s | %s advice | %s agents | "
-                            "%s models | %s usage | %s gateway | %s remote | "
-                            "%s help | q quit") % (
-                        i_tag, cur_tag, a_tag, s_tag, m_tag, u_tag, g_tag,
-                        r_tag, h_tag)
-                lines, rows, sel = frame(view, sel, focus=focus, detail=detail)
+                if collect_due or snap is None:
+                    snap = collect_snapshot(view, focus=focus, detail=detail)
+                    deadline = time.time() + interval
+                    collect_due = False
+                lines, rows, sel = render_frame(snap, view, sel, focus=focus, detail=detail)
                 # A session can exit while its confirmation is on screen. Matching
                 # on pid rather than on the row dict is what makes that detectable:
                 # every frame rebuilds the dicts, so identity and equality both
@@ -3861,31 +4307,52 @@ def main():
                             pending["name"],), BOLD, RED)
                 else:
                     status = note or ""
-                title = (c("roost", BOLD) + "  " + c(socket.gethostname(), CYAN)
-                         + "  " + time.strftime("%H:%M:%S") + "   " + c(hint, DIM))
-                if keys.enabled and interactive:
-                    # Only while interactive mode is armed, because that is the
-                    # half that can end a process. Reading the dashboard has
-                    # never been the risky part. Pinned top-right so it sits
-                    # above the table rather than anywhere the frame can clip
-                    # it away.
-                    tag = c(" EXPERIMENTAL ", BOLD, REVERSE, YELLOW)
-                    pad = term_size()[0] - 1 - visible_len(title) - visible_len(tag)
-                    title += " " * max(1, pad) + tag
+                painted_size = term_size()
+                # The EXPERIMENTAL tag only while interactive mode is armed,
+                # because that is the half that can end a process; reading
+                # the dashboard has never been the risky part. header_title
+                # owns the shed order (hint, then age chip, then host; the
+                # clock and the tag never).
+                title = header_title(
+                    painted_size[0], socket.gethostname(), time.strftime("%H:%M:%S"),
+                    age_secs=(None if _LAST_COLLECT is None
+                              else time.time() - _LAST_COLLECT),
+                    keys_enabled=keys.enabled, interactive=interactive, view=view,
+                    tagged=keys.enabled and interactive)
                 header = [title, status, ""]
                 paint(header + lines, vt)
+                painted_at = time.time()
 
-                # Sleep in slices so a keypress lands within ~0.2s rather than at
-                # the end of the tick.
-                deadline = time.time() + interval
+                # Sleep in slices so a keypress lands within ~0.2s rather than
+                # at the end of the tick. Each idle slice also samples the
+                # terminal size: conhost has no SIGWINCH, so a polled compare
+                # is the portable resize signal. While a drag keeps the size
+                # moving, the loop repaints live from the cached snapshot --
+                # ResizeThrottle caps that at one paint per ~120ms and
+                # shortens the slices so those paints actually land -- and
+                # the mismatch left behind when the drag stops buys the final
+                # paint at the settled size. Independently, a repaint tick
+                # fires once a second (tick_action) so the clock, the age
+                # chip and the loading dots move between collects. Every such
+                # repaint is pure render-from-cache: no collect runs and the
+                # collect deadline is left where it was, so the "updated Ns
+                # ago" chip keeps telling the truth.
                 while True:
-                    remaining = deadline - time.time()
-                    if remaining <= 0:
+                    now = time.time()
+                    action = tick_action(now, deadline, painted_at)
+                    if action == "collect":
+                        collect_due = True
                         break
-                    key = keys.get(min(0.2, remaining))
+                    if action == "repaint":
+                        break  # render-from-cache; collect_due stays False
+                    key = keys.get(wait_slice(now, deadline, painted_at,
+                                              resize.slice_len(now)))
                     if key is None:
+                        if resize.poll(term_size(), painted_size, time.time()):
+                            break  # live repaint from cache at the current size
                         continue
                     note = None
+                    collect_due = True  # keypresses repaint from fresh data
 
                     # The confirmation swallows every key: only an explicit y
                     # stops a session, and q here cancels rather than quitting so
