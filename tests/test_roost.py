@@ -704,6 +704,71 @@ class TestCursor(unittest.TestCase):
         self.assertEqual(roost.SEL, "\033[30;46m")
         self.assertTrue(roost.highlight("row").startswith(roost.SEL))
 
+    @staticmethod
+    def _sgr_cells(s):
+        """Interpret SGR the way a terminal does: (char, fg, bg, bold) per
+        visible cell. Enough of the state machine to check a colour pair."""
+        fg = bg = None
+        bold = False
+        cells = []
+        i = 0
+        while i < len(s):
+            if s[i] == "\033":
+                j = s.index("m", i)
+                params = s[i + 2:j].split(";") if s[i + 2:j] else ["0"]
+                k = 0
+                while k < len(params):
+                    p = int(params[k] or 0)
+                    if p == 0:
+                        fg = bg = None
+                        bold = False
+                    elif p == 1:
+                        bold = True
+                    elif 30 <= p <= 37 or 90 <= p <= 97:
+                        fg = p
+                    elif p == 38:
+                        fg = ("ext", params[k + 1:k + 3 if params[k + 1] == "5" else k + 5])
+                        k += 2 if params[k + 1] == "5" else 4
+                    elif 40 <= p <= 47:
+                        bg = p
+                    k += 1
+                i = j + 1
+                continue
+            cells.append((s[i], fg, bg, bold))
+            i += 1
+        return cells
+
+    def test_highlight_blackens_every_inner_foreground(self):
+        """Per-cell foregrounds (bright-blue WORKER, yellow CTX, bucket
+        colours) must not survive inside the bar: blue-on-cyan and
+        yellow-on-cyan are illegible. Every visible cell of a highlighted
+        row is fg black / bg cyan; BOLD is kept so weight still carries."""
+        roost.COLOR = True
+        line = ("> " + roost.c("demo-a1", roost.BOLD, "\033[38;5;12m") + "  "
+                + roost.c("85%", roost.BOLD, roost.YELLOW) + "  "
+                + roost.c("DOWN", roost.BOLD, roost.RED) + "  "
+                + roost.c("opus-5", roost.DIM) + " "
+                + roost.c("rgb", "\033[38;2;10;20;30m") + " task")
+        out = roost.highlight(line)
+        cells = self._sgr_cells(out)
+        self.assertEqual("".join(ch for ch, _, _, _ in cells),
+                         "> demo-a1  85%  DOWN  opus-5 rgb task")
+        for ch, fg, bg, _ in cells:
+            self.assertEqual((fg, bg), (30, 46), repr((ch, fg, bg)))
+        self.assertTrue(any(bold for ch, _, _, bold in cells if ch in "demo-a1"))
+        self.assertNotIn("\033[38;5;12m", out)
+        self.assertNotIn(roost.YELLOW, out)
+
+    def test_highlighted_worker_row_is_uniformly_black_on_cyan(self):
+        """End to end through render(): the real cursor row, with its real
+        identity/attention colours, comes out one colour pair."""
+        roost.COLOR = True
+        rows = [worker(name="a", ctx_pct=85.0), worker(name="b", idle_secs=5)]
+        out = roost.render(rows, 0)
+        bar = next(ln for ln in out if ln.startswith(roost.SEL))
+        for ch, fg, bg, _ in self._sgr_cells(bar):
+            self.assertEqual((fg, bg), (30, 46), repr((ch, fg, bg)))
+
     def test_highlight_is_a_noop_without_colour(self):
         self.assertEqual(roost.highlight("plain"), "plain")
 

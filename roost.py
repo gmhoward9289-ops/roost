@@ -640,18 +640,52 @@ def c(text, *codes):
     return "".join(codes) + text + RESET
 
 
+_SGR_RE = re.compile(r"\033\[([0-9;]*)m")
+
+
+def _blacken_fg(params):
+    """Rewrite the foreground colour in one SGR parameter list to black (30),
+    keeping every non-colour attribute (bold, dim, reverse, reset) as it was.
+
+    Handles the three foreground forms: 30-37 and 90-97, 38;5;N (256-colour,
+    which IDENT_BLUE uses), and 38;2;R;G;B (truecolour).
+    """
+    out = []
+    parts = params.split(";") if params else [""]
+    i = 0
+    while i < len(parts):
+        p = parts[i]
+        if p.isdigit() and (30 <= int(p) <= 37 or 90 <= int(p) <= 97):
+            out.append("30")
+        elif p == "38" and i + 1 < len(parts) and parts[i + 1] == "5":
+            out.append("30")
+            i += 2
+        elif p == "38" and i + 1 < len(parts) and parts[i + 1] == "2":
+            out.append("30")
+            i += 4
+        else:
+            out.append(p)
+        i += 1
+    return ";".join(out)
+
+
 def highlight(line):
     """Paint a whole line that already contains colour as the selection bar
-    (black on cyan -- the one painted background).
+    (black on cyan -- the one painted background, uniformly).
 
-    Every per-cell colour ends in RESET, which clears the background along
-    with the colour -- so a naive wrap highlights only up to the first
-    coloured cell. Re-arming after each RESET keeps the bar unbroken across
-    the row.
+    Two things would otherwise break the bar. Every per-cell colour ends in
+    RESET, which clears the background along with the colour -- so a naive
+    wrap highlights only up to the first coloured cell; re-arming after each
+    RESET keeps the bar unbroken. And the cells keep their own foregrounds
+    (bright-blue WORKER, yellow/red CTX, bucket colours), which on a cyan
+    background read as blue-on-cyan and yellow-on-cyan mud; every inner
+    foreground is rewritten to black while BOLD/DIM survive, so weight still
+    carries the row's emphasis and the bar is one colour pair end to end.
     """
     if not COLOR:
         return line
-    return SEL + line.replace(RESET, RESET + SEL) + RESET
+    inner = _SGR_RE.sub(lambda m: "\033[" + _blacken_fg(m.group(1)) + "m", line)
+    return SEL + inner.replace(RESET, RESET + SEL) + RESET
 
 
 def ascii_safe(s):
