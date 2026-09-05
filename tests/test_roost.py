@@ -201,14 +201,19 @@ class TestDuration(unittest.TestCase):
         self.assertEqual(roost.dur(None), "-")
         self.assertEqual(roost.dur(45), "45s")
         self.assertEqual(roost.dur(90), "1m")
-        self.assertEqual(roost.dur(3661), "1h01m")
+        self.assertEqual(roost.dur(3661), "1h")
 
-    def test_days_take_over_past_48_hours(self):
-        """Three days idle should read '3d', not '72h00m' -- hours stop
-        meaning anything past the second day."""
-        self.assertEqual(roost.dur(47 * 3600), "47h00m")
-        self.assertEqual(roost.dur(48 * 3600), "2d")
+    def test_one_unit_only(self):
+        """The charter's 45s/12m/3h/2d: the largest unit that fits, truncated,
+        never a two-unit form like 47h59m and never a cliff between tiers."""
+        self.assertEqual(roost.dur(12 * 60 + 59), "12m")
+        self.assertEqual(roost.dur(3 * 3600 + 59 * 60), "3h")
+        self.assertEqual(roost.dur(23 * 3600 + 59 * 60), "23h")
+        self.assertEqual(roost.dur(24 * 3600), "1d")
+        self.assertEqual(roost.dur(47 * 3600), "1d")
         self.assertEqual(roost.dur(3 * 86400), "3d")
+        for secs in (0, 59, 60, 3599, 3600, 86399, 86400, 10 * 86400):
+            self.assertRegex(roost.dur(secs), r"^\d+[smhd]$")
 
 
 class TestAsciiSafe(unittest.TestCase):

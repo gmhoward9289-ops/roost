@@ -23,7 +23,7 @@ The short ambient loop below is the same program, idling:
 NEAR LIMIT
   demo-a1  opus-5   85%  170k    +4k       ..:-=+#+=-..  12s    refactor the parser
 PARKED + COSTLY
-  demo-b2  opus-5   61%  122k    +2k    ..............   4h10m  audit the build scripts
+  demo-b2  opus-5   61%  122k    +2k    ..............   4h     audit the build scripts
 WORKING NOW
   demo-c3  fable-5  22%  44k     +22k       ...:=+*#+    3s     add integration tests
 STARTING
@@ -36,7 +36,7 @@ QUIET (4)  demo-e5 . demo-f6 . demo-g7 . demo-h8
 SUBAGENTS
   STATE    AGENT          MODEL     CTX       IDLE   TASK
   working  Explore/a812a  opus-5    66k/200k  2s     survey the config loaders
-  idle     adaffaba4b     sonnet-5  484k/1M   1h22m  draft the migration notes
+  idle     adaffaba4b     sonnet-5  484k/1M   1h     draft the migration notes
 
   2 subagent(s), 1 working
 
@@ -333,7 +333,7 @@ GATEWAY
   openrouter-free-zdr  openrouter/inclusionai/ling-3.0-flash:free  cloud  -
   jobs queue: inbox 0  running 1  done 12  failed 0
   BATCH RUN              MODEL           DONE/TOTAL  FAIL  RATE   ETA    LAST
-  results-laneB-derived  gemma4-32k      121/300     2     64/hr  2h48m  35s ago
+  results-laneB-derived  gemma4-32k      121/300     2     64/hr  2h     35s ago
 ```
 
 Configured models come from `model_list` in `ROOST_LITELLM_CONFIG`

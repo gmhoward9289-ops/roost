@@ -2840,6 +2840,12 @@ def growth(history):
 
 
 def dur(secs):
+    """One-unit age: 45s, 12m, 3h, 2d (the charter's text convention).
+
+    The largest unit that fits, truncated -- 90 seconds is "1m", 47 hours is
+    "1d". Two-unit forms like "47h59m" bought false precision at the cost of
+    width and a visible cliff where they gave way to days.
+    """
     if secs is None:
         return "-"
     secs = int(secs)
@@ -2847,10 +2853,8 @@ def dur(secs):
         return "%ds" % secs
     if secs < 3600:
         return "%dm" % (secs // 60)
-    if secs < 48 * 3600:
-        return "%dh%02dm" % (secs // 3600, (secs % 3600) // 60)
-    # Past two days, hours stop meaning anything: three days idle should read
-    # "3d", not "72h00m".
+    if secs < 86400:
+        return "%dh" % (secs // 3600)
     return "%dd" % (secs // 86400)
 
 
