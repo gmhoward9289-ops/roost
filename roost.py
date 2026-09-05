@@ -3119,10 +3119,12 @@ def loading_dots():
     """Animated loading marker, derived from the clock.
 
     A static dim label is indistinguishable from a dead one; deriving the dot
-    count from time gives visible motion for free on interactive paints. This
-    is only ever called on the live path -- one-shot and pipe output never
-    render a loading state, so their bytes stay stable for snapshot tests.
-    Padded to its widest frame so the rest of the line never shifts.
+    count from time gives visible motion for free on interactive paints, and
+    the watch loop's once-a-second repaint tick (tick_action) is what makes
+    those paints happen between collects. This is only ever called on the
+    live path -- one-shot and pipe output never render a loading state, so
+    their bytes stay stable for snapshot tests. Padded to its widest frame so
+    the rest of the line never shifts.
     """
     return ("." * (int(time.time() * 2) % 3 + 1)).ljust(3)
 
@@ -3829,6 +3831,35 @@ class ResizeThrottle:
         return 0.05 if now - self._last_moving < 0.5 else 0.2
 
 
+REPAINT_SECONDS = 1.0  # render-from-cache cadence between collects
+
+
+def tick_action(now, deadline, painted_at):
+    """What an idle slice owes the frame.
+
+    "collect" once the collect deadline has passed; "repaint" once a whole
+    REPAINT_SECONDS has elapsed since the last paint; None to keep waiting.
+    Collection keeps its own (much longer) deadline. Between collects the frame
+    is repainted from the cached snapshot once a second so the clock, the
+    "updated Ns ago" chip and the loading dots visibly move -- before this
+    tick, repaints only followed collects, so the chip almost always read "0s"
+    and the dots never animated. A repaint runs no collector and leaves
+    _LAST_COLLECT alone, so the chip keeps reporting data age.
+    """
+    if now >= deadline:
+        return "collect"
+    if now - painted_at >= REPAINT_SECONDS:
+        return "repaint"
+    return None
+
+
+def wait_slice(now, deadline, painted_at, slice_len):
+    """How long the key wait may block before the loop needs control back:
+    the collect deadline, the next repaint tick, or the resize-poll slice,
+    whichever comes first. Never negative."""
+    return max(0.0, min(slice_len, deadline - now, painted_at + REPAINT_SECONDS - now))
+
+
 def key_hint(width, interactive=False, view=None):
     """The footer key hint, degraded in a designed order rather than clipped.
 
@@ -4290,6 +4321,7 @@ def main():
                     tagged=keys.enabled and interactive)
                 header = [title, status, ""]
                 paint(header + lines, vt)
+                painted_at = time.time()
 
                 # Sleep in slices so a keypress lands within ~0.2s rather than
                 # at the end of the tick. Each idle slice also samples the
@@ -4299,16 +4331,22 @@ def main():
                 # ResizeThrottle caps that at one paint per ~120ms and
                 # shortens the slices so those paints actually land -- and
                 # the mismatch left behind when the drag stops buys the final
-                # paint at the settled size. Every such repaint is pure
-                # render-from-cache: no collect runs and the collect deadline
-                # is left where it was, so the "updated Ns ago" chip keeps
-                # telling the truth.
+                # paint at the settled size. Independently, a repaint tick
+                # fires once a second (tick_action) so the clock, the age
+                # chip and the loading dots move between collects. Every such
+                # repaint is pure render-from-cache: no collect runs and the
+                # collect deadline is left where it was, so the "updated Ns
+                # ago" chip keeps telling the truth.
                 while True:
-                    remaining = deadline - time.time()
-                    if remaining <= 0:
+                    now = time.time()
+                    action = tick_action(now, deadline, painted_at)
+                    if action == "collect":
                         collect_due = True
                         break
-                    key = keys.get(min(resize.slice_len(time.time()), remaining))
+                    if action == "repaint":
+                        break  # render-from-cache; collect_due stays False
+                    key = keys.get(wait_slice(now, deadline, painted_at,
+                                              resize.slice_len(now)))
                     if key is None:
                         if resize.poll(term_size(), painted_size, time.time()):
                             break  # live repaint from cache at the current size

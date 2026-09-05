@@ -1160,6 +1160,88 @@ class TestSnapshotRenderSplit(unittest.TestCase):
         self.assertEqual(sel, 0)
 
 
+class TestRepaintTick(unittest.TestCase):
+    """Between collects the frame repaints from cache once a second, so the
+    clock, the "updated Ns ago" chip and the loading dots actually move.
+    The policy takes `now`, so a whole tick runs on a fake clock."""
+
+    PATCHED = ("collect_workers", "collect_infra", "collect_subagents")
+
+    def setUp(self):
+        self._saved = {n: getattr(roost, n) for n in self.PATCHED}
+        self._last = roost._LAST_COLLECT
+        self.collects = 0
+
+        def workers():
+            self.collects += 1
+            return [worker(idle_secs=5)]
+
+        roost.collect_workers = workers
+        roost.collect_infra = lambda: []
+        roost.collect_subagents = lambda sids: []
+
+    def tearDown(self):
+        for name, fn in self._saved.items():
+            setattr(roost, name, fn)
+        roost._LAST_COLLECT = self._last
+
+    def test_nothing_is_due_inside_the_first_second(self):
+        self.assertIsNone(roost.tick_action(now=10.5, deadline=20.0, painted_at=10.0))
+
+    def test_repaint_is_due_after_a_second_without_a_collect(self):
+        self.assertEqual(roost.tick_action(now=11.0, deadline=20.0, painted_at=10.0),
+                         "repaint")
+
+    def test_collect_deadline_outranks_the_repaint_tick(self):
+        self.assertEqual(roost.tick_action(now=20.0, deadline=20.0, painted_at=10.0),
+                         "collect")
+
+    def test_wait_slice_stops_at_the_earliest_event(self):
+        # resize slice is the nearest
+        self.assertAlmostEqual(roost.wait_slice(10.0, 20.0, 10.0, 0.2), 0.2)
+        # repaint tick is the nearest
+        self.assertAlmostEqual(roost.wait_slice(10.9, 20.0, 10.0, 0.2), 0.1)
+        # collect deadline is the nearest
+        self.assertAlmostEqual(roost.wait_slice(19.95, 20.0, 19.5, 0.2), 0.05)
+        # never negative, even when a tick is already overdue
+        self.assertEqual(roost.wait_slice(12.0, 20.0, 10.0, 0.2), 0.0)
+
+    def test_a_slice_tick_repaints_without_collecting(self):
+        """Drive the loop's decision on a fake clock: the tick says repaint,
+        the repaint renders the cached snapshot, and no collector runs and
+        the collect clock does not move -- so the age chip that the repaint
+        paints reports data age, and a larger number than before."""
+        snap = roost.collect_snapshot()
+        stamp = roost._LAST_COLLECT
+        self.assertEqual(self.collects, 1)
+        painted_at = stamp
+        deadline = stamp + 10.0  # as with --watch 10
+        ages = []
+        for tick in (1, 2, 3):
+            now = stamp + tick * roost.REPAINT_SECONDS
+            self.assertEqual(roost.tick_action(now, deadline, painted_at), "repaint")
+            roost.render_frame(snap)   # what the loop does on "repaint"
+            ages.append(roost.header_title(150, "h", "12:00:00",
+                                           age_secs=now - roost._LAST_COLLECT))
+            painted_at = now
+        self.assertEqual(self.collects, 1)
+        self.assertEqual(roost._LAST_COLLECT, stamp)
+        self.assertIn("updated 1s ago", ages[0])
+        self.assertIn("updated 2s ago", ages[1])
+        self.assertIn("updated 3s ago", ages[2])
+
+    def test_loading_dots_move_across_repaint_ticks(self):
+        real = roost.time.time
+        seen = []
+        try:
+            for tick in range(4):
+                roost.time.time = lambda t=100.0 + tick * roost.REPAINT_SECONDS: t
+                seen.append(roost.loading_dots())
+        finally:
+            roost.time.time = real
+        self.assertGreater(len(set(seen)), 1)
+
+
 class TestResizeThrottle(unittest.TestCase):
     """Mid-drag the loop repaints live from cache, throttled; the settle
     paint still lands once the drag stops. Driven on a fake clock -- the
