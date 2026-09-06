@@ -15,23 +15,34 @@ jobs:
     # load-bearing -- the Windows path uses ctypes for process liveness and
     # console VT, which no Linux run would ever exercise.
     #
-    # 3.14 is here because it is what the primary dev box actually runs -- every
-    # local test run happened on an interpreter CI never exercised. macos-15-intel
-    # is here because macos-latest is arm64 now, so Intel Macs were untested.
-    # (It replaced macos-13, whose image GitHub retired in Dec 2025 -- jobs
-    # asking for it queue forever. macos-15-intel is the designated successor,
-    # available until Aug 2027; when it goes, the Intel leg goes with it.)
+    # This is deliberately not a full os x python cross product (it was: 24
+    # legs, 12 of them macOS). The interpreter is tested on Linux, where a leg
+    # costs seconds, across every minor from the 3.9 floor to 3.14, which is
+    # what the primary dev box actually runs. The other two platforms are here
+    # to prove the platform claim, not to re-test each interpreter:
     #
-    # Unlike leghorn, Windows gets no 3.14 exclusion: leghorn has to skip that
-    # leg because windows-curses wheels top out at 3.13, but roost has no
-    # dependencies at all (see pyproject.toml -- `dependencies = []`, stdlib
-    # only, no curses anywhere), so nothing about Windows + 3.14 can fail on
-    # dependency resolution. Every cell of this matrix is testing repo code.
+    # - macOS gets one leg, on 3.13, because that is the python@3.13 the
+    #   Homebrew formula installs -- the interpreter nearly every Mac user runs
+    #   this under. There is no Intel leg: roost is pure-Python stdlib with no
+    #   dependencies at all (pyproject.toml: `dependencies = []`), so arm64 vs
+    #   x86_64 cannot change a result. (macos-15-intel used to be here, and
+    #   macos-13 before GitHub retired that image in Dec 2025.)
+    # - Windows gets the floor and the ceiling, 3.9 and 3.14, because the
+    #   ctypes and console code is where an interpreter change would bite, and
+    #   the two ends bracket it. No windows-curses here, so unlike leghorn
+    #   nothing stops the 3.14 leg.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, macos-15-intel, windows-latest]
+        os: [ubuntu-latest]
         python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          - os: macos-latest
+            python: "3.13"
+          - os: windows-latest
+            python: "3.9"
+          - os: windows-latest
+            python: "3.14"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -91,3 +102,30 @@ jobs:
       - uses: actions/checkout@v7
       - name: Semgrep
         run: semgrep scan --config p/python --config p/secrets --error --metrics=off .
+
+  # The branch ruleset requires this one check instead of naming every job
+  # above. Required checks match by name, and a matrix leg's name is its
+  # parameters, so a matrix change silently strands the ruleset: this repo's
+  # named twelve test legs for a matrix that had twenty-four, and leghorn's
+  # kept demanding "test (macos-13, ...)" long after that leg was gone,
+  # leaving every PR on "Expected -- waiting for status". This job's name
+  # never changes; what it asserts is "every job in ci.yml succeeded".
+  # codespell and the PR-title lint live in their own workflows, so the
+  # ruleset still names those two directly.
+  #
+  # `if: always()` is load-bearing. Without it a failed dependency skips this
+  # job, and a skipped required check shows as pending forever rather than
+  # failed. The jq line then does the real gating: success only, so a
+  # cancelled or skipped job fails the gate instead of slipping through as
+  # merely not-a-failure.
+  ci-ok:
+    if: always()
+    needs: [test, packaging, security]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job in ci.yml succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS"
+          echo "$NEEDS" | jq -e 'all(.[]; .result == "success")' > /dev/null
