@@ -169,7 +169,7 @@ jobs:
           gh repo sync gmhoward9289-ops/winget-pkgs --source microsoft/winget-pkgs \
             || echo "::warning::fork sync failed; continuing with winget-releaser against the fork as-is"
 
-      - uses: vedantmgoyal9/winget-releaser@4ffc7888bffd451b357355dc214d43bb9f23917e # v2
+      - uses: vedantmgoyal9/winget-releaser@b7370d4d152efdce803a26cc6ca9eee58cb2ad54 # v2
         if: steps.bootstrapped.outputs.exists == 'true'
         with:
           identifier: gmhoward9289-ops.roost
